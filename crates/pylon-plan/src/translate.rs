@@ -160,14 +160,21 @@ pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan,
     // produces a Project; for aggregate queries we split into
     // (group_by, aggs) and wrap in Aggregate.
     let mut projs = Vec::new();
+    let mut aliases: Vec<Option<String>> = Vec::new();
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(_) => {}
-            SelectItem::UnnamedExpr(e) => projs.push(translate_expr(e, &pre_agg_schema)?),
+            SelectItem::UnnamedExpr(e) => {
+                projs.push(translate_expr(e, &pre_agg_schema)?);
+                aliases.push(None);
+            }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let mut p = translate_expr(expr, &pre_agg_schema)?;
-                p = rename_expr(&p, &alias.value);
-                projs.push(p);
+                // For non-aggregate Project the alias flows into the
+                // output schema via the LExpr's name (we re-attach
+                // later in the Project path). For the Aggregate path
+                // we use the raw LExpr and track the alias separately.
+                projs.push(translate_expr(expr, &pre_agg_schema)?);
+                aliases.push(Some(alias.value.clone()));
             }
             _ => {
                 warn!("select item not supported: {item:?}");
@@ -183,18 +190,24 @@ pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan,
     let has_agg = projs.iter().any(is_aggregate_expr);
     if has_agg || group_by_exprs.is_some() {
         // Split projections into group_by columns and aggregate calls.
-        let mut group_by_lexprs = Vec::new();
-        let mut agg_lexprs = Vec::new();
-        for p in projs.iter() {
+        // Track which projection each came from so we can apply the
+        // user-supplied alias (if any) to the output field name.
+        let mut group_by_lexprs: Vec<LExpr> = Vec::new();
+        let mut group_by_aliases: Vec<Option<String>> = Vec::new();
+        let mut agg_lexprs: Vec<LExpr> = Vec::new();
+        let mut agg_aliases: Vec<Option<String>> = Vec::new();
+        for (p, alias) in projs.iter().zip(aliases.iter()) {
             if is_aggregate_expr(p) {
                 agg_lexprs.push(p.clone());
+                agg_aliases.push(alias.clone());
             } else {
                 group_by_lexprs.push(p.clone());
+                group_by_aliases.push(alias.clone());
             }
         }
         // Translate the GROUP BY expressions themselves (they can be column
         // refs or expressions; M3 first cut only supports column refs).
-        let mut group_by_from_ast = Vec::new();
+        let mut group_by_from_ast: Vec<LExpr> = Vec::new();
         if let Some(grp_ast) = &group_by_exprs {
             for g in grp_ast {
                 let le = translate_expr(g, &pre_agg_schema)?;
@@ -207,8 +220,9 @@ pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan,
             }
         }
         // Sanity: every projected non-agg column must be in the
-        // group_by list. SQL allows group_by columns to be omitted
-        // from the projection (they're still computed but not emitted).
+        // group_by list (or in an aggregate call). Comparison is on
+        // the unrenamed column name so `SELECT region AS r ...
+        // GROUP BY region` does not trip the check.
         for p in &group_by_lexprs {
             if !group_by_contains(&group_by_from_ast, p) {
                 return Err(PylonError::InvalidPlan(format!(
@@ -221,16 +235,42 @@ pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan,
         // projected non-agg columns as the implicit group_by.
         if group_by_from_ast.is_empty() && has_agg && group_by_exprs.is_none() {
             group_by_from_ast = group_by_lexprs.clone();
+            group_by_aliases = group_by_aliases.clone();
         }
-        let agg_schema = build_aggregate_schema(&group_by_from_ast, &agg_lexprs, &pre_agg_schema)?;
+        // Build the output schema using the (possibly aliased) names.
+        let agg_schema = build_aggregate_schema(
+            &group_by_from_ast,
+            &group_by_aliases,
+            &agg_lexprs,
+            &agg_aliases,
+            &pre_agg_schema,
+        )?;
+        // Apply the user-supplied alias to the aggregate LExprs by
+        // rewriting their `name` field. (The group_by LExprs keep
+        // their original column names; the alias is recorded in the
+        // output schema only.)
+        let aggs = apply_agg_aliases(agg_lexprs, agg_aliases);
         return Ok(LogicalPlan::Aggregate {
             input: Box::new(input),
             group_by: group_by_from_ast,
-            aggs: agg_lexprs,
+            aggs,
             schema: agg_schema,
         });
     }
 
+    // Non-aggregate path: apply aliases to projected columns so the
+    // output schema carries the user-supplied name.
+    let projs: Vec<LExpr> = projs
+        .into_iter()
+        .zip(aliases.into_iter())
+        .map(|(p, alias)| {
+            if alias.is_some() {
+                rename_expr(&p, &alias.unwrap())
+            } else {
+                p
+            }
+        })
+        .collect();
     Ok(LogicalPlan::Project {
         input: Box::new(input),
         projections: projs,
@@ -301,25 +341,32 @@ fn compute_projected_schema(
 }
 
 /// Build the post-aggregation schema: one field per group_by column
-/// (same name + type as the input), followed by one field per aggregate
-/// (named `agg_name` or `agg_name(arg)` if no alias was supplied).
+/// (alias if supplied, else the input column name + type), followed
+/// by one field per aggregate (alias if supplied, else the default
+/// `agg_name` / `agg_col`).
 fn build_aggregate_schema(
     group_by: &[LExpr],
+    group_by_aliases: &[Option<String>],
     aggs: &[LExpr],
+    agg_aliases: &[Option<String>],
     input_schema: &SchemaRef,
 ) -> Result<SchemaRef, PylonError> {
     let mut fields = Vec::new();
-    for g in group_by {
+    for (g, alias) in group_by.iter().zip(group_by_aliases.iter()) {
         let f = match g {
-            LExpr::Column(field) => input_schema
-                .field_with_name(field.name())
-                .map_err(|_| {
-                    PylonError::InvalidPlan(format!(
-                        "group by: column {} not found in input",
-                        field.name()
-                    ))
-                })?
-                .clone(),
+            LExpr::Column(field) => {
+                let resolved = input_schema
+                    .field_with_name(field.name())
+                    .map_err(|_| {
+                        PylonError::InvalidPlan(format!(
+                            "group by: column {} not found in input",
+                            field.name()
+                        ))
+                    })?
+                    .clone();
+                let name = alias.clone().unwrap_or_else(|| resolved.name().clone());
+                Field::new(&name, resolved.data_type().clone(), resolved.is_nullable())
+            }
             other => {
                 return Err(PylonError::InvalidPlan(format!(
                     "group by expression must be a column reference in M3 first cut: {other:?}"
@@ -328,13 +375,14 @@ fn build_aggregate_schema(
         };
         fields.push(f);
     }
-    for a in aggs {
+    for (a, alias) in aggs.iter().zip(agg_aliases.iter()) {
         let field = match a {
-            // `name` is either the user-supplied alias (from
-            // `rename_expr`) or the default `agg_name` /
-            // `agg_col` from `translate_aggregate_function`.
             LExpr::AggregateFunction { name, data_type, .. } => {
-                Field::new(name, data_type.clone(), true)
+                // `name` carries the default `agg_name` / `agg_col` from
+                // `translate_aggregate_function`. The user alias wins if
+                // supplied.
+                let out_name = alias.clone().unwrap_or_else(|| name.clone());
+                Field::new(&out_name, data_type.clone(), true)
             }
             _ => {
                 return Err(PylonError::InvalidPlan(format!(
@@ -345,6 +393,27 @@ fn build_aggregate_schema(
         fields.push(field);
     }
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Rewrite each `LExpr::AggregateFunction`'s `name` field with the
+/// user-supplied alias (if any). Group_by column aliases are recorded
+/// in the schema only and not on the LExpr itself.
+fn apply_agg_aliases(aggs: Vec<LExpr>, aliases: Vec<Option<String>>) -> Vec<LExpr> {
+    aggs.into_iter()
+        .zip(aliases.into_iter())
+        .map(|(a, alias)| match a {
+            LExpr::AggregateFunction { func, name, args, data_type, input_data_types } => {
+                LExpr::AggregateFunction {
+                    func,
+                    name: alias.unwrap_or(name),
+                    args,
+                    data_type,
+                    input_data_types,
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 fn group_by_contains(group_by: &[LExpr], target: &LExpr) -> bool {
