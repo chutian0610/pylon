@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod arrow_compute;
 pub mod filter;
 pub mod project;
@@ -5,6 +6,7 @@ pub mod exchange;
 pub mod partition_filter;
 pub mod seq_scan;
 
+pub use aggregate::{build_aggregate_output_schema, AggSpec, HashAggregateOp};
 pub use arrow_compute::filter_record_batch;
 pub use exchange::{ExchangeSinkOp, ExchangeSourceOp};
 pub use filter::FilterOp;
