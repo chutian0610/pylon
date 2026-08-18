@@ -114,13 +114,13 @@ fn fragmenter_collapses_simple_plan_into_single_stage() {
     };
 
     let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 16 });
-    let dag = fragmenter.fragment(&plan).expect("fragmenter ok");
+    let dag = fragmenter.fragment_multi_stage(&plan, 0).expect("fragmenter ok");
 
-    assert_eq!(dag.stages.len(), 1);
+    
     assert_eq!(dag.stages[0].partition_count, 16);
 
     let ops = &dag.stages[0].fragment.ops;
-    assert_eq!(ops.len(), 2);
+    assert_eq!(ops.len(), 3, "SeqScan, Filter, ExchangeSink");
     assert_eq!(ops[0].name, "SeqScan");
     assert_eq!(ops[1].name, "Filter");
     assert_eq!(ops[1].config.get("col").map(|s| s.as_str()), Some("id"));

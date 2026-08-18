@@ -52,7 +52,6 @@ async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
         info!(task_id, "got task request");
         match run_task(task_req_msg, flight_service.clone()).await {
             Ok(batches) => {
-                eprintln!("[W1] matching Ok with {} batches", batches.len());
                 let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
                 let mut emitted = 0u64;
                 for batch in batches {
@@ -64,9 +63,7 @@ async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
                         batch: bytes,
                         message: String::new(),
                     };
-                    eprintln!("[W1] sending TaskResponse task_id={} state_running rows={}", task_id, batch.num_rows());
                     if out_tx.send(resp).await.is_err() {
-                        eprintln!("[W1] coord stream closed mid-batch (task_id={task_id})");
                         warn!("coord stream closed mid-batch");
                         return Ok(());
                     }
@@ -105,19 +102,16 @@ async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
 async fn run_task(req: TaskRequest, flight_service: Arc<PylonFlightService>) -> Result<Vec<arrow_array::RecordBatch>> {
     let spec = req.spec.context("task spec missing")?;
     let fragment = spec.fragment.as_ref().context("fragment missing")?;
-    eprintln!("[W1] run_task ops={}", fragment.ops.iter().map(|o| o.name.as_str()).collect::<Vec<_>>().join(","));
+
     let ops = build_ops(fragment, flight_service.clone())?;
-    eprintln!("[W1] run_task built ops, count={}", ops.len());
-    let pipeline = Arc::new(Pipeline::new(ops));
-    let driver = Driver::new(pipeline).with_mode(DriverMode::PerOpTokioTask);
+    let pipeline = Pipeline::new(ops);
+    let driver = Driver::new(pipeline);  // default mode = SingleThreadLoop
 
     let mut output = driver.run(None).await?;
     let mut collected = Vec::new();
     while let Some(batch) = output.recv().await {
-        eprintln!("[W1] run_task got output batch rows={}", batch.num_rows());
         collected.push(batch);
     }
-    eprintln!("[W1] run_task output channel closed, collected={}", collected.iter().map(|b| b.num_rows()).sum::<usize>());
     Ok(collected)
 }
 

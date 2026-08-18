@@ -1,13 +1,17 @@
-//! Pipeline: a chain of operators with shared state — Trino alignment.
+//! Pipeline: chain of operators + shared state bridges (Trino-aligned).
+//!
+//! Velox-style single-thread fused driver: ops are owned
+//! `Vec<Box<dyn PipelineOp>>` (no Mutex). The driver polls them sequentially
+//! in one async task — ops do NOT take locks across awaits; instead the
+//! driver awaits the op's async method directly, no contention.
 
 use crate::bridge::StateBridge;
 use crate::op::PipelineOp;
 use pylon_types::Result as PylonResult;
-use pylon_types::{PylonError, RecordBatch};
+use pylon_types::RecordBatch;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
@@ -22,9 +26,12 @@ impl PipelineId {
     }
 }
 
+/// Owned pipeline: ops are `Box<dyn PipelineOp>` and live directly on the
+/// driver thread, no Mutex. Shared state bridges are referenced by `Arc`
+/// since multiple drivers may need to read them.
 pub struct Pipeline {
     pub id: PipelineId,
-    pub ops: Vec<Arc<Mutex<Box<dyn PipelineOp>>>>,
+    pub ops: Vec<Box<dyn PipelineOp>>,
     pub state_bridges: Vec<Arc<dyn StateBridge>>,
 }
 
@@ -32,19 +39,47 @@ impl Pipeline {
     pub fn new(ops: Vec<Box<dyn PipelineOp>>) -> Self {
         Self {
             id: PipelineId::generate(),
-            ops: ops.into_iter().map(|op| Arc::new(Mutex::new(op))).collect(),
+            ops,
             state_bridges: Vec::new(),
         }
     }
+
     pub fn with_bridge(mut self, b: Arc<dyn StateBridge>) -> Self {
-        self.state_bridges.push(b); self
+        self.state_bridges.push(b);
+        self
     }
-    pub fn op_count(&self) -> usize { self.ops.len() }
+
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
 }
 
-pub async fn run_pipeline_per_op_task(
-    pipeline: Arc<Pipeline>,
-    input: Option<mpsc::Receiver<RecordBatch>>,
+// DriverId is in driver.rs to keep this file focused on Pipeline data.
+
+/// Run the pipeline as a single tokio task running a Velox-style
+/// single-thread poll loop. M3+ default.
+///
+/// The pipeline must be owned outright: ops are mutably called in
+/// sequence, no lock needed because no two ops run concurrently.
+///
+/// Loop structure (per iteration):
+///   1. Feed external_input → op[0].input_buf
+///   2. Cascade op[i].output_buf → op[i+1].input_buf for each i
+///   3. Drive each op (in order):
+///      3a. if upstream_done path is satisfied → call op.no_more_input()
+///      3b. drain op.input_buf into op.add_input
+///      3c. drain op.get_output into op.output_buf OR final_tx (terminal op)
+///      3d. check is_finished → mark op_states[i].finished = true
+///   4. If all ops finished → break
+///   5. Collect is_blocked futures across ops; if any, await the first
+///   6. Yield to scheduler if no progress was made
+///
+/// External input is consumed only by op[0]. The driver logically closes
+/// external_input when its mpsc Receiver reports `is_closed` (drop of producer).
+pub async fn run_pipeline_single_thread(
+    pipeline: Pipeline,
+    external_input: Option<mpsc::Receiver<RecordBatch>>,
+    pipeline_id: PipelineId,
 ) -> PylonResult<mpsc::Receiver<RecordBatch>> {
     let n_ops = pipeline.ops.len();
     if n_ops == 0 {
@@ -52,109 +87,197 @@ pub async fn run_pipeline_per_op_task(
         return Ok(rx);
     }
     let (final_tx, final_rx) = mpsc::channel::<RecordBatch>(DEFAULT_CHANNEL_CAPACITY);
-    let mut joins: JoinSet<()> = JoinSet::new();
-    let mut next_input: Option<mpsc::Receiver<RecordBatch>> = input;
+    let is_source_stage = external_input.is_none();
+    let mut external_input = external_input;
 
-    for (i, op) in pipeline.ops.iter().cloned().enumerate() {
-        let (tx, rx) = mpsc::channel::<RecordBatch>(DEFAULT_CHANNEL_CAPACITY);
-        let is_last = i + 1 == n_ops;
-        let op_input = next_input.take();
-        let output_tx = if is_last { final_tx.clone() } else { tx };
+    let Pipeline { ops, state_bridges: _, .. } = pipeline;
 
-        joins.spawn(async move {
-            if let Err(e) = run_op(op, op_input, output_tx).await {
-                warn!(target: "pylon::pipeline", error = %e, "op exited with error");
-            }
-        });
-
-        if !is_last {
-            next_input = Some(rx);
-        }
+    // Per-op bookkeeping. Lives only inside this function (single-thread,
+    // so no Mutex needed; we mutate freely).
+    struct OpState {
+        input_buf: Vec<RecordBatch>,
+        output_buf: Vec<RecordBatch>, // only used for non-terminal ops
+        upstream_notified: bool,
+        finished: bool,
     }
-
-    tokio::spawn(async move {
-        while let Some(res) = joins.join_next().await {
-            if let Err(e) = res { warn!(target: "pylon::pipeline", panic = %e, "task panic"); }
-        }
-        debug!(target: "pylon::pipeline", "all ops exited");
-    });
+    let mut op_states: Vec<OpState> = (0..n_ops)
+        .map(|_| OpState {
+            input_buf: Vec::new(),
+            output_buf: Vec::new(),
+            upstream_notified: false,
+            finished: false,
+        })
+        .collect();
+    let mut ops: Vec<Box<dyn PipelineOp>> = ops;
 
     info!(
         target: "pylon::pipeline",
-        pipeline_id = pipeline.id.0,
+        pipeline_id = pipeline_id.0,
         ops = n_ops,
-        mode = "PerOpTokioTask",
-        "pipeline started"
+        mode = "SingleThreadLoop",
+        is_source_stage,
+        "single-thread pipeline started"
+    );
+
+    loop {
+        let mut progressed = false;
+
+        // ----- Step 1: external input → op[0].input_buf -----
+        let mut external_closed = false;
+        if let Some(rx) = external_input.as_mut() {
+            while let Ok(batch) = rx.try_recv() {
+                op_states[0].input_buf.push(batch);
+                progressed = true;
+            }
+            if rx.is_closed() {
+                external_closed = true;
+            }
+        }
+        if external_closed {
+            external_input = None;
+        }
+
+        // ----- Step 2: inter-op cascade -----
+        //
+        // We now cascade as part of step 3 (per-op, after op[i] emits), so this
+        // step is just a fallback for batches that arrived from a previous iter
+        // and were never delivered (e.g. ops that finished but their output was
+        // never cascaded). For correctness we still run it once per iter, but
+        // it should be a no-op when step 3 has done its work.
+        if n_ops > 1 {
+            for i in 0..n_ops.saturating_sub(1) {
+                let drain = op_states[i].output_buf.len();
+                if drain > 0 {
+                    let drained: Vec<RecordBatch> =
+                        op_states[i].output_buf.drain(..).collect();
+                    op_states[i + 1].input_buf.extend(drained);
+                    progressed = true;
+                }
+            }
+        }
+
+        // ----- Step 3: drive each op in sequence -----
+        for i in 0..n_ops {
+            // Pre-compute the op's upstream readiness info before mutating,
+            // because we'll mut-borrow op_states[i] below.
+            let upstream_ready = if i == 0 {
+                external_input.is_none()
+            } else {
+                // op_states[i-1].finished checked via separate borrow
+                op_states[i - 1].finished
+            };
+
+            // No `let st = ...` here — direct op_states[i] access for 3a, then
+            // release borrow before 3c.
+            if op_states[i].finished {
+                continue;
+            }
+            let op = &mut ops[i];
+
+            // 3a. drain input buffer FIRST (cascade in step 2 just populated it)
+            let mut fed = 0usize;
+            while let Some(batch) = op_states[i].input_buf.pop() {
+                op.add_input(batch).await?;
+                fed += 1;
+            }
+            if fed > 0 {
+                progressed = true;
+            }
+
+            // 3b. no_more_input signal — only AFTER we've drained input.
+            if !op_states[i].upstream_notified {
+                let ready = if i == 0 {
+                    external_input.is_none()
+                } else {
+                    upstream_ready
+                };
+                if ready {
+                    op.no_more_input().await?;
+                    op_states[i].upstream_notified = true;
+                    progressed = true;
+                }
+            }
+
+            // 3c. drain output
+            let is_last = i + 1 == n_ops;
+            loop {
+                let next_out = op.get_output().await?;
+                match next_out {
+                    Some(batch) => {
+                        if is_last {
+                            // terminal op: deliver to final_tx
+                            if final_tx.send(batch).await.is_err() {
+                                // downstream consumer dropped
+                                debug!(
+                                    target: "pylon::pipeline",
+                                    "final_tx closed; aborting driver"
+                                );
+                                return Ok(final_rx);
+                            }
+                        } else {
+                            op_states[i + 1].input_buf.push(batch);
+                        }
+                        progressed = true;
+                    }
+                    None => break,
+                }
+            }
+
+            // 3d. finished?
+            if op.is_finished().await {
+                op_states[i].finished = true;
+                info!(
+                    target: "pylon::pipeline",
+                    pipeline_id = pipeline_id.0,
+                    op_index = i,
+                    name = %op.name(),
+                    "op finished"
+                );
+            }
+        }
+
+        // ----- Step 4: pipeline finished? -----
+        if op_states.iter().all(|s| s.finished) {
+            break;
+        }
+
+        // ----- Step 5: blocked futures -----
+        let mut blocked: Vec<BoxFuture<'static, ()>> = Vec::new();
+        for (i, op) in ops.iter_mut().enumerate() {
+            if op_states[i].finished {
+                continue;
+            }
+            match op.is_blocked().await? {
+                Some(fut) => blocked.push(fut),
+                None => {}
+            }
+        }
+        if !blocked.is_empty() {
+            // Wait for any one to resolve. select_all picks the fastest.
+            let selected = futures::future::select_all(blocked).await;
+            debug!(
+                target: "pylon::pipeline",
+                pipeline_id = pipeline_id.0,
+                "a blocked future resolved; retrying ops"
+            );
+            // suppress unused warning
+            let _ = selected;
+            progressed = true;
+            continue;
+        }
+
+        // ----- Step 6: no progress → cooperative yield -----
+        if !progressed {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    info!(
+        target: "pylon::pipeline",
+        pipeline_id = pipeline_id.0,
+        "single-thread pipeline done"
     );
     Ok(final_rx)
 }
 
-async fn run_op(
-    op: Arc<Mutex<Box<dyn PipelineOp>>>,
-    mut input: Option<mpsc::Receiver<RecordBatch>>,
-    output: mpsc::Sender<RecordBatch>,
-) -> PylonResult<()> {
-    let mut upstream_done = false;
-
-    loop {
-        // Phase A: feed input (lock→unlock with no holds across await)
-        if !upstream_done {
-            let needs = {
-                let g = op.lock().await;
-                g.needs_input().await
-            };
-            if needs {
-                if let Some(rx) = input.as_mut() {
-                    let recv = rx.try_recv();
-                    match recv {
-                        Ok(batch) => {
-                            let name = op.lock().await.name().to_string();
-                            op.lock().await.add_input(batch).await
-                                .map_err(|e| PylonError::Internal(format!("{name} add_input: {e}")))?;
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => {}
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            let name = op.lock().await.name().to_string();
-                            op.lock().await.no_more_input().await
-                                .map_err(|e| PylonError::Internal(format!("{name} no_more_input: {e}")))?;
-                            upstream_done = true;
-                        }
-                    }
-                } else {
-                    upstream_done = true;
-                }
-            }
-        }
-
-        // Phase B: drain output
-        let maybe_out = {
-            let mut g = op.lock().await;
-            g.get_output().await
-        };
-        match maybe_out {
-            Ok(Some(batch)) => {
-                let oname = op.lock().await.name().to_string();
-                eprintln!("[RUN-OP] {oname} output rows={}", batch.num_rows());
-                if output.send(batch).await.is_err() {
-                    return Ok(());
-                }
-                continue;
-            }
-            Ok(None) => {
-                let oname = op.lock().await.name().to_string();
-            }
-            Err(e) => {
-                let name = op.lock().await.name().to_string();
-                return Err(PylonError::Internal(format!("{name} get_output: {e}")).into());
-            }
-        }
-
-        // Phase C: finished?
-        {
-            let g = op.lock().await;
-            if g.is_finished().await { return Ok(()); }
-        }
-
-        tokio::task::yield_now().await;
-    }
-}
+use futures::future::BoxFuture;

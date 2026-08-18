@@ -43,7 +43,6 @@ impl PipelineOp for ExchangeSinkOp {
     }
 
     async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
-eprintln!("[STAGE0->FLIGHT] desc={} rows={}", self.descriptor.as_str(), batch.num_rows());
         if batch.num_rows() > 0 {
             self.service.push(&self.descriptor, batch.clone()).await?;
             trace!(
@@ -121,7 +120,10 @@ impl PipelineOp for ExchangeSourceOp {
                 }
                 None => {
                     self.empty_polls += 1;
-                    if self.upstream_done || self.empty_polls >= self.producer_done_threshold {
+                    // M3 fix: don't short-circuit on upstream_done — that's true from t=0
+                    // for a source op, and would cause us to miss batches arriving from a
+                    // later stage. Only the empty-poll threshold counts.
+                    if self.empty_polls >= self.producer_done_threshold {
                         return Ok(None);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

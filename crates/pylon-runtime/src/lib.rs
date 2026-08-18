@@ -17,7 +17,7 @@ pub mod error;
 pub mod ops;
 
 pub use op::PipelineOp;
-pub use pipeline::{Pipeline, PipelineId, run_pipeline_per_op_task};
+pub use pipeline::{Pipeline, PipelineId, run_pipeline_single_thread};
 pub use driver::{Driver, DriverId, DriverMode};
 pub use bridge::{DummyBridge, StateBridge, StateChange};
 pub use error::RuntimeError;

@@ -17,7 +17,7 @@ pub struct ProjectOp {
 }
 
 impl ProjectOp {
-    pub fn new(col_names: Vec<String>, mut output_schema: Arc<Schema>) -> Self {
+    pub fn new(col_names: Vec<String>, output_schema: Arc<Schema>) -> Self {
         // M2: if output_schema is empty, infer from input data lazily
         // This is set later when first_batch arrives; placeholder for now.
         if output_schema.fields().is_empty() {
