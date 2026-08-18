@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pylon-types",
+    "crates/pylon-plan",
+    "crates/pylon-runtime",
+    "crates/pylon-exchange",
+    "crates/pylon-catalog",
+    "crates/pylon-iceberg",
+    "crates/pylon-storage",
+    "crates/pylon-coord",
+    "crates/pylon-worker",
+    "tools/gen-sample-data",
+    "tools/verify-output",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/chutian0610/pylon"
+
+[workspace.dependencies]
+# Core data (arrow-rs v59)
+arrow = "59"
+arrow-array = "59"
+arrow-schema = "59"
+arrow-select = "59"
+arrow-buffer = "59"
+parquet = "59"
+
+# Async
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors + util
+anyhow = "1"
+thiserror = "2"
+
+# Plan / parsing
+sqlparser = "0.55"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+needless_return = "warn"
+redundant_clone = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

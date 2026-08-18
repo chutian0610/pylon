@@ -1,0 +1,16 @@
+[package]
+name = "pylon-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

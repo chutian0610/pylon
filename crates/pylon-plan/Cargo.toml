@@ -1,0 +1,19 @@
+[package]
+name = "pylon-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pylon-types = { path = "../pylon-types" }
+sqlparser = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
