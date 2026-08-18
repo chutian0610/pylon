@@ -220,3 +220,44 @@ Date: 2026-08-18 (Implemented)
 Sign-off packet: [docs/notes/m3-status.md](../notes/m3-status.md)。End-to-end 验证在 `tools/e2e/two_worker_smoke.sh` —— 2 个 OS 进程 + 1 coord + 真 Arrow Flight `DoExchange` 跑通 `SELECT name, COUNT(*) FROM sample GROUP BY name` 端到端。
 
 下一步 (M4)：FTE (写 Arrow IPC stream 到 S3) + Spill + 容错。RFC-0006 待写。
+
+## 15. M3 Tail — exchange unification (post-sign-off cleanup)
+
+The first cut described above kept two parallel producer shapes:
+`ExchangeSinkOp` (in-process `PylonFlightService::push`) for same-worker
+shuffles and `ExchangeSinkRpc` (tonic `DoExchange`) for cross-worker.
+This forced the fragmenter to branch on `worker_flight_addrs.is_empty()`,
+gave the worker factory two branches, and spread same-worker vs
+cross-worker logic across the runtime and worker crates.
+
+The M3-tail cleanup (`docs/roadmap/m3-tail-exchange-unify.md`) collapsed
+the two paths:
+
+- **PR1 (B3)** — moved `target_flight_addrs` computation from the
+  fragmenter to the coord dispatcher. The dispatcher is now the
+  authoritative source for stage1 partition → worker assignment; the
+  fragmenter's placeholder is overwritten before any task reaches the
+  worker.
+- **PR2 (B1+B2)** — deleted `ExchangeSinkOp`, `fragment_multi_stage`,
+  and the worker `"ExchangeSink"` factory branch. The fragmenter now
+  emits exactly one op shape (`ExchangeSinkRpc`); the worker has one
+  factory branch. Same-worker fan-out is naturally expressed as
+  `target.flight_addr == local flight_addr` — a true loopback gRPC
+  call through the local `FlightServerImpl`.
+- **B8** — removed the `// M3 first cut` / `// B-2 routing` markers
+  from `fragment.rs`, dropped the dead `build_stage0_ops` /
+  `build_stage1_ops` / `aggregate_results` helpers from
+  `pylon-coord/src/bin/pylon-coord.rs`, and updated the
+  `aggregate_2stage_e2e_test` to drive the unified Flight path
+  against a loopback server.
+
+The unified path is one producer (`ExchangeSinkRpc`) + one consumer
+(`ExchangeSourceOp`); the dispatcher is the single authority for
+placement; the fragmenter owns plan-shape only. There is no longer a
+distinction between "in-process" and "RPC" at the operator level —
+only at the address level (`flight_addr`).
+
+The M3-tail #1 — replacing the `sleep(3)` coord-side polling with a
+real `TaskDone` ack — is the remaining loose end. Once that lands, the
+last `tokio::time::sleep` barriers in tests can be replaced with
+proper join handles.

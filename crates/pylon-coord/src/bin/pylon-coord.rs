@@ -14,13 +14,12 @@ use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
 use pylon_coord::scheduler::WorkerId;
 use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
 use pylon_proto::pylon::{
-    OpSpec as OpSpecMsg, TaskRequest, TaskResponse,
-    Fragment as FragmentMsg, Distribution as DistributionMsg,
+    TaskRequest, TaskResponse,
 };
 use pylon_proto::worker_server::{Worker, WorkerServer};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as AstExpr, Statement, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -276,7 +275,10 @@ async fn plan_and_dispatch(
     if workers.is_empty() {
         anyhow::bail!("no workers registered");
     }
-    let n_partitions = workers.len().min(DEFAULT_PARTITION_COUNT).max(1);
+    // n_partitions is decided by the fragmenter config and applied
+    // uniformly (see `FragmenterConfig::default_partition_count`).
+    // We don't pin it to `workers.len()` so dispatch stays
+    // independent of cluster size.
 
     // 3. Build the DAG via Fragmenter. For M3 B-3.5: use the
     //    registered workers' flight_addrs to route the partitioned
@@ -319,7 +321,7 @@ async fn plan_and_dispatch(
     };
     // Use 2 partitions for M3 first cut cross-worker demo.
     let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 2 });
-    let dag = match fragmenter.fragment_with_workers(&physical_plan, qid_u64, &worker_flight_addrs) {
+    let dag = match fragmenter.fragment(&physical_plan, qid_u64, &worker_flight_addrs) {
         Ok(d) => d,
         Err(e) => {
             return Err(anyhow::anyhow!("fragment: {e:?}"));
@@ -327,6 +329,36 @@ async fn plan_and_dispatch(
     };
     info!(query_id = qid_u64, stages = dag.stages.len(), "fragmented plan");
     let (stage0_ops, stage1_tasks) = split_dag_for_dispatch(&dag);
+
+    // M3 tail — PR1 (B3): the dispatcher is the authoritative
+    // source for stage1 partition → worker assignment. Rewrite
+    // `ExchangeSinkRpc.target_flight_addrs` in the stage0 ops with
+    // the actual addresses so that same-worker partitions become
+    // a true loopback gRPC target (rather than relying on the
+    // in-process `ExchangeSinkOp` short-circuit that PR2 removes).
+    let stage1_partition_count = dag.stages[1].partition_count;
+    let stage1_flight_addrs: Vec<String> = (0..stage1_partition_count)
+        .map(|p| {
+            worker_flight_addrs
+                .get(p % worker_flight_addrs.len().max(1))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut stage0_ops = stage0_ops;
+    let rewrites = rewrite_exchange_targets_in_place(
+        &mut stage0_ops,
+        stage1_partition_count,
+        &stage1_flight_addrs,
+    );
+    if rewrites > 0 {
+        info!(
+            rewrites,
+            stage1_partition_count,
+            stage1_workers = stage1_flight_addrs.len(),
+            "PR1 dispatch-rewrote ExchangeSinkRpc.target_flight_addrs"
+        );
+    }
 
     let stage0 = pylon_proto::pylon::TaskSpec {
         id: qid_u64.wrapping_mul(1000).wrapping_add(1),
@@ -490,69 +522,7 @@ async fn plan_and_dispatch(
     Ok(())
 }
 
-fn build_stage0_ops(
-    table: &str,
-    _columns: &[String],
-    filter: Option<&(String, String, String)>,
-    n_partitions: usize,
-    query_id: u64,
-) -> Vec<pylon_proto::pylon::OpSpec> {
-    use std::collections::HashMap;
-    let mut ops = vec![pylon_proto::pylon::OpSpec {
-        name: "SeqScan".into(),
-        config: HashMap::from([("path".into(), format!("data/{table}.parquet"))]),
-    }];
-    // PartitionFilter: id % n_partitions == 0 (single-partition M3 first cut)
-    ops.push(pylon_proto::pylon::OpSpec {
-        name: "PartitionFilter".into(),
-        config: HashMap::from([
-            ("col".into(), "id".into()),
-            ("literal".into(), format!("0|{n_partitions}")),
-        ]),
-    });
-    if let Some((col, op_s, lit)) = filter {
-        ops.push(pylon_proto::pylon::OpSpec {
-            name: "Filter".into(),
-            config: HashMap::from([
-                ("col".into(), col.clone()),
-                ("op".into(), op_s.clone()),
-                ("literal".into(), lit.clone()),
-            ]),
-        });
-    }
-    // ExchangeSink at end of Stage 0 — pushes to stage1/task0 via in-process Flight
-    let sink_desc = format!("pylon://query/{query_id}/stage/2/task/0");
-    ops.push(pylon_proto::pylon::OpSpec {
-        name: "ExchangeSink".into(),
-        config: HashMap::from([("descriptor".into(), sink_desc)]),
-    });
-    ops
-}
 
-fn build_stage1_ops(
-    columns: &[String],
-    query_id: u64,
-) -> Vec<pylon_proto::pylon::OpSpec> {
-    use std::collections::HashMap;
-    let mut ops = Vec::new();
-    // ExchangeSource first
-    let source_desc = format!("pylon://query/{query_id}/stage/2/task/0");
-    ops.push(pylon_proto::pylon::OpSpec {
-        name: "ExchangeSource".into(),
-        config: HashMap::from([("descriptor".into(), source_desc)]),
-    });
-    // Project (M3: keep columns as before)
-    if !columns.is_empty() && !(columns.len() == 1 && columns[0] == "*") {
-        ops.push(pylon_proto::pylon::OpSpec {
-            name: "Project".into(),
-            config: HashMap::from([("cols".into(), columns.join(","))]),
-        });
-    }
-    ops
-}
-
-
-/// Split a Fragmenter-produced StageDag into (stage0 ops, per-partition
 /// stage1 task op lists). M3 B-3.5: stage0 is always 1 task (the
 /// Fragmenter emits a single stage0 task with N
 /// ExchangeSink[Rpc] targets). Stage 1 has N partitioned tasks;
@@ -596,6 +566,158 @@ async fn wait_for_stage_done_inner(
     info!(query_id, stage = stage_id, "stage acked (M3 sleep heuristic)");
 }
 
+/// M3 tail — PR1 (B3): rewrite `ExchangeSinkRpc.target_flight_addrs`
+/// at dispatch time so the per-partition flight_addr list reflects
+/// the actual stage1 partition → worker assignment, not the
+/// fragmenter's best-effort round-robin.
+///
+/// The fragmenter emits a placeholder `target_flight_addrs` keyed
+/// off its `worker_flight_addrs` (ordered by registration); the
+/// dispatcher is the authoritative source for which worker runs
+/// stage1 partition p, so we overwrite the placeholder here before
+/// the stage0 task is shipped to the worker. After this rewrite,
+/// same-worker shuffle is naturally expressed as
+/// `target_flight_addr == local flight_addr` (true loopback gRPC);
+/// cross-worker is the original DoExchange behaviour. The
+/// In-process `ExchangeSinkOp` short-circuit was removed in PR2;
+/// only the Flight path remains.
+///
+/// Mutates every `OpSpec` named `ExchangeSinkRpc` in place.
+/// Returns the count rewritten (0 when none present, e.g. for
+/// non-aggregate queries).
+///
+/// Semantics:
+/// - `n_partitions` is the stage1 partition count from
+///   `dag.stages[1].partition_count`.
+/// - For partition p, the rewritten address is
+///   `stage1_flight_addrs[p % stage1_flight_addrs.len()]` when
+///   non-empty, else the empty string. The existing worker factory
+///   (B-2 / B-3.5) enforces `flight_addrs.len() == descs.len()` on
+///   parse, so an empty `stage1_flight_addrs` produces a length
+///   mismatch at the worker (a clear diagnostic) rather than a
+///   silent zero-byte error.
+fn rewrite_exchange_targets_in_place(
+    ops: &mut [pylon_proto::pylon::OpSpec],
+    n_partitions: usize,
+    stage1_flight_addrs: &[String],
+) -> usize {
+    let target_value: String = if stage1_flight_addrs.is_empty() {
+        // n_workers = max(1, len) in the fragmenter; here we mirror
+        // that contract — an empty list still produces a
+        // syntactically valid semicolon-joined string for the
+        // length-mismatch check downstream.
+        std::iter::repeat(String::new())
+            .take(n_partitions)
+            .collect::<Vec<_>>()
+            .join(";")
+    } else {
+        (0..n_partitions)
+            .map(|p| stage1_flight_addrs[p % stage1_flight_addrs.len()].clone())
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let mut count = 0;
+    for op in ops.iter_mut() {
+        if op.name == "ExchangeSinkRpc" {
+            op.config
+                .insert("target_flight_addrs".to_string(), target_value.clone());
+            count += 1;
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod b3_rewrite_tests {
+    use super::rewrite_exchange_targets_in_place;
+    use pylon_proto::pylon::OpSpec as OpSpecMsg;
+    use std::collections::HashMap;
+
+    fn op(name: &str) -> OpSpecMsg {
+        OpSpecMsg {
+            name: name.to_string(),
+            config: HashMap::new(),
+        }
+    }
+
+    fn op_with_config(name: &str, pairs: &[(&str, &str)]) -> OpSpecMsg {
+        let mut o = op(name);
+        for (k, v) in pairs {
+            o.config.insert((*k).to_string(), (*v).to_string());
+        }
+        o
+    }
+
+    #[test]
+    fn rewrites_exchange_sink_rpc_with_full_addr_list() {
+        let mut ops = vec![op_with_config(
+            "ExchangeSinkRpc",
+            &[
+                ("descriptors", "d0;d1;d2;d3"),
+                ("target_flight_addrs", "WRONG;WRONG;WRONG;WRONG"),
+            ],
+        )];
+        let addrs = vec!["a".to_string(), "b".to_string()];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 4, &addrs);
+        assert_eq!(n, 1);
+        // 4 partitions, 2 workers, round-robin
+        assert_eq!(ops[0].config.get("target_flight_addrs").unwrap(), "a;b;a;b");
+        // other keys preserved
+        assert_eq!(ops[0].config.get("descriptors").unwrap(), "d0;d1;d2;d3");
+    }
+
+    #[test]
+    fn no_op_when_no_exchange_sink_rpc() {
+        let mut ops = vec![op("SeqScan"), op("Filter")];
+        let addrs = vec!["a".to_string()];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 4, &addrs);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn empty_addr_list_emits_semicolon_padding() {
+        let mut ops = vec![op("ExchangeSinkRpc")];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 3, &[]);
+        assert_eq!(n, 1);
+        assert_eq!(ops[0].config.get("target_flight_addrs").unwrap(), ";;");
+    }
+
+    #[test]
+    fn rewrites_every_exchange_sink_rpc_op() {
+        let mut ops = vec![
+            op("SeqScan"),
+            op_with_config("ExchangeSinkRpc", &[("descriptors", "d0;d1")]),
+            op_with_config("ExchangeSinkRpc", &[("descriptors", "d2")]),
+        ];
+        let addrs = vec!["a".to_string()];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 2, &addrs);
+        assert_eq!(n, 2);
+        for op in &ops[1..] {
+            assert_eq!(op.config.get("target_flight_addrs").unwrap(), "a;a");
+        }
+    }
+
+    #[test]
+    fn single_partition_single_worker() {
+        let mut ops = vec![op("ExchangeSinkRpc")];
+        let addrs = vec!["only".to_string()];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 1, &addrs);
+        assert_eq!(n, 1);
+        assert_eq!(ops[0].config.get("target_flight_addrs").unwrap(), "only");
+    }
+
+    #[test]
+    fn more_partitions_than_workers_wraps_modulo() {
+        let mut ops = vec![op("ExchangeSinkRpc")];
+        let addrs = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let n = rewrite_exchange_targets_in_place(&mut ops, 7, &addrs);
+        assert_eq!(n, 1);
+        assert_eq!(
+            ops[0].config.get("target_flight_addrs").unwrap(),
+            "x;y;z;x;y;z;x"
+        );
+    }
+}
 
 fn parse_sql(sql: &str) -> Result<Statement> {
     Parser::parse_sql(&GenericDialect {}, sql)
@@ -633,75 +755,6 @@ fn translate_filter_ast(e: &AstExpr) -> Result<(String, String, String)> {
         }
         _ => anyhow::bail!("only binary op filter supported"),
     }
-}
-
-async fn aggregate_results(
-    state: Arc<CoordState>,
-    qid: QueryId,
-    task_ids: Vec<u64>,
-    workers: Vec<Arc<WorkerHandle>>,
-) {
-    let expected: HashSet<u64> = task_ids.into_iter().collect();
-    let mut last: u64 = 0;
-    let mut idle: u32 = 0;
-    let mut all_rows: Vec<arrow_array::RecordBatch> = Vec::new();
-
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        let mut total: u64 = 0;
-        let mut ids: Vec<i64> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
-        for w in &workers {
-            if let Ok(c) = w.completed.lock() {
-                for (tid, batches) in c.iter() {
-                    if !expected.contains(tid) { continue; }
-                    for b in batches {
-                        total += b.num_rows() as u64;
-                        ids.push(b.column(0).as_any()
-                            .downcast_ref::<arrow_array::Int64Array>()
-                            .map(|a| a.value(0)).unwrap_or(*tid as i64));
-                        names.push(format!("worker-tid-{tid}"));
-                    }
-                }
-            }
-        }
-
-        let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
-        ]));
-        if !ids.is_empty() {
-            let ids_arr = arrow_array::Int64Array::from(ids.clone());
-            let names_arr = arrow_array::StringArray::from(names.clone());
-            let batch_res = arrow_array::RecordBatch::try_new(
-                schema,
-                vec![Arc::new(ids_arr) as Arc<dyn arrow_array::Array>, Arc::new(names_arr)],
-            );
-            if let Ok(b) = batch_res {
-                all_rows = vec![b];
-            }
-        }
-
-        if total == last {
-            idle += 1;
-            if idle >= 30 { break; }
-        } else {
-            idle = 0;
-            last = total;
-        }
-        if total >= (expected.len() as u64) * 1000 { break; }
-    }
-
-    state.queries.lock().unwrap().insert(qid, QueryStatus {
-        state: QueryState::Done,
-        rows: all_rows,
-        schema: None,
-        error: None,
-        stage0_task_id: None,
-        stage1_task_ids: vec![],
-    });
-    info!(query_id = qid.0, "aggregated, last_total={last}");
 }
 
 pub struct CoordGrpc { state: Arc<CoordState> }
@@ -851,7 +904,6 @@ impl futures::Stream for SessionOutStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::pin::Pin;
-        use std::task::Poll;
         Pin::new(&mut self.inner).poll_next(cx).map(|opt| opt.map(Ok))
     }
 }

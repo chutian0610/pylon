@@ -10,10 +10,10 @@ use pylon_proto::pylon::{
 use pylon_proto::worker_client::WorkerClient;
 use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightClient, PylonFlightService};
 use pylon_runtime::ops::{
-    AggSpec, ExchangeSinkOp, ExchangeSourceOp, FilterOp, HashAggregateOp,
-    PartitionFilterOp, ProjectOp, SeqScanOp,
+    AggSpec, ExchangeSourceOp, FilterOp, HashAggregateOp, PartitionFilterOp,
+    ProjectOp, SeqScanOp,
 };
-use pylon_runtime::{Driver, DriverMode, Pipeline, PipelineOp};
+use pylon_runtime::{Driver, Pipeline, PipelineOp};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -263,34 +263,6 @@ fn build_op(
             Ok(Box::new(ProjectOp::new(cols, schema)))
         }
         "PartitionFilter" => Ok(Box::new(PartitionFilterOp::new(get("col")?, &get("literal")?)?)),
-        "ExchangeSink" => {
-            // A2-1: two modes.
-            //   - Partitioned: config has `descriptors` (semicolon-joined),
-            //     `n_partitions`, and `partition_keys`. The op routes
-            //     each row by hash of the partition-key column values
-            //     to one of N descriptors.
-            //   - Single: config has `descriptor` (A1 behavior).
-            if let Some(descs_str) = config.get("descriptors") {
-                let descriptors: Vec<FlightDescriptor> = descs_str
-                    .split(';')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| FlightDescriptor(s.to_string()))
-                    .collect();
-                let partition_keys: Vec<String> = get("partition_keys")?
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                Ok(Box::new(ExchangeSinkOp::new_partitioned(
-                    descriptors,
-                    partition_keys,
-                    flight_service.clone(),
-                )))
-            } else {
-                let desc = FlightDescriptor(get("descriptor")?);
-                Ok(Box::new(ExchangeSinkOp::new(desc, flight_service.clone())))
-            }
-        }
         "ExchangeSource" => {
             let desc = FlightDescriptor(get("descriptor")?);
             Ok(Box::new(ExchangeSourceOp::new(desc, flight_service)))
@@ -366,7 +338,6 @@ fn build_op(
 /// buffer; no actual Flight RPC happens here (coord reads the bytes
 /// out of `TaskResponse.batch` and decodes them locally).
 fn encode_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Vec<u8>> {
-    use pylon_exchange::PylonFlightClient;
     // The worker is already running inside a tokio runtime (from
     // `#[tokio::main]`), so we drive the async client via
     // `Handle::current().block_on`. We use a dedicated single-thread

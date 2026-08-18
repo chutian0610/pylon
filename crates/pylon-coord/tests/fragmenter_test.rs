@@ -77,7 +77,7 @@ fn stage0_descriptors(dag: &pylon_coord::StageDag) -> Vec<String> {
         .fragment
         .ops
         .iter()
-        .find(|o| o.name == "ExchangeSink");
+        .find(|o| o.name == "ExchangeSinkRpc");
     match sink {
         None => Vec::new(),
         Some(s) => s
@@ -94,7 +94,7 @@ fn plan_without_aggregate_has_no_boundary() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: 4,
     });
-    let dag = f.fragment_multi_stage(&plan, 0).unwrap();
+    let dag = f.fragment(&plan, 0, &["test_addr".to_string()]).unwrap();
     assert_eq!(dag.stages.len(), 2, "still 2 stages in the dag");
     assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter"]);
     assert!(dag.stages[1].fragment.ops.is_empty());
@@ -106,9 +106,9 @@ fn plan_with_aggregate_cuts_boundary_at_aggregate() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: 4,
     });
-    let dag = f.fragment_multi_stage(&plan, 99).unwrap();
+    let dag = f.fragment(&plan, 99, &["test_addr".to_string()]).unwrap();
     // Stage 0: Scan, Filter, ExchangeSink
-    assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter", "ExchangeSink"]);
+    assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter", "ExchangeSinkRpc"]);
     // Stage 1: 4× (ExchangeSource + Aggregate) per partition.
     // Fragmenter layout: N sources first, then N aggregates, so
     // [ExchangeSource, ExchangeSource, ExchangeSource, ExchangeSource,
@@ -126,7 +126,7 @@ fn aggregate_emits_n_partition_descriptors() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: n,
     });
-    let dag = f.fragment_multi_stage(&plan, 7).unwrap();
+    let dag = f.fragment(&plan, 7, &["test_addr".to_string()]).unwrap();
     let descs = stage0_descriptors(&dag);
     assert_eq!(descs.len(), n, "n descriptors for n partitions");
     // All descriptors are well-formed and have the right qid/stage/partition.
@@ -146,7 +146,7 @@ fn aggregate_emits_n_exchange_sources_with_matching_descriptors() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: n,
     });
-    let dag = f.fragment_multi_stage(&plan, 11).unwrap();
+    let dag = f.fragment(&plan, 11, &["test_addr".to_string()]).unwrap();
     let sources: Vec<&str> = dag.stages[1]
         .fragment
         .ops
@@ -166,7 +166,7 @@ fn aggregate_op_spec_carries_partition_keys_and_agg_specs() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: 4,
     });
-    let dag = f.fragment_multi_stage(&plan, 1).unwrap();
+    let dag = f.fragment(&plan, 1, &["test_addr".to_string()]).unwrap();
     let agg = dag.stages[1]
         .fragment
         .ops
@@ -190,12 +190,12 @@ fn partitioned_sink_op_spec_carries_partition_keys_and_n_partitions() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: n,
     });
-    let dag = f.fragment_multi_stage(&plan, 1).unwrap();
+    let dag = f.fragment(&plan, 1, &["test_addr".to_string()]).unwrap();
     let sink = dag.stages[0]
         .fragment
         .ops
         .iter()
-        .find(|o| o.name == "ExchangeSink")
+        .find(|o| o.name == "ExchangeSinkRpc")
         .expect("ExchangeSink present");
     assert_eq!(
         sink.config.get("partition_keys").map(|s| s.as_str()),
@@ -222,12 +222,12 @@ fn descriptor_partition_assignment_is_consistent() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: n,
     });
-    let dag = f.fragment_multi_stage(&plan, 42).unwrap();
+    let dag = f.fragment(&plan, 42, &["test_addr".to_string()]).unwrap();
     let sink_descs: Vec<String> = dag.stages[0]
         .fragment
         .ops
         .iter()
-        .find(|o| o.name == "ExchangeSink")
+        .find(|o| o.name == "ExchangeSinkRpc")
         .unwrap()
         .config
         .get("descriptors")
@@ -252,12 +252,12 @@ fn plan_with_aggregate_below_filter_still_cuts_once() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: 4,
     });
-    let dag = f.fragment_multi_stage(&plan, 1).unwrap();
+    let dag = f.fragment(&plan, 1, &["test_addr".to_string()]).unwrap();
     let n_sinks = dag.stages[0]
         .fragment
         .ops
         .iter()
-        .filter(|o| o.name == "ExchangeSink")
+        .filter(|o| o.name == "ExchangeSinkRpc")
         .count();
     let n_sources = dag.stages[1]
         .fragment
@@ -283,7 +283,7 @@ fn stage_partition_count_matches_config() {
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: n,
     });
-    let dag = f.fragment_multi_stage(&plan, 1).unwrap();
+    let dag = f.fragment(&plan, 1, &["test_addr".to_string()]).unwrap();
     assert_eq!(dag.stages[0].partition_count, n);
     assert_eq!(dag.stages[1].partition_count, n);
 }

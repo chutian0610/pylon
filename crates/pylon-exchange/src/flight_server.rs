@@ -1,5 +1,4 @@
 use arrow_array::RecordBatch;
-use pylon_types::PylonError;
 use pylon_types::Result;
 use std::collections::HashMap;
 use std::sync::Arc;

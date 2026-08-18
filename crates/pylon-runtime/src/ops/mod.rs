@@ -8,7 +8,7 @@ pub mod seq_scan;
 
 pub use aggregate::{build_aggregate_output_schema, AggSpec, HashAggregateOp};
 pub use arrow_compute::filter_record_batch;
-pub use exchange::{ExchangeSinkOp, ExchangeSinkRpc, ExchangeSourceOp, RpcTarget};
+pub use exchange::{ExchangeSinkRpc, ExchangeSourceOp, RpcTarget};
 pub use filter::FilterOp;
 pub use partition_filter::PartitionFilterOp;
 pub use project::ProjectOp;

@@ -1,25 +1,24 @@
-//! A2-2 end-to-end: in-process 2-stage `SeqScan → ExchangeSink(partitioned)`
-//! + N× `ExchangeSource → HashAggregate` pipelines running on
-//! `data/sample.parquet`.
+//! M3+ 2-stage aggregate e2e: `SeqScan → ExchangeSinkRpc`
+//! (partitioned, RPC) + N × `ExchangeSource → HashAggregate`
+//! against a single loopback Arrow Flight server.
 //!
-//! The test mirrors the real cross-task shuffle topology: stage0
-//! emits batches to N partition descriptors (via the partitioned
-//! `ExchangeSinkOp`); N stage1 tasks each pull from one descriptor
-//! and aggregate independently. The global result is the concat of
-//! all N stage1 outputs (no group spans partitions, so no
-//! cross-partition merge is needed).
-//!
-//! This is the **A2** wire-up — single worker, in-process, no real
-//! Flight RPC. The 2-worker cross-process version is **B (TODO)**.
+//! This mirrors the production same-worker path (PR2 in
+//! `docs/roadmap/m3-tail-exchange-unify.md`): every batch is sent
+//! over a real `DoExchange` gRPC frame even when source and
+//! destination are the same process. Hash-partition stability is
+//! the A2 contract; the transport is now uniform with cross-worker.
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Schema};
 use pylon_exchange::{FlightDescriptor, PylonFlightService};
 use pylon_runtime::ops::{
-    AggSpec, ExchangeSinkOp, ExchangeSourceOp, HashAggregateOp, SeqScanOp,
+    AggSpec, ExchangeSinkRpc, ExchangeSourceOp, HashAggregateOp, RpcTarget, SeqScanOp,
 };
 use pylon_runtime::{Driver, Pipeline, PipelineOp};
 
@@ -38,10 +37,20 @@ fn make_descriptors(query_id: u64, stage_id: u64, n: usize) -> Vec<FlightDescrip
         .collect()
 }
 
+fn make_targets(
+    addr: std::net::SocketAddr,
+    descs: &[FlightDescriptor],
+) -> Vec<RpcTarget> {
+    descs
+        .iter()
+        .map(|d| RpcTarget {
+            flight_addr: addr.to_string(),
+            descriptor: d.clone(),
+        })
+        .collect()
+}
+
 fn expected_aggregates() -> Vec<(String, i64, f64)> {
-    // Same expected-aggregate helper as A1-5's E2E: read the parquet
-    // file with the parquet crate and compute the answer in pure
-    // Rust.
     let path = sample_path();
     let file = std::fs::File::open(&path).expect("sample.parquet open");
     let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
@@ -84,15 +93,14 @@ fn expected_aggregates() -> Vec<(String, i64, f64)> {
     acc.into_iter().map(|(k, (c, s))| (k, c, s)).collect()
 }
 
-fn make_stage0_pipeline(service: Arc<PylonFlightService>, n_partitions: usize) -> Pipeline {
+fn make_stage0_pipeline(targets: Vec<RpcTarget>) -> Pipeline {
     let scan: Box<dyn PipelineOp> = Box::new(SeqScanOp::new(
         sample_path().to_string_lossy().to_string(),
         8192,
     ));
-    let sink: Box<dyn PipelineOp> = Box::new(ExchangeSinkOp::new_partitioned(
-        make_descriptors(1, 2, n_partitions),
+    let sink: Box<dyn PipelineOp> = Box::new(ExchangeSinkRpc::new_partitioned(
+        targets,
         vec!["name".into()],
-        service,
     ));
     Pipeline::new(vec![scan, sink])
 }
@@ -132,45 +140,54 @@ async fn collect_final_batches(mut rx: tokio::sync::mpsc::Receiver<RecordBatch>)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     let n_partitions = 4;
-    let service = Arc::new(PylonFlightService::new());
+    let (addr, service, h) = common::start_flight_server().await;
+    let descs = make_descriptors(1, 2, n_partitions);
+    let targets = make_targets(addr, &descs);
 
-    // Stage 0 + N stage 1 tasks run in parallel; the in-process
-    // PylonFlightService acts as the "wire" between them.
-    let stage0_driver = Driver::new(make_stage0_pipeline(service.clone(), n_partitions));
+    let stage0_driver = Driver::new(make_stage0_pipeline(targets));
     let mut stage1_drivers: Vec<Driver> = (0..n_partitions)
         .map(|p| {
             Driver::new(make_stage1_pipeline(
                 service.clone(),
-                make_descriptors(1, 2, n_partitions)[p].clone(),
+                descs[p].clone(),
             ))
         })
         .collect();
 
-    // Run stage0 + all stage1 concurrently.
-    let mut handles = Vec::new();
-    handles.push(tokio::spawn(async move {
+    // Run Stage 0 to completion first, then a brief barrier so the
+    // DoExchange tasks (spawned by `ExchangeSinkRpc`) flush, then
+    // Stage 1. Sequential stages avoid the ExchangeSourceOp
+    // `producer_done_threshold` heuristic (5 empty polls × 50 ms)
+    // tripping between stage0 driver exit and RPC completion.
+    //
+    // M3-tail item #1 — real TaskDone ack — replaces the sleep
+    // with an explicit barrier; for now the heuristic + sleep is
+    // good enough for the e2e shape test.
+    let stage0_handle = tokio::spawn(async move {
         let rx = stage0_driver.run(None).await.expect("stage0 run");
         collect_final_batches(rx).await
-    }));
-    for d in stage1_drivers.drain(..) {
-        handles.push(tokio::spawn(async move {
-            let rx = d.run(None).await.expect("stage1 run");
-            collect_final_batches(rx).await
-        }));
-    }
-    let results = futures::future::join_all(handles).await;
-    let stage0_batches = results[0].as_ref().expect("stage0 task ok");
-    // Stage 0 has a sink op (no output batches), but the driver
-    // still produces a final receiver; it should be empty.
+    });
+    let stage0_batches = stage0_handle.await.expect("stage0 task ok");
     assert!(
         stage0_batches.is_empty(),
         "stage0 sink produces no output batches"
     );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let results: Vec<_> = futures::future::join_all(
+        stage1_drivers
+            .into_iter()
+            .map(|d| tokio::spawn(async move {
+                let rx = d.run(None).await.expect("stage1 run");
+                collect_final_batches(rx).await
+            }))
+            .collect::<Vec<_>>(),
+    )
+    .await;
 
-    // Each stage1 task emits exactly 1 final batch.
     let mut stage1_batches: Vec<RecordBatch> = Vec::new();
-    for (i, h) in results[1..].iter().enumerate() {
+    for (i, h) in results.iter().enumerate() {
         let batches = h.as_ref().unwrap_or_else(|e| panic!("stage1 {i}: {e}"));
+
         assert_eq!(
             batches.len(),
             1,
@@ -179,16 +196,11 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
         stage1_batches.push(batches[0].clone());
     }
 
-    // Concat all stage1 outputs. Since each group goes to exactly
-    // one partition, no group appears in two batches — concat is the
-    // full global result.
     let all_batches: Vec<RecordBatch> = stage1_batches;
     let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
     let expected = expected_aggregates();
     assert_eq!(total_rows, expected.len(), "groups span all partitions");
 
-    // Verify the schema of one stage1 batch (they all share the
-    // post-aggregate schema).
     let schema = &all_batches[0].schema();
     assert_eq!(schema.fields().len(), 3);
     assert_eq!(schema.field(0).name(), "name");
@@ -198,8 +210,6 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     assert_eq!(schema.field(2).name(), "sum_amount");
     assert_eq!(schema.field(2).data_type(), &DataType::Float64);
 
-    // Aggregate (name, count, sum) across all stage1 batches into a
-    // single map, then compare to expected.
     let mut actual: std::collections::BTreeMap<String, (i64, f64)> =
         std::collections::BTreeMap::new();
     for b in &all_batches {
@@ -222,28 +232,22 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
         let diff = (got_s - exp_sum).abs();
         assert!(diff < 1e-3, "{exp_name} sum: expected {exp_sum}, got {got_s}");
     }
+    h.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_same_groups_not_split_across_partitions() {
-    // Stronger guarantee: each distinct name goes to exactly one
-    // partition. We can't trivially observe this from the result,
-    // but we can prove it via the row count per stage1 task. If the
-    // hash were broken, the per-task rows would not equal the
-    // global count's split.
-    //
-    // A subtler check: each stage1 task's final batch has at most
-    // as many distinct (name, count) entries as there are distinct
-    // names — meaning within a partition, no name is double-emitted.
     let n_partitions = 4;
-    let service = Arc::new(PylonFlightService::new());
+    let (addr, service, h) = common::start_flight_server().await;
+    let descs = make_descriptors(1, 2, n_partitions);
+    let targets = make_targets(addr, &descs);
 
-    let stage0_driver = Driver::new(make_stage0_pipeline(service.clone(), n_partitions));
+    let stage0_driver = Driver::new(make_stage0_pipeline(targets));
     let mut stage1_drivers: Vec<Driver> = (0..n_partitions)
         .map(|p| {
             Driver::new(make_stage1_pipeline(
                 service.clone(),
-                make_descriptors(1, 2, n_partitions)[p].clone(),
+                descs[p].clone(),
             ))
         })
         .collect();
@@ -265,8 +269,6 @@ async fn e2e_2stage_same_groups_not_split_across_partitions() {
         .map(|h| h.as_ref().unwrap().clone())
         .collect();
 
-    // Each (name, count) pair must appear in exactly one stage1
-    // output. This is the "groups are partition-stable" check.
     let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for batches in &stage1_results {
         for b in batches {
@@ -285,4 +287,5 @@ async fn e2e_2stage_same_groups_not_split_across_partitions() {
             "name {exp_name} should appear in exactly 1 stage1 task's output"
         );
     }
+    h.abort();
 }

@@ -97,24 +97,6 @@ fn mk_agg_op() -> HashAggregateOp {
     op
 }
 
-/// Drain all batches the source has from the local PylonFlightService
-/// for `descriptor`. Runs the sink's `add_input` and then
-/// `no_more_input` so the aggregate sees the EOS marker.
-async fn drain_source(service: Arc<PylonFlightService>, desc: FlightDescriptor) -> Vec<RecordBatch> {
-    let mut source = ExchangeSourceOp::new(desc, service);
-    let mut batches = Vec::new();
-    // Replicate the driver loop's read-until-EOF behavior:
-    for _ in 0..1000 {
-        match source.get_output().await.unwrap() {
-            Some(b) => batches.push(b),
-            None => break,
-        }
-    }
-    let _ = source.no_more_input().await;
-    let _ = source.is_finished().await;
-    batches
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_in_process_flight_servers_exchange_real_dopexchange() {
     // ---- Arrange: two Arrow Flight servers on kernel-assigned ports.

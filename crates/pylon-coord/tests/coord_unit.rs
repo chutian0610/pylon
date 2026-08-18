@@ -114,7 +114,7 @@ fn fragmenter_collapses_simple_plan_into_single_stage() {
     };
 
     let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 16 });
-    let dag = fragmenter.fragment_multi_stage(&plan, 0).expect("fragmenter ok");
+    let dag = fragmenter.fragment(&plan, 0, &["test_addr".to_string()]).expect("fragmenter ok");
 
     
     assert_eq!(dag.stages[0].partition_count, 16);
