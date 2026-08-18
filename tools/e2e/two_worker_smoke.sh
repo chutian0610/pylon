@@ -100,11 +100,10 @@ echo "OK: all workers have flight_addr registered"
 
 echo ""
 echo "=== Step 2: Send a simple query (B-1+B-2 wiring end-to-end) ==="
-# For B-3, this query's stage0 currently emits in-process ExchangeSink
-# (since coord doesn't pass worker_flight_addrs to the Fragmenter).
-# Both workers run the same task locally. The coord's existing
-# dispatch sends stage0 to all workers and stage1 to the first worker.
-QUERY="SELECT name FROM sample"
+# Real cross-worker Flight shuffle: stage0 on worker 0 scans
+# the data and per-row hashes to one of N target worker
+# flight_addrs; stage1 partition p runs on worker p % n_workers.
+QUERY="SELECT name, COUNT(*) FROM sample GROUP BY name"
 QID_RESP=$(curl -s -X POST "http://127.0.0.1:$COORD_HTTP_PORT/v1/query" \
     -H "Content-Type: application/json" \
     -d "{\"sql\": \"$QUERY\"}")

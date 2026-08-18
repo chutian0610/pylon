@@ -10,7 +10,9 @@ use axum::{
 };
 use futures::StreamExt;
 use pylon_coord::query::{QueryId, QueryState};
+use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
 use pylon_coord::scheduler::WorkerId;
+use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
 use pylon_proto::pylon::{
     OpSpec as OpSpecMsg, TaskRequest, TaskResponse,
     Fragment as FragmentMsg, Distribution as DistributionMsg,
@@ -35,6 +37,13 @@ struct QueryStatus {
     rows: Vec<arrow_array::RecordBatch>,
     schema: Option<arrow_schema::SchemaRef>,
     error: Option<String>,
+    /// M3 B-3.5: task IDs of dispatched tasks.
+    /// - `stage0_task_id`: the single stage0 task (for non-aggregate
+    ///   queries, the result comes from this task).
+    /// - `stage1_task_ids`: per-partition stage1 tasks (for aggregate
+    ///   queries, the result is the union of these).
+    stage0_task_id: Option<u64>,
+    stage1_task_ids: Vec<u64>,
 }
 
 impl Clone for QueryStatus {
@@ -44,6 +53,8 @@ impl Clone for QueryStatus {
             rows: self.rows.clone(),
             schema: self.schema.clone(),
             error: self.error.clone(),
+            stage0_task_id: self.stage0_task_id,
+            stage1_task_ids: self.stage1_task_ids.clone(),
         }
     }
 }
@@ -121,27 +132,28 @@ async fn submit_query(
     let qid_str = format!("q-{qid_num:08x}");
     info!(query_id = %qid_str, sql = %req.sql, "submit");
 
+    // M3 B-3.5: insert the entry BEFORE plan_and_dispatch so the
+    // polling task spawned inside it can read stage0_task_id.
+    state.queries.lock().unwrap().entry(qid).or_insert(QueryStatus {
+        state: QueryState::Running,
+        rows: vec![],
+        schema: None,
+        error: None,
+        stage0_task_id: None,
+        stage1_task_ids: vec![],
+    });
     let result = plan_and_dispatch(state.clone(), qid, &req.sql).await;
 
     let success = result.is_ok();
     let body = match result {
-        Ok(_) => {
-            state.queries.lock().unwrap().entry(qid).or_insert(QueryStatus {
-                state: QueryState::Running,
-                rows: vec![],
-                schema: None,
-                error: None,
-            });
-            QuerySubmitted { query_id: qid_str.clone(), state: "running".into() }
-        }
+        Ok(_) => QuerySubmitted { query_id: qid_str.clone(), state: "running".into() },
         Err(e) => {
             warn!(query_id = %qid_str, "plan_dispatch failed: {e:?}");
-            state.queries.lock().unwrap().insert(qid, QueryStatus {
-                state: QueryState::Failed,
-                rows: vec![],
-                schema: None,
-                error: Some(format!("{e:?}")),
-            });
+            let mut qmap = state.queries.lock().unwrap();
+            if let Some(q) = qmap.get_mut(&qid) {
+                q.state = QueryState::Failed;
+                q.error = Some(format!("{e:?}"));
+            }
             QuerySubmitted { query_id: qid_str.clone(), state: "failed".into() }
         }
     };
@@ -234,13 +246,22 @@ async fn plan_and_dispatch(
     let mut columns: Vec<String> = Vec::new();
     for item in &body.projection {
         if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
-            if let AstExpr::Identifier(ident) = e {
-                columns.push(ident.value.clone());
-            } else {
-                anyhow::bail!("only column refs in projection");
+            match e {
+                AstExpr::Identifier(ident) => {
+                    columns.push(ident.value.clone());
+                }
+                // Skip aggregate functions / wildcards in the
+                // projection — pylon-plan's logical_from_sql
+                // handles those. We just want to know which input
+                // columns are needed.
+                _ => {}
             }
+        } else if let sqlparser::ast::SelectItem::Wildcard(_) = item {
+            // SELECT * — include all columns
         } else {
-            anyhow::bail!("only UnnamedExpr projection");
+            // SELECT ... AS alias or QualifiedWildcard — let
+            // pylon-plan parse; we don't need to extract column
+            // names manually.
         }
     }
 
@@ -257,10 +278,55 @@ async fn plan_and_dispatch(
     }
     let n_partitions = workers.len().min(DEFAULT_PARTITION_COUNT).max(1);
 
-    // 3. Build the 2-stage DAG (Stage 0 + Stage 1)
+    // 3. Build the DAG via Fragmenter. For M3 B-3.5: use the
+    //    registered workers' flight_addrs to route the partitioned
+    //    ExchangeSinkRpc in stage0 across the workers.
     let qid_u64 = qid.0;
-    let stage0_op_specs = build_stage0_ops(&table, &columns, filter_pred.as_ref(), n_partitions, qid_u64);
-    let stage1_op_specs = build_stage1_ops(&columns, qid_u64);
+    let worker_flight_addrs: Vec<String> = workers
+        .iter()
+        .filter_map(|w| w.flight_addr.clone())
+        .collect();
+    // Build a minimal catalog + parse the SQL to a PhysicalPlan.
+    let mut catalog = CatalogStub::new();
+    catalog.register(
+        &table,
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Float64, false),
+        ])),
+        &format!("data/{table}.parquet"),
+    );
+    // M3 B-3.5: pass the original SQL straight to pylon-plan's
+    // translator so aggregate / GROUP BY clauses survive. (The
+    // `columns` / `filter_pred` extraction above was just for the
+    // legacy in-process dispatch path; with the Fragmenter we don't
+    // need to re-synthesize the SQL here.)
+    let _ = (columns, filter_pred.as_ref());
+    let logical_plan = match logical_from_sql(sql, &catalog) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::anyhow!("logical plan: {e:?}"));
+        }
+    };
+    let physical_plan = match physical_from_logical(logical_plan) {
+        Ok(p) => {
+                    p
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("physical plan: {e:?}"));
+        }
+    };
+    // Use 2 partitions for M3 first cut cross-worker demo.
+    let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 2 });
+    let dag = match fragmenter.fragment_with_workers(&physical_plan, qid_u64, &worker_flight_addrs) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(anyhow::anyhow!("fragment: {e:?}"));
+        }
+    };
+    info!(query_id = qid_u64, stages = dag.stages.len(), "fragmented plan");
+    let (stage0_ops, stage1_tasks) = split_dag_for_dispatch(&dag);
 
     let stage0 = pylon_proto::pylon::TaskSpec {
         id: qid_u64.wrapping_mul(1000).wrapping_add(1),
@@ -268,44 +334,42 @@ async fn plan_and_dispatch(
         stage_id: 1,
         partition: 0,                    // Single task per worker; concurrency on workers side
         fragment: Some(pylon_proto::pylon::Fragment {
-            ops: stage0_op_specs,
+            ops: stage0_ops.clone(),
             distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
         }),
         sources: vec![],
         sinks: vec![],
         memory_budget_bytes: 256 * 1024 * 1024,
     };
-    let stage1 = pylon_proto::pylon::TaskSpec {
-        id: qid_u64.wrapping_mul(1000).wrapping_add(2),
-        query_id: qid_u64,
-        stage_id: 2,
-        partition: 0,
-        fragment: Some(pylon_proto::pylon::Fragment {
-            ops: stage1_op_specs,
-            distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
-        }),
-        sources: vec![],
-        sinks: vec![],
-        memory_budget_bytes: 256 * 1024 * 1024,
-    };
+    // (Stage1 dispatch happens in the spawned task below, per-partition.)
 
-    // 4. Dispatch Stage 0 to all workers (parallel).
-    let stage0_tasks: Vec<(pylon_proto::pylon::TaskSpec, Arc<WorkerHandle>)> = (0..workers.len())
-        .map(|i| (stage0.clone(), workers[i].clone()))
-        .collect();
-    let _ = stage0_tasks; // unused in M3 first cut: assign per-worker below
-    for (i, w) in workers.iter().enumerate() {
+    // 4. Dispatch Stage 0 to ONE worker (M3 first cut: only the
+    //    first worker scans the data; the cross-worker shuffle is
+    //    driven by stage0's ExchangeSinkRpc targeting each worker's
+    //    flight_addr).
+    if let Some(w) = workers.first() {
         w.tx
             .send(TaskRequest { spec: Some(stage0.clone()) })
             .await
             .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
-        info!(stage = 0, worker = i, "stage0 dispatched");
+        info!(stage = 0, worker = 0, "stage0 dispatched");
+        // Save stage0 task ID for the polling task to drain.
+        {
+            let mut qmap = state.queries.lock().unwrap();
+            info!(stage = 0, qid = ?qid, qmap_len = qmap.len(), keys = ?qmap.keys().collect::<Vec<_>>(), "save stage0_task_id");
+            if let Some(q) = qmap.get_mut(&qid) {
+                q.stage0_task_id = Some(stage0.id);
+                info!(stage = 0, task_id = stage0.id, "saved stage0_task_id");
+            } else {
+                info!(stage = 0, qid = ?qid, "qmap.get_mut returned None");
+            }
+        }
     }
 
-    // 5. Wait for all Stage 0 tasks to complete (count DONE acks)
-    let expected_stage0_acks = workers.len();
-    let stage1_for_send = stage1.clone();
+    let expected_stage0_acks = 1;
     let state_for_send = state.clone();
+    let workers_snapshot = workers.clone();
+    let stage1_tasks_clone = stage1_tasks.clone();
     tokio::spawn(async move {
         wait_for_stage_done_inner(
             state.clone(),
@@ -313,57 +377,111 @@ async fn plan_and_dispatch(
             1u64,
             expected_stage0_acks,
         ).await;
-        // After Stage 0: dispatch Stage 1 to first worker
-        let first_worker = match state_for_send.workers.lock().unwrap().values().next() {
-            Some(w) => w.clone(),
-            None => {
-                warn!("no workers registered for stage 1");
-                return;
+        // After Stage 0: dispatch each stage1 partition task to a
+        // worker (round-robin: partition p → worker p % n_workers).
+        if stage1_tasks_clone.is_empty() {
+            info!(stage = 1, "no stage1 tasks (non-aggregate query)");
+        } else {
+            let n_workers = workers_snapshot.len().max(1);
+            let mut dispatched_ids: Vec<u64> = Vec::new();
+            for (p, partition_ops) in stage1_tasks_clone.iter().enumerate() {
+                let worker_idx = p % n_workers;
+                let worker = match workers_snapshot.get(worker_idx) {
+                    Some(w) => w.clone(),
+                    None => {
+                        warn!(partition = p, "no worker for partition");
+                        continue;
+                    }
+                };
+                let stage1_task_id = qid_u64
+                    .wrapping_mul(1000)
+                    .wrapping_add(2)
+                    .wrapping_add(p as u64);
+                let task_spec = pylon_proto::pylon::TaskSpec {
+                    id: stage1_task_id,
+                    query_id: qid_u64,
+                    stage_id: 2,
+                    partition: p as u32,
+                    fragment: Some(pylon_proto::pylon::Fragment {
+                        ops: partition_ops.clone(),
+                        distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
+                    }),
+                    sources: vec![],
+                    sinks: vec![],
+                    memory_budget_bytes: 256 * 1024 * 1024,
+                };
+                if worker.tx
+                    .send(TaskRequest { spec: Some(task_spec.clone()) })
+                    .await
+                    .is_err()
+                {
+                    warn!(partition = p, worker = worker_idx, "stage1 send failed");
+                    continue;
+                }
+                info!(stage = 1, partition = p, worker = worker_idx, task_id = stage1_task_id, "stage1 dispatched");
+                dispatched_ids.push(stage1_task_id);
             }
-        };
-        if first_worker.tx
-            .send(TaskRequest { spec: Some(stage1_for_send.clone()) })
-            .await
-            .is_err()
-        {
-            warn!("worker stage1 send failed");
-            return;
+            // Save the dispatched task IDs for the polling task below
+            // to know which task IDs to drain from the workers'
+            // completed maps.
+            {
+                let mut qmap = state_for_send.queries.lock().unwrap();
+                if let Some(q) = qmap.get_mut(&pylon_coord::QueryId(qid_u64)) {
+                    q.stage1_task_ids = dispatched_ids.clone();
+                }
+            }
         }
-        info!(stage = 1, "stage1 dispatched");
 
-        // After Stage 1 dispatch: poll for completion and aggregate Stage 1
-        // results into QueryStatus.rows. Future: track by query_id+stage_id
-        // TaskDone acknowledgement.
+        // After Stage 1 dispatch: poll for completion and aggregate
+        // stage1 results from all dispatched task IDs.
         let qid_inner = qid_u64;
         let state_inner = state_for_send.clone();
-        let task1_id = stage1_for_send.id;
+        // Read the dispatched task IDs we saved earlier.
+        let (stage0_task_id, stage1_task_ids): (Option<u64>, Vec<u64>) = {
+            let qmap = state_inner.queries.lock().unwrap();
+            let result = qmap
+                .get(&pylon_coord::QueryId(qid_inner))
+                .map(|q| (q.stage0_task_id, q.stage1_task_ids.clone()))
+                .unwrap_or((None, vec![]));
+            info!(stage0_task_id = ?result.0, stage1_task_ids = ?result.1, "polling: read task ids");
+            result
+        };
         tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            // Drain the worker's "completed" map for stage 1 task id
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
-            let schema: arrow_schema::SchemaRef = std::sync::Arc::new(arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-                arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
-            ]));
-            let qid_q = pylon_coord::query::QueryId(qid_inner);
+            let mut schema: Option<arrow_schema::SchemaRef> = None;
+            let qid_q = pylon_coord::QueryId(qid_inner);
+            // Collect all task IDs to drain (stage0 + stage1).
+            let mut task_ids: Vec<u64> = Vec::new();
+            if let Some(t) = stage0_task_id { task_ids.push(t); }
+            task_ids.extend(stage1_task_ids.iter().copied());
             {
                 let workers_lock = state_inner.workers.lock().unwrap();
                 let mut seen = 0usize;
                 for w in workers_lock.values() {
                     let comp = w.completed.lock().unwrap();
-                    if let Some(batches) = comp.get(&task1_id) {
-                        for b in batches {
-                            seen += b.num_rows();
-                            all_batches.push(b.clone());
+                    for tid in &task_ids {
+                        if let Some(batches) = comp.get(tid) {
+                            for b in batches {
+                                if schema.is_none() {
+                                    schema = Some(b.schema());
+                                }
+                                seen += b.num_rows();
+                                all_batches.push(b.clone());
+                            }
                         }
                     }
                 }
-                info!(stage = 1, "aggregated {} rows from stage1", seen);
+                info!(
+                    rows = seen,
+                    batches = all_batches.len(),
+                    "aggregated task results"
+                );
             }
             let mut qmap = state_inner.queries.lock().unwrap();
             if let Some(s) = qmap.get_mut(&qid_q) {
-                s.rows = all_batches.clone();
-                s.schema = Some(schema);
+                s.rows = all_batches;
+                s.schema = schema;
                 s.state = pylon_coord::query::QueryState::Done;
             }
         });
@@ -431,6 +549,38 @@ fn build_stage1_ops(
         });
     }
     ops
+}
+
+
+/// Split a Fragmenter-produced StageDag into (stage0 ops, per-partition
+/// stage1 task op lists). M3 B-3.5: stage0 is always 1 task (the
+/// Fragmenter emits a single stage0 task with N
+/// ExchangeSink[Rpc] targets). Stage 1 has N partitioned tasks;
+/// each is `[ExchangeSource, Aggregate]` (the Fragmenter emits them
+/// as a flat `stage1_ops` list with the [source, agg] pair layout).
+fn split_dag_for_dispatch(
+    dag: &pylon_coord::StageDag,
+) -> (Vec<pylon_proto::pylon::OpSpec>, Vec<Vec<pylon_proto::pylon::OpSpec>>) {
+    let to_proto = |op: &pylon_coord::stage::OpSpec| pylon_proto::pylon::OpSpec {
+        name: op.name.clone(),
+        config: op.config.clone(),
+    };
+    let stage0_ops: Vec<pylon_proto::pylon::OpSpec> =
+        dag.stages[0].fragment.ops.iter().map(&to_proto).collect();
+    let stage1_ops = &dag.stages[1].fragment.ops;
+    let n_partitions = dag.stages[1].partition_count;
+    let mut tasks: Vec<Vec<pylon_proto::pylon::OpSpec>> = Vec::with_capacity(n_partitions);
+    if n_partitions == 0 {
+        return (stage0_ops, tasks);
+    }
+    // Layout: N sources first, then N aggregates. Slice into N pairs.
+    let half = stage1_ops.len() / 2;
+    let n = half.min(n_partitions);
+    for i in 0..n {
+        let pair = vec![to_proto(&stage1_ops[i]), to_proto(&stage1_ops[half + i])];
+        tasks.push(pair);
+    }
+    (stage0_ops, tasks)
 }
 
 /// Wait for stage N to complete (sleep-based heuristic in M3 first cut).
@@ -548,6 +698,8 @@ async fn aggregate_results(
         rows: all_rows,
         schema: None,
         error: None,
+        stage0_task_id: None,
+        stage1_task_ids: vec![],
     });
     info!(query_id = qid.0, "aggregated, last_total={last}");
 }
@@ -654,7 +806,9 @@ impl Worker for CoordGrpc {
                                         .unwrap()
                                         .entry(tid)
                                         .or_default()
-                                        .extend(batches);
+                                        .extend(batches.clone());
+                                    let stored = completed.lock().unwrap().get(&tid).map(|v| v.len()).unwrap_or(0);
+                                    debug!(worker = worker_id.0, task_id = tid, stored_batches = stored, "stored in completed");
                                 }
                                 Ok(_) => {
                                     // Empty stream (just schema + EOS). Ignore.
