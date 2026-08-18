@@ -95,6 +95,10 @@ impl Fragmenter {
             upstream: Vec::new(),
             downstream: vec![stage1_id],
         };
+        // M3 B-3: stage1 is split into N per-partition tasks at
+        // dispatch time. We expose the flat ops + partition count
+        // via a public method; here we still build a single Stage
+        // (coord splits when dispatching).
         let stage1 = Stage {
             id: stage1_id,
             fragment: Fragment {
@@ -243,8 +247,11 @@ fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId
                 config: sink_config,
             });
 
-            // 2. Head of stage1: N ExchangeSource ops, one per partition.
-            for p in 0..n {
+            // 2. Head of stage1: N ExchangeSource ops, one per
+            //    partition. Layout: per-partition pair
+            //    [ExchangeSource, Aggregate], so the coord can split
+            //    by walking 2 ops at a time.
+for p in 0..n {
                 let desc = format!(
                     "pylon://query/{}/stage/{}/task/{}",
                     ctx.query_id,
@@ -256,14 +263,16 @@ fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId
                     config: kv(&[("descriptor", &desc)]),
                 });
             }
-            // 3. Tail of stage1: the Aggregate op itself.
-            child.stage1_ops.push(OpSpec {
-                name: "Aggregate".to_string(),
-                config: kv(&[
-                    ("group_by_cols", &group_cols.join(",")),
-                    ("agg_specs", &agg_specs.join(";")),
-                ]),
-            });
+            // 3. Tail of stage1: the Aggregate op (one per partition).
+            for _p in 0..n {
+                child.stage1_ops.push(OpSpec {
+                    name: "Aggregate".to_string(),
+                    config: kv(&[
+                        ("group_by_cols", &group_cols.join(",")),
+                        ("agg_specs", &agg_specs.join(";")),
+                    ]),
+                });
+            }
             // Stage 1 doesn't know its post-aggregate schema in the
             // OpSpec config (M3 A1-4 — the op derives it on the
             // first batch).

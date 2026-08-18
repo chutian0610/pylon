@@ -109,11 +109,14 @@ fn plan_with_aggregate_cuts_boundary_at_aggregate() {
     let dag = f.fragment_multi_stage(&plan, 99).unwrap();
     // Stage 0: Scan, Filter, ExchangeSink
     assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter", "ExchangeSink"]);
-    // Stage 1: 4× ExchangeSource + Aggregate
+    // Stage 1: 4× (ExchangeSource + Aggregate) per partition.
+    // Fragmenter layout: N sources first, then N aggregates, so
+    // [ExchangeSource, ExchangeSource, ExchangeSource, ExchangeSource,
+    //  Aggregate, Aggregate, Aggregate, Aggregate].
     let s1_names = op_names(&dag, 1);
-    assert_eq!(s1_names.len(), 5, "4 sources + 1 aggregate");
-    assert!(s1_names[..4].iter().all(|n| *n == "ExchangeSource"));
-    assert_eq!(s1_names[4], "Aggregate");
+    assert_eq!(s1_names.len(), 8, "4 sources + 4 aggregates");
+    assert_eq!(&s1_names[..4], &["ExchangeSource"; 4]);
+    assert_eq!(&s1_names[4..], &["Aggregate"; 4]);
 }
 
 #[test]
@@ -262,8 +265,15 @@ fn plan_with_aggregate_below_filter_still_cuts_once() {
         .iter()
         .filter(|o| o.name == "ExchangeSource")
         .count();
+    let n_aggs = dag.stages[1]
+        .fragment
+        .ops
+        .iter()
+        .filter(|o| o.name == "Aggregate")
+        .count();
     assert_eq!(n_sinks, 1);
     assert_eq!(n_sources, 4, "one source per partition");
+    assert_eq!(n_aggs, 4, "one aggregate per partition");
 }
 
 #[test]
