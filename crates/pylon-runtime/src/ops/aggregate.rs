@@ -15,17 +15,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-/// Per-aggregate spec resolved at op-construction time.
+/// Per-aggregate spec passed in at op-construction time. The
+/// function name and the optional input column name (none for
+/// `COUNT(*)`) are the only required fields. The op resolves the
+/// column's data type lazily on the first `add_input` (we look at
+/// the actual batch) and the result type is derived from the
+/// `output_schema` field at construction time.
 #[derive(Debug, Clone)]
 pub struct AggSpec {
     pub func: String, // lowercased: "count" | "sum" | "min" | "max"
     /// `None` for `COUNT(*)`; otherwise the column name to fold.
     pub arg_col: Option<String>,
-    /// `None` for `COUNT(*)`; otherwise the type of the input column.
-    pub input_type: Option<DataType>,
-    /// Type of the result column. For COUNT this is always Int64.
-    pub output_type: DataType,
     /// Output field name (alias if supplied, else `func` / `func_col`).
+    /// The op matches this to a field in `output_schema` to discover
+    /// the result type.
     pub out_name: String,
 }
 
@@ -111,6 +114,10 @@ pub struct HashAggregateOp {
     /// Buffered output batches. M3 first cut emits exactly one batch on
     /// EOS, so the buffer holds 0 or 1 entries.
     output_buf: Vec<RecordBatch>,
+    /// Per-aggregate input type, resolved on first `add_input`. Outer
+    /// `None` = unresolved. Inner `None` per aggregate = `COUNT(*)`
+    /// (no input column).
+    input_types: Option<Vec<Option<DataType>>>,
     pub upstream_done: bool,
     pub emitted: bool,
 }
@@ -131,9 +138,87 @@ impl HashAggregateOp {
             output_schema,
             state: HashMap::new(),
             output_buf: Vec::new(),
+            input_types: None,
             upstream_done: false,
             emitted: false,
         }
+    }
+
+    /// Resolve each aggregate's input column type from the input
+    /// batch. Idempotent: only runs once, on the first non-empty
+    /// batch. After this returns, `input_types` is `Some(...)` and
+    /// the fold / state-init code can use it.
+    ///
+    /// If `output_schema` was passed in as `Schema::empty()` (the
+    /// worker uses this when the fragmenter doesn't carry the
+    /// post-aggregate schema through the OpSpec), we also build the
+    /// schema from the input column types here.
+    fn resolve_input_types(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.input_types.is_some() {
+            return Ok(());
+        }
+        let in_schema = batch.schema();
+
+        // Resolve each aggregate's input type.
+        let mut types = Vec::with_capacity(self.aggregates.len());
+        for agg in &self.aggregates {
+            let t = match &agg.arg_col {
+                None => None, // COUNT(*)
+                Some(name) => {
+                    let idx = in_schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == name)
+                        .ok_or_else(|| {
+                            PylonError::InvalidPlan(format!(
+                                "aggregate: arg column {name} not found in input"
+                            ))
+                        })?;
+                    Some(batch.column(idx).data_type().clone())
+                }
+            };
+            types.push(t);
+        }
+        self.input_types = Some(types);
+
+        // If the output schema is still empty, derive it now.
+        if self.output_schema.fields().is_empty() {
+            let mut fields: Vec<Field> = Vec::new();
+            for name in &self.group_by_cols {
+                let f = in_schema
+                    .field_with_name(name)
+                    .map_err(|_| {
+                        PylonError::InvalidPlan(format!(
+                            "aggregate: group_by column {name} not found in input"
+                        ))
+                    })?
+                    .clone();
+                fields.push(f);
+            }
+            for (agg, input_type) in self.aggregates.iter().zip(self.input_types.as_ref().unwrap().iter()) {
+                let out_dt = match agg.func.as_str() {
+                    "count" => DataType::Int64,
+                    "sum" => match input_type.as_ref().unwrap() {
+                        DataType::Int64 => DataType::Int64,
+                        DataType::Float64 => DataType::Float64,
+                        other => {
+                            return Err(PylonError::InvalidPlan(format!(
+                                "SUM does not support input type {other:?}"
+                            )))
+                        }
+                    },
+                    "min" | "max" => input_type.as_ref().unwrap().clone(),
+                    other => {
+                        return Err(PylonError::InvalidPlan(format!(
+                            "aggregate {other} not supported in output-schema derivation"
+                        )))
+                    }
+                };
+                fields.push(Field::new(&agg.out_name, out_dt, true));
+            }
+            self.output_schema = Arc::new(Schema::new(fields));
+        }
+        Ok(())
     }
 
     /// Resolve the indices of the group_by columns in the input schema.
@@ -155,44 +240,30 @@ impl HashAggregateOp {
             .collect()
     }
 
-    /// Resolve the index of an aggregate's argument column, if any.
-    fn agg_arg_index(agg: &AggSpec, batch: &RecordBatch) -> Result<Option<usize>> {
-        match &agg.arg_col {
-            None => Ok(None),
-            Some(name) => {
-                let idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == name)
-                    .ok_or_else(|| {
-                        PylonError::InvalidPlan(format!(
-                            "aggregate: arg column {name} not found in input"
-                        ))
-                    })?;
-                Ok(Some(idx))
-            }
-        }
-    }
-
     /// Initialize the per-group state vector for a freshly-seen group.
+    /// Caller must have resolved `input_types` already.
     fn initial_states(&self) -> Vec<AggState> {
+        let input_types = self
+            .input_types
+            .as_ref()
+            .expect("initial_states called before resolve_input_types");
         self.aggregates
             .iter()
-            .map(|agg| match agg.func.as_str() {
+            .zip(input_types.iter())
+            .map(|(agg, input_type)| match agg.func.as_str() {
                 "count" => AggState::Count(0),
-                "sum" => match agg.input_type.as_ref().unwrap() {
+                "sum" => match input_type.as_ref().expect("sum needs arg column") {
                     DataType::Int64 => AggState::SumI64(0),
                     DataType::Float64 => AggState::SumF64(0.0),
                     other => panic!("sum unsupported type {other:?} in AggSpec"),
                 },
-                "min" => match agg.input_type.as_ref().unwrap() {
+                "min" => match input_type.as_ref().expect("min needs arg column") {
                     DataType::Int64 => AggState::MinI64(None),
                     DataType::Float64 => AggState::MinF64(None),
                     DataType::Utf8 => AggState::MinUtf8(None),
                     other => panic!("min unsupported type {other:?} in AggSpec"),
                 },
-                "max" => match agg.input_type.as_ref().unwrap() {
+                "max" => match input_type.as_ref().expect("max needs arg column") {
                     DataType::Int64 => AggState::MaxI64(None),
                     DataType::Float64 => AggState::MaxF64(None),
                     DataType::Utf8 => AggState::MaxUtf8(None),
@@ -329,6 +400,12 @@ impl HashAggregateOp {
         // downstream consumers see a well-formed result. We must hand
         // back one column-array per schema field, just with zero rows.
         if self.state.is_empty() {
+            if self.output_schema.fields().is_empty() {
+                return Err(PylonError::InvalidPlan(
+                    "HashAggregate: empty input and no output schema provided;                      caller must either pass a non-empty output schema or                      feed at least one batch before no_more_input"
+                        .into(),
+                ));
+            }
             let empty_cols: Vec<Arc<dyn Array>> = self
                 .output_schema
                 .fields()
@@ -408,10 +485,16 @@ impl HashAggregateOp {
             }
         }
 
-        // Aggregate columns.
+        // Aggregate columns. Output type comes from the field at
+        // position `group_by_cols.len() + a_idx` in the output schema.
         for (a_idx, agg) in self.aggregates.iter().enumerate() {
-            match agg.func.as_str() {
-                "count" => {
+            let out_type = self
+                .output_schema
+                .field(self.group_by_cols.len() + a_idx)
+                .data_type()
+                .clone();
+            match (agg.func.as_str(), &out_type) {
+                ("count", DataType::Int64) => {
                     let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
                     for k in &groups {
                         let states = self.state.get(*k).unwrap();
@@ -423,126 +506,105 @@ impl HashAggregateOp {
                     }
                     columns.push(Arc::new(Int64Array::from(buf)));
                 }
-                "sum" => match agg.input_type.as_ref().unwrap() {
-                    DataType::Int64 => {
-                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::SumI64(s) = &states[a_idx] {
-                                buf.push(Some(*s));
-                            } else {
-                                return Err(PylonError::Internal("sum state mismatch".into()));
-                            }
+                ("sum", DataType::Int64) => {
+                    let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::SumI64(s) = &states[a_idx] {
+                            buf.push(Some(*s));
+                        } else {
+                            return Err(PylonError::Internal("sum i64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Int64Array::from(buf)));
                     }
-                    DataType::Float64 => {
-                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::SumF64(s) = &states[a_idx] {
-                                buf.push(Some(*s));
-                            } else {
-                                return Err(PylonError::Internal("sum state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Int64Array::from(buf)));
+                }
+                ("sum", DataType::Float64) => {
+                    let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::SumF64(s) = &states[a_idx] {
+                            buf.push(Some(*s));
+                        } else {
+                            return Err(PylonError::Internal("sum f64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Float64Array::from(buf)));
                     }
-                    other => {
-                        return Err(PylonError::Internal(format!(
-                            "sum output type {other:?} not handled"
-                        )))
-                    }
-                },
-                "min" => match agg.input_type.as_ref().unwrap() {
-                    DataType::Int64 => {
-                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MinI64(s) = &states[a_idx] {
-                                buf.push(*s);
-                            } else {
-                                return Err(PylonError::Internal("min state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Float64Array::from(buf)));
+                }
+                ("min", DataType::Int64) => {
+                    let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MinI64(s) = &states[a_idx] {
+                            buf.push(*s);
+                        } else {
+                            return Err(PylonError::Internal("min i64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Int64Array::from(buf)));
                     }
-                    DataType::Float64 => {
-                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MinF64(s) = &states[a_idx] {
-                                buf.push(*s);
-                            } else {
-                                return Err(PylonError::Internal("min state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Int64Array::from(buf)));
+                }
+                ("min", DataType::Float64) => {
+                    let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MinF64(s) = &states[a_idx] {
+                            buf.push(*s);
+                        } else {
+                            return Err(PylonError::Internal("min f64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Float64Array::from(buf)));
                     }
-                    DataType::Utf8 => {
-                        let mut buf: Vec<Option<String>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MinUtf8(s) = &states[a_idx] {
-                                buf.push(s.clone());
-                            } else {
-                                return Err(PylonError::Internal("min state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Float64Array::from(buf)));
+                }
+                ("min", DataType::Utf8) => {
+                    let mut buf: Vec<Option<String>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MinUtf8(s) = &states[a_idx] {
+                            buf.push(s.clone());
+                        } else {
+                            return Err(PylonError::Internal("min utf8 state mismatch".into()));
                         }
-                        columns.push(Arc::new(StringArray::from(buf)));
                     }
-                    other => {
-                        return Err(PylonError::Internal(format!(
-                            "min output type {other:?} not handled"
-                        )))
-                    }
-                },
-                "max" => match agg.input_type.as_ref().unwrap() {
-                    DataType::Int64 => {
-                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MaxI64(s) = &states[a_idx] {
-                                buf.push(*s);
-                            } else {
-                                return Err(PylonError::Internal("max state mismatch".into()));
-                            }
+                    columns.push(Arc::new(StringArray::from(buf)));
+                }
+                ("max", DataType::Int64) => {
+                    let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MaxI64(s) = &states[a_idx] {
+                            buf.push(*s);
+                        } else {
+                            return Err(PylonError::Internal("max i64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Int64Array::from(buf)));
                     }
-                    DataType::Float64 => {
-                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MaxF64(s) = &states[a_idx] {
-                                buf.push(*s);
-                            } else {
-                                return Err(PylonError::Internal("max state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Int64Array::from(buf)));
+                }
+                ("max", DataType::Float64) => {
+                    let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MaxF64(s) = &states[a_idx] {
+                            buf.push(*s);
+                        } else {
+                            return Err(PylonError::Internal("max f64 state mismatch".into()));
                         }
-                        columns.push(Arc::new(Float64Array::from(buf)));
                     }
-                    DataType::Utf8 => {
-                        let mut buf: Vec<Option<String>> = Vec::with_capacity(n_groups);
-                        for k in &groups {
-                            let states = self.state.get(*k).unwrap();
-                            if let AggState::MaxUtf8(s) = &states[a_idx] {
-                                buf.push(s.clone());
-                            } else {
-                                return Err(PylonError::Internal("max state mismatch".into()));
-                            }
+                    columns.push(Arc::new(Float64Array::from(buf)));
+                }
+                ("max", DataType::Utf8) => {
+                    let mut buf: Vec<Option<String>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        let states = self.state.get(*k).unwrap();
+                        if let AggState::MaxUtf8(s) = &states[a_idx] {
+                            buf.push(s.clone());
+                        } else {
+                            return Err(PylonError::Internal("max utf8 state mismatch".into()));
                         }
-                        columns.push(Arc::new(StringArray::from(buf)));
                     }
-                    other => {
-                        return Err(PylonError::Internal(format!(
-                            "max output type {other:?} not handled"
-                        )))
-                    }
-                },
-                other => {
+                    columns.push(Arc::new(StringArray::from(buf)));
+                }
+                (f, t) => {
                     return Err(PylonError::Internal(format!(
-                        "aggregate {other} not implemented in build_output"
+                        "aggregate {f} with output type {t:?} not implemented in build_output"
                     )))
                 }
             }
@@ -573,11 +635,33 @@ impl PipelineOp for HashAggregateOp {
                 "HashAggregate received input after emitting final batch".into(),
             ));
         }
+        // Resolve aggregate input types on the first non-empty batch.
+        // After this, `input_types` is Some and we can use it in the
+        // fold loop without further lookups.
+        self.resolve_input_types(&batch)?;
+        let input_types = self
+            .input_types
+            .as_ref()
+            .expect("resolve_input_types just set this");
+
         let group_by_indices = self.group_by_indices(&batch)?;
         let arg_indices: Vec<Option<usize>> = self
             .aggregates
             .iter()
-            .map(|a| Self::agg_arg_index(a, &batch))
+            .map(|agg| match &agg.arg_col {
+                None => Ok(None),
+                Some(name) => batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == name)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        PylonError::InvalidPlan(format!(
+                            "aggregate: arg column {name} not found in input"
+                        ))
+                    }),
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Per row: extract group key, fold each aggregate.
@@ -598,11 +682,13 @@ impl PipelineOp for HashAggregateOp {
                 .collect::<Result<Vec<_>>>()?;
             let initial = self.initial_states();
             let states = self.state.entry(key).or_insert(initial);
-            for (a_idx, agg) in self.aggregates.iter().enumerate() {
+            for (a_idx, (agg, input_type)) in
+                self.aggregates.iter().zip(input_types.iter()).enumerate()
+            {
                 Self::fold_value(
                     &mut states[a_idx],
                     &agg.func,
-                    agg.input_type.as_ref().unwrap_or(&DataType::Int64),
+                    input_type.as_ref().unwrap_or(&DataType::Int64),
                     arg_arrays[a_idx],
                     row,
                 )?;

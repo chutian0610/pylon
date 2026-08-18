@@ -6,7 +6,8 @@ use pylon_proto::pylon::{TaskRequest, TaskResponse, TaskState};
 use pylon_proto::worker_client::WorkerClient;
 use pylon_exchange::{FlightDescriptor, PylonFlightService};
 use pylon_runtime::ops::{
-    ExchangeSinkOp, ExchangeSourceOp, FilterOp, PartitionFilterOp, ProjectOp, SeqScanOp,
+    AggSpec, ExchangeSinkOp, ExchangeSourceOp, FilterOp, HashAggregateOp,
+    PartitionFilterOp, ProjectOp, SeqScanOp,
 };
 use pylon_runtime::{Driver, DriverMode, Pipeline, PipelineOp};
 use std::sync::Arc;
@@ -126,6 +127,39 @@ fn build_ops(
     Ok(ops)
 }
 
+/// Parse the `agg_specs` config value into a list of `AggSpec`.
+/// Accepts semicolon-separated entries, each either `count()`
+/// (for `COUNT(*)`) or `func:col` (e.g. `sum:amount`).
+fn parse_agg_specs(specs: &str) -> Result<Vec<AggSpec>> {
+    let mut out = Vec::new();
+    for spec in specs.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(inner) = spec.strip_prefix("count(").and_then(|s| s.strip_suffix(")")) {
+            if !inner.is_empty() {
+                anyhow::bail!("count() takes no arguments; got count({inner})");
+            }
+            out.push(AggSpec {
+                func: "count".into(),
+                arg_col: None,
+                out_name: "count".into(),
+            });
+        } else if let Some((func, col)) = spec.split_once(':') {
+            let func = func.trim().to_lowercase();
+            let col = col.trim();
+            if col.is_empty() {
+                anyhow::bail!("aggregate {func}() requires a column");
+            }
+            out.push(AggSpec {
+                func,
+                arg_col: Some(col.to_string()),
+                out_name: spec.to_string(),
+            });
+        } else {
+            anyhow::bail!("malformed agg spec: {spec}");
+        }
+    }
+    Ok(out)
+}
+
 fn build_op(
     name: &str,
     config: &std::collections::HashMap<String, String>,
@@ -150,6 +184,25 @@ fn build_op(
         "ExchangeSource" => {
             let desc = FlightDescriptor(get("descriptor")?);
             Ok(Box::new(ExchangeSourceOp::new(desc, flight_service)))
+        }
+        "Aggregate" => {
+            // M3 A1-4 wiring. The fragmenter emits two config keys:
+            //   group_by_cols: comma-separated column names
+            //   agg_specs:     semicolon-separated, each entry is
+            //                  either "count()" (for COUNT(*)) or
+            //                  "func:col" (e.g. "sum:amount", "min:id").
+            // The post-aggregate schema isn't carried in the OpSpec
+            // (M3 first cut); the op derives it lazily on the first
+            // input batch.
+            let group_by_cols: Vec<String> = get("group_by_cols")?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let aggregates = parse_agg_specs(&get("agg_specs")?)?;
+            // Schema::empty() so the op derives it on first input batch.
+            let schema = std::sync::Arc::new(arrow_schema::Schema::empty());
+            Ok(Box::new(HashAggregateOp::new(group_by_cols, aggregates, schema)))
         }
         other => Err(anyhow::anyhow!("unknown op: {other}")),
     }
