@@ -149,6 +149,29 @@ fn split_into_two_stages(
             });
             Ok(())
         }
+        // Aggregate: A1-1 plumbing only. The fragmenter doesn't know
+        // how to inject ExchangeSink/Source above an Aggregate yet —
+        // that lands in A2 (HashPartitionExchange). For now we keep the
+        // whole subtree in stage 1 so the rest of the pipeline keeps
+        // compiling.
+        PhysicalPlan::Aggregate { input, group_by, aggs, schema: _ } => {
+            split_into_two_stages(input, stage0, stage1)?;
+            let group_cols: Vec<String> = group_by.iter()
+                .map(|e| match e {
+                    PhysicalExpr::Column { field, .. } => field.name().clone(),
+                    _ => "_".into(),
+                })
+                .collect();
+            let agg_specs: Vec<String> = aggs.iter().map(agg_spec_to_string).collect();
+            stage1.push(OpSpec {
+                name: "Aggregate".to_string(),
+                config: kv(&[
+                    ("group_by_cols", &group_cols.join(",")),
+                    ("agg_specs", &agg_specs.join(";")),
+                ]),
+            });
+            Ok(())
+        }
     }
 }
 
@@ -168,6 +191,26 @@ fn decompose_filter(p: &PhysicalExpr) -> PylonResult<(String, String, String)> {
         }
         _ => ("_".to_string(), "=".to_string(), "0".to_string()),
     })
+}
+
+/// Format a PhysicalExpr::AggregateFunction as a worker-readable
+/// string like `count()` or `sum:amount` or `min:id` or `max:id`.
+fn agg_spec_to_string(e: &PhysicalExpr) -> String {
+    use pylon_plan::physical::physical_expr::PhysicalExpr as PE;
+    match e {
+        PE::AggregateFunction { name, args, .. } => {
+            if name == "count" && args.is_empty() {
+                "count()".into()
+            } else {
+                let arg = match args.first() {
+                    Some(PE::Column { field, .. }) => field.name().clone(),
+                    _ => "*".into(),
+                };
+                format!("{name}:{arg}")
+            }
+        }
+        _ => "?".into(),
+    }
 }
 
 #[allow(dead_code)]
