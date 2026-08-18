@@ -1,15 +1,22 @@
 //! Fragmenter — PhysicalPlan → multi-stage StageDag.
 //!
-//! M3 first cut: produces a 2-stage DAG (Stage 0 = scan/filters/sink, Stage 1
-//! = exchange-source/project) for any SELECT. Future work (M4+) adds real
-//! HashPartitionExchange injection based on operator hints.
+//! M3 A2-1: post-order walk with HashPartitionExchange injection. Each
+//! `Aggregate[groupBy=K]` node forces a stage boundary: the child
+//! stage ends with an `ExchangeSink` that hash-routes rows to N
+//! downstream partitions, and a new stage begins with one
+//! `ExchangeSource` per partition followed by the `Aggregate`.
+//!
+//! M3 first cut only knows one boundary-triggering rule (Aggregate).
+//! HashJoin / Distinct / Window arrive in M4+; the framework here
+//! makes those drops-in later.
 
 use crate::stage::{Distribution, Fragment, OpSpec, Stage, StageDag, StageId};
+
 use pylon_plan::physical::physical_expr::PhysicalExpr;
 use pylon_plan::physical::PhysicalPlan;
-use pylon_types::PylonError;
-use pylon_types::Result as PylonResult;
+use pylon_types::{PylonError, Result as PylonResult};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct FragmenterConfig {
@@ -41,138 +48,222 @@ impl Fragmenter {
         }
     }
 
-    /// M3 multi-stage: 2 stages for any query.
-    ///   Stage 0: scan + filter + PartitionFilter + ExchangeSink
-    ///   Stage 1: ExchangeSource + Project (final gather/single task)
+    /// Post-order walk the plan, emit a 2-stage StageDag for
+    /// `Aggregate[groupBy=K]` queries. Stage 0 = scan/filter/project +
+    /// partitioned `ExchangeSink`. Stage 1 = per-partition
+    /// `ExchangeSource` + `Aggregate`.
     pub fn fragment_multi_stage(
         &self,
         plan: &PhysicalPlan,
         query_id: u64,
     ) -> PylonResult<StageDag> {
-        let mut stage0_ops = Vec::new();
-        let mut stage1_ops = Vec::new();
-        split_into_two_stages(plan, &mut stage0_ops, &mut stage1_ops)?;
-
+        let n_partitions = self.cfg.default_partition_count;
         let stage0_id = StageId(1);
         let stage1_id = StageId(2);
-
-        let stage0_fragment = Fragment {
-            ops: stage0_ops,
-            distribution: Distribution::Partitioned(self.cfg.default_partition_count),
+        let mut ctx = FragmentCtx {
+            query_id,
+            n_partitions,
+            stage0_id,
+            stage1_id,
         };
-        let stage1_fragment = Fragment {
-            ops: stage1_ops,
-            distribution: Distribution::Single,
+        let visit = visit_plan(plan, &mut ctx, stage0_id)?;
+
+        let stage0 = Stage {
+            id: stage0_id,
+            fragment: Fragment {
+                ops: visit.stage0_ops,
+                distribution: Distribution::Partitioned(n_partitions),
+            },
+            partition_count: n_partitions,
+            memory_budget_bytes: 256 * 1024 * 1024,
+            upstream: Vec::new(),
+            downstream: vec![stage1_id],
         };
-
-        let mut stage0 = Stage::new(stage0_id, stage0_fragment)
-            .with_partition_count(self.cfg.default_partition_count);
-        let mut stage1 = Stage::new(stage1_id, stage1_fragment);
-
-        stage0.downstream = vec![stage1_id];
-        stage1.upstream = vec![stage0_id];
-
-        let qid = query_id;
-        // Pin exchange descriptor keys: target_qid = qid, target_stage = 2 (stage1 always),
-        // target_partition = 0 (single-partition Stage 1 task in M3 demo).
-        let exchange_desc = format!(
-            "pylon://query/{qid}/stage/2/task/0"
-        );
-        append_sink_with_desc(&mut stage0, &exchange_desc);
-        append_source_with_desc(&mut stage1, &exchange_desc);
-
-        let mut dag = StageDag::new().with_stage(stage0).with_stage(stage1);
-        // Topological order: sources first
-        Ok(dag)
+        let stage1 = Stage {
+            id: stage1_id,
+            fragment: Fragment {
+                ops: visit.stage1_ops,
+                distribution: Distribution::Partitioned(n_partitions),
+            },
+            partition_count: n_partitions,
+            memory_budget_bytes: 256 * 1024 * 1024,
+            upstream: vec![stage0_id],
+            downstream: Vec::new(),
+        };
+        Ok(StageDag::new().with_stage(stage0).with_stage(stage1))
     }
 }
 
-fn kv(items: &[(&str, &str)]) -> HashMap<String, String> {
-    items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+/// Mutable context threaded through the post-order walk.
+struct FragmentCtx {
+    query_id: u64,
+    n_partitions: usize,
+    stage0_id: StageId,
+    stage1_id: StageId,
 }
 
-fn append_sink_with_desc(stage: &mut Stage, desc: &str) {
-    let mut config = HashMap::new();
-    config.insert("descriptor".to_string(), desc.to_string());
-    stage.fragment.ops.push(OpSpec {
-        name: "ExchangeSink".to_string(),
-        config,
-    });
+/// Result of a post-order walk. `stage0_ops` and `stage1_ops` collect
+/// OpSpecs for each stage. We allocate ops into stages at boundary
+/// time (when an Aggregate is seen).
+struct Visit {
+    stage0_ops: Vec<OpSpec>,
+    stage1_ops: Vec<OpSpec>,
 }
 
-fn append_source_with_desc(stage: &mut Stage, desc: &str) {
-    let mut config = HashMap::new();
-    config.insert("descriptor".to_string(), desc.to_string());
-    // Source goes at the BEGINNING of stage 1 ops
-    stage.fragment.ops.insert(0, OpSpec {
-        name: "ExchangeSource".to_string(),
-        config,
-    });
-}
-
-fn split_into_two_stages(
-    plan: &PhysicalPlan,
-    stage0: &mut Vec<OpSpec>,
-    stage1: &mut Vec<OpSpec>,
-) -> PylonResult<()> {
-    // Walks the plan pre-order. Filters (and SeqScan before them) → stage 0.
-    // Project goes to stage 1. After processing, fragmenter adds ExchangeSink
-    // /ExchangeSource at the stage boundaries (see append_* above).
+/// Walk the plan post-order. Returns the OpSpec lists to put on
+/// stage0 and stage1. The walk inserts ExchangeSink/Source at every
+/// Aggregate[groupBy] boundary.
+fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId) -> PylonResult<Visit> {
     match plan {
-        PhysicalPlan::SeqScan { table, schema: _ } => {
-            stage0.push(OpSpec {
+        PhysicalPlan::SeqScan { table, schema } => {
+            let op = OpSpec {
                 name: "SeqScan".to_string(),
                 config: kv(&[("path", &format!("data/{table}.parquet"))]),
-            });
-            Ok(())
+            };
+            Ok(op_only_in(current_stage, ctx, op))
         }
         PhysicalPlan::Filter { input, predicate } => {
-            split_into_two_stages(input, stage0, stage1)?;
+            let mut child = visit_plan(input, ctx, current_stage)?;
             let (col, op_s, lit) = decompose_filter(predicate)?;
-            stage0.push(OpSpec {
+            let op = OpSpec {
                 name: "Filter".to_string(),
                 config: kv(&[("col", &col), ("op", &op_s), ("literal", &lit)]),
-            });
-            Ok(())
+            };
+            push_op(&mut child, current_stage, op);
+            Ok(child)
         }
         PhysicalPlan::Project { input, projections, schema: _ } => {
-            split_into_two_stages(input, stage0, stage1)?;
-            let cols: Vec<String> = projections.iter()
+            let mut child = visit_plan(input, ctx, current_stage)?;
+            let cols: Vec<String> = projections
+                .iter()
                 .map(|p| match p {
                     PhysicalExpr::Column { field, .. } => field.name().clone(),
                     _ => "_".into(),
                 })
                 .collect();
-            stage1.push(OpSpec {
+            let op = OpSpec {
                 name: "Project".to_string(),
                 config: kv(&[("cols", &cols.join(","))]),
-            });
-            Ok(())
+            };
+            push_op(&mut child, current_stage, op);
+            Ok(child)
         }
-        // Aggregate: A1-1 plumbing only. The fragmenter doesn't know
-        // how to inject ExchangeSink/Source above an Aggregate yet —
-        // that lands in A2 (HashPartitionExchange). For now we keep the
-        // whole subtree in stage 1 so the rest of the pipeline keeps
-        // compiling.
-        PhysicalPlan::Aggregate { input, group_by, aggs, schema: _ } => {
-            split_into_two_stages(input, stage0, stage1)?;
-            let group_cols: Vec<String> = group_by.iter()
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggs,
+            schema,
+        } => {
+            // A2-1 rule: any Aggregate forces a stage boundary in M3
+            // first cut. The child runs in the current stage; the
+            // Aggregate lives in the next stage. Between them is a
+            // partitioned Exchange (sink on child side, sources on
+            // the next-stage side, one source per partition).
+            //
+            // In M3 first cut, the child's stage is always stage0
+            // (we don't recurse past an Aggregate — there's only one
+            // boundary per query). The next stage is stage1.
+            let mut child = visit_plan(input, ctx, current_stage)?;
+
+            // Sanity: the current stage should be stage0 — for M3
+            // first cut we don't support nested aggregates. If a
+            // future plan has an Aggregate inside a stage that's
+            // already stage1, we'd need to recurse into stage2+.
+            if current_stage != ctx.stage0_id {
+                return Err(PylonError::InvalidPlan(
+                    "nested Aggregate not supported in M3 first cut fragmenter".into(),
+                ));
+            }
+
+            let group_cols: Vec<String> = group_by
+                .iter()
                 .map(|e| match e {
                     PhysicalExpr::Column { field, .. } => field.name().clone(),
                     _ => "_".into(),
                 })
                 .collect();
             let agg_specs: Vec<String> = aggs.iter().map(agg_spec_to_string).collect();
-            stage1.push(OpSpec {
+
+            // 1. Tail of stage0: partitioned ExchangeSink.
+            let n = ctx.n_partitions;
+            let descriptors: Vec<String> = (0..n)
+                .map(|p| {
+                    format!(
+                        "pylon://query/{}/stage/{}/task/{}",
+                        ctx.query_id,
+                        ctx.stage1_id.0,
+                        p
+                    )
+                })
+                .collect();
+            // The OpSpec's config is a flat string map. We encode the
+            // N descriptors as a single semicolon-separated value
+            // ("descriptors") plus the count, plus the partition keys.
+            let op_sink = OpSpec {
+                name: "ExchangeSink".to_string(),
+                config: kv(&[
+                    ("descriptors", &descriptors.join(";")),
+                    ("n_partitions", &n.to_string()),
+                    ("partition_keys", &group_cols.join(",")),
+                ]),
+            };
+            child.stage0_ops.push(op_sink);
+
+            // 2. Head of stage1: N ExchangeSource ops, one per partition.
+            for p in 0..n {
+                let desc = format!(
+                    "pylon://query/{}/stage/{}/task/{}",
+                    ctx.query_id,
+                    ctx.stage1_id.0,
+                    p
+                );
+                child.stage1_ops.push(OpSpec {
+                    name: "ExchangeSource".to_string(),
+                    config: kv(&[("descriptor", &desc)]),
+                });
+            }
+            // 3. Tail of stage1: the Aggregate op itself.
+            child.stage1_ops.push(OpSpec {
                 name: "Aggregate".to_string(),
                 config: kv(&[
                     ("group_by_cols", &group_cols.join(",")),
                     ("agg_specs", &agg_specs.join(";")),
                 ]),
             });
-            Ok(())
+            // Stage 1 doesn't know its post-aggregate schema in the
+            // OpSpec config (M3 A1-4 — the op derives it on the
+            // first batch).
+            let _ = schema; // silence unused warning
+            Ok(child)
         }
     }
+}
+
+/// Push `op` into the appropriate stage's OpSpec list.
+fn push_op(visit: &mut Visit, current_stage: StageId, op: OpSpec) {
+    if current_stage.0 == 1 {
+        visit.stage0_ops.push(op);
+    } else {
+        visit.stage1_ops.push(op);
+    }
+}
+
+/// Construct a Visit with `op` placed in the current stage only.
+fn op_only_in(current_stage: StageId, ctx: &FragmentCtx, op: OpSpec) -> Visit {
+    let mut v = Visit {
+        stage0_ops: Vec::new(),
+        stage1_ops: Vec::new(),
+    };
+    if current_stage == ctx.stage0_id {
+        v.stage0_ops.push(op);
+    } else {
+        v.stage1_ops.push(op);
+    }
+    v
+}
+
+fn kv(items: &[(&str, &str)]) -> HashMap<String, String> {
+    items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
 fn decompose_filter(p: &PhysicalExpr) -> PylonResult<(String, String, String)> {
@@ -215,3 +306,5 @@ fn agg_spec_to_string(e: &PhysicalExpr) -> String {
 
 #[allow(dead_code)]
 pub fn _unused_marker(_e: PylonError) {}
+
+

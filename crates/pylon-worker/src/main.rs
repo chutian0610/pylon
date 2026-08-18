@@ -178,8 +178,32 @@ fn build_op(
         }
         "PartitionFilter" => Ok(Box::new(PartitionFilterOp::new(get("col")?, &get("literal")?)?)),
         "ExchangeSink" => {
-            let desc = FlightDescriptor(get("descriptor")?);
-            Ok(Box::new(ExchangeSinkOp::new(desc, flight_service.clone())))
+            // A2-1: two modes.
+            //   - Partitioned: config has `descriptors` (semicolon-joined),
+            //     `n_partitions`, and `partition_keys`. The op routes
+            //     each row by hash of the partition-key column values
+            //     to one of N descriptors.
+            //   - Single: config has `descriptor` (A1 behavior).
+            if let Some(descs_str) = config.get("descriptors") {
+                let descriptors: Vec<FlightDescriptor> = descs_str
+                    .split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| FlightDescriptor(s.to_string()))
+                    .collect();
+                let partition_keys: Vec<String> = get("partition_keys")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                Ok(Box::new(ExchangeSinkOp::new_partitioned(
+                    descriptors,
+                    partition_keys,
+                    flight_service.clone(),
+                )))
+            } else {
+                let desc = FlightDescriptor(get("descriptor")?);
+                Ok(Box::new(ExchangeSinkOp::new(desc, flight_service.clone())))
+            }
         }
         "ExchangeSource" => {
             let desc = FlightDescriptor(get("descriptor")?);

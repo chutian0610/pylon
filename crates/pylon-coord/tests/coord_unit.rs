@@ -119,11 +119,17 @@ fn fragmenter_collapses_simple_plan_into_single_stage() {
     
     assert_eq!(dag.stages[0].partition_count, 16);
 
+    // A2-1: with no Aggregate in the plan, there is no stage
+    // boundary — stage0 carries just the scan + filter. ExchangeSink
+    // is only emitted at Aggregate boundaries.
     let ops = &dag.stages[0].fragment.ops;
-    assert_eq!(ops.len(), 3, "SeqScan, Filter, ExchangeSink");
+    assert_eq!(ops.len(), 2, "SeqScan, Filter (no ExchangeSink without Aggregate)");
     assert_eq!(ops[0].name, "SeqScan");
     assert_eq!(ops[1].name, "Filter");
     assert_eq!(ops[1].config.get("col").map(|s| s.as_str()), Some("id"));
     assert_eq!(ops[1].config.get("op").map(|s| s.as_str()), Some(">"));
     assert_eq!(ops[1].config.get("literal").map(|s| s.as_str()), Some("5"));
+    // Stage 1 should be empty (or near-empty) — no Aggregate means
+    // no second stage in M3 first cut.
+    assert!(dag.stages[1].fragment.ops.is_empty(), "stage1 empty without Aggregate");
 }
