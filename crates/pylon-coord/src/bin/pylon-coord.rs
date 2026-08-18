@@ -30,11 +30,22 @@ const HTTP_PORT: u16 = 8080;
 const GRPC_PORT: u16 = 9090;
 const DEFAULT_PARTITION_COUNT: usize = 4;
 
-#[derive(Clone)]
 struct QueryStatus {
     state: QueryState,
     rows: Vec<arrow_array::RecordBatch>,
+    schema: Option<arrow_schema::SchemaRef>,
     error: Option<String>,
+}
+
+impl Clone for QueryStatus {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state,
+            rows: self.rows.clone(),
+            schema: self.schema.clone(),
+            error: self.error.clone(),
+        }
+    }
 }
 
 struct WorkerHandle {
@@ -101,7 +112,7 @@ async fn submit_query(
     let qid_str = format!("q-{qid_num:08x}");
     info!(query_id = %qid_str, sql = %req.sql, "submit");
 
-    let result = plan_and_dispatch(&state, qid, &req.sql).await;
+    let result = plan_and_dispatch(state.clone(), qid, &req.sql).await;
 
     let success = result.is_ok();
     let body = match result {
@@ -109,6 +120,7 @@ async fn submit_query(
             state.queries.lock().unwrap().entry(qid).or_insert(QueryStatus {
                 state: QueryState::Running,
                 rows: vec![],
+                schema: None,
                 error: None,
             });
             QuerySubmitted { query_id: qid_str.clone(), state: "running".into() }
@@ -118,6 +130,7 @@ async fn submit_query(
             state.queries.lock().unwrap().insert(qid, QueryStatus {
                 state: QueryState::Failed,
                 rows: vec![],
+                schema: None,
                 error: Some(format!("{e:?}")),
             });
             QuerySubmitted { query_id: qid_str.clone(), state: "failed".into() }
@@ -186,10 +199,11 @@ async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse
 }
 
 async fn plan_and_dispatch(
-    state: &Arc<CoordState>,
+    state: Arc<CoordState>,
     qid: QueryId,
     sql: &str,
 ) -> Result<()> {
+    // 1. Parse SQL to PhysicalPlan
     let stmt = parse_sql(sql).context("sql parse")?;
     let query = match stmt {
         Statement::Query(q) => q,
@@ -199,30 +213,16 @@ async fn plan_and_dispatch(
         sqlparser::ast::SetExpr::Select(s) => s.clone(),
         _ => anyhow::bail!("only SELECT body"),
     };
-    let table = body.from.first().map(|t| t.relation.to_string()).unwrap_or_else(|| "sample".into());
 
-    let mut base_ops = vec![OpSpecMsg {
-        name: "SeqScan".into(),
-        config: HashMap::from([("path".into(), format!("data/{table}.parquet"))]),
-    }];
+    let table = body.from.first()
+        .map(|t| t.relation.to_string())
+        .unwrap_or_else(|| "sample".into());
 
-    if let Some(where_expr) = &body.selection {
-        let (col, op_s, lit) = translate_filter_ast(where_expr)?;
-        base_ops.push(OpSpecMsg {
-            name: "Filter".into(),
-            config: HashMap::from([
-                ("col".into(), col),
-                ("op".into(), op_s),
-                ("literal".into(), lit),
-            ]),
-        });
-    }
-
-    let mut cols = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
     for item in &body.projection {
         if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
             if let AstExpr::Identifier(ident) = e {
-                cols.push(ident.value.clone());
+                columns.push(ident.value.clone());
             } else {
                 anyhow::bail!("only column refs in projection");
             }
@@ -230,58 +230,209 @@ async fn plan_and_dispatch(
             anyhow::bail!("only UnnamedExpr projection");
         }
     }
-    if !cols.is_empty() && !(cols.len() == 1 && cols[0] == "*") {
-        base_ops.push(OpSpecMsg {
-            name: "Project".into(),
-            config: HashMap::from([("cols".into(), cols.join(","))]),
-        });
-    }
 
+    let filter_pred: Option<(String, String, String)> = if let Some(w) = &body.selection {
+        Some(translate_filter_ast(w)?)
+    } else {
+        None
+    };
+
+    // 2. Get registered workers
     let workers: Vec<Arc<WorkerHandle>> = state.workers.lock().unwrap().values().cloned().collect();
     if workers.is_empty() {
         anyhow::bail!("no workers registered");
     }
-    let n = workers.len().min(DEFAULT_PARTITION_COUNT);
+    let n_partitions = workers.len().min(DEFAULT_PARTITION_COUNT).max(1);
 
-    let mut task_specs = Vec::new();
+    // 3. Build the 2-stage DAG (Stage 0 + Stage 1)
+    let qid_u64 = qid.0;
+    let stage0_op_specs = build_stage0_ops(&table, &columns, filter_pred.as_ref(), n_partitions, qid_u64);
+    let stage1_op_specs = build_stage1_ops(&columns, qid_u64);
+
+    let stage0 = pylon_proto::pylon::TaskSpec {
+        id: qid_u64.wrapping_mul(1000).wrapping_add(1),
+        query_id: qid_u64,
+        stage_id: 1,
+        partition: 0,                    // Single task per worker; concurrency on workers side
+        fragment: Some(pylon_proto::pylon::Fragment {
+            ops: stage0_op_specs,
+            distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
+        }),
+        sources: vec![],
+        sinks: vec![],
+        memory_budget_bytes: 256 * 1024 * 1024,
+    };
+    let stage1 = pylon_proto::pylon::TaskSpec {
+        id: qid_u64.wrapping_mul(1000).wrapping_add(2),
+        query_id: qid_u64,
+        stage_id: 2,
+        partition: 0,
+        fragment: Some(pylon_proto::pylon::Fragment {
+            ops: stage1_op_specs,
+            distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
+        }),
+        sources: vec![],
+        sinks: vec![],
+        memory_budget_bytes: 256 * 1024 * 1024,
+    };
+
+    // 4. Dispatch Stage 0 to all workers (parallel).
+    let stage0_tasks: Vec<(pylon_proto::pylon::TaskSpec, Arc<WorkerHandle>)> = (0..workers.len())
+        .map(|i| (stage0.clone(), workers[i].clone()))
+        .collect();
+    let _ = stage0_tasks; // unused in M3 first cut: assign per-worker below
     for (i, w) in workers.iter().enumerate() {
-        let partition = i % n;
-        let mut ops = base_ops.clone();
-        let pos = ops.iter().position(|op| op.name == "SeqScan").map(|p| p + 1).unwrap_or(1);
-        ops.insert(pos, OpSpecMsg {
-            name: "PartitionFilter".into(),
-            config: HashMap::from([
-                ("col".into(), "id".into()),
-                ("literal".into(), format!("{partition}|{n}")),
-            ]),
-        });
-        let frag = FragmentMsg {
-            ops,
-            distribution: DistributionMsg::DistribPartitioned as i32,
+        w.tx
+            .send(TaskRequest { spec: Some(stage0.clone()) })
+            .await
+            .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
+        info!(stage = 0, worker = i, "stage0 dispatched");
+    }
+
+    // 5. Wait for all Stage 0 tasks to complete (count DONE acks)
+    let expected_stage0_acks = workers.len();
+    let stage1_for_send = stage1.clone();
+    let state_for_send = state.clone();
+    tokio::spawn(async move {
+        wait_for_stage_done_inner(
+            state.clone(),
+            qid_u64,
+            1u64,
+            expected_stage0_acks,
+        ).await;
+        // After Stage 0: dispatch Stage 1 to first worker
+        let first_worker = match state_for_send.workers.lock().unwrap().values().next() {
+            Some(w) => w.clone(),
+            None => {
+                warn!("no workers registered for stage 1");
+                return;
+            }
         };
-        let tid = qid.0.wrapping_mul(1000).wrapping_add(i as u64).wrapping_add(1);
-        task_specs.push(pylon_proto::pylon::TaskSpec {
-            id: tid,
-            query_id: qid.0,
-            stage_id: 1,
-            partition: partition as u32,
-            fragment: Some(frag),
-            sources: vec![],
-            sinks: vec![],
-            memory_budget_bytes: 256 * 1024 * 1024,
+        if first_worker.tx
+            .send(TaskRequest { spec: Some(stage1_for_send.clone()) })
+            .await
+            .is_err()
+        {
+            warn!("worker stage1 send failed");
+            return;
+        }
+        info!(stage = 1, "stage1 dispatched");
+
+        // After Stage 1 dispatch: poll for completion and aggregate Stage 1
+        // results into QueryStatus.rows. Future: track by query_id+stage_id
+        // TaskDone acknowledgement.
+        let qid_inner = qid_u64;
+        let state_inner = state_for_send.clone();
+        let task1_id = stage1_for_send.id;
+        tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            // Drain the worker's "completed" map for stage 1 task id
+            let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+            let schema: arrow_schema::SchemaRef = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+            ]));
+            let qid_q = pylon_coord::query::QueryId(qid_inner);
+            {
+                let workers_lock = state_inner.workers.lock().unwrap();
+                let mut seen = 0usize;
+                for w in workers_lock.values() {
+                    let comp = w.completed.lock().unwrap();
+                    if let Some(batches) = comp.get(&task1_id) {
+                        for b in batches {
+                            seen += b.num_rows();
+                            all_batches.push(b.clone());
+                        }
+                    }
+                }
+                info!(stage = 1, "aggregated {} rows from stage1", seen);
+            }
+            let mut qmap = state_inner.queries.lock().unwrap();
+            if let Some(s) = qmap.get_mut(&qid_q) {
+                s.rows = all_batches.clone();
+                s.schema = Some(schema);
+                s.state = pylon_coord::query::QueryState::Done;
+            }
         });
-    }
+    });
 
-    let mut task_ids = Vec::new();
-    for (i, t) in task_specs.iter().enumerate() {
-        workers[i].tx.send(TaskRequest { spec: Some(t.clone()) })
-            .await.map_err(|e| anyhow::anyhow!("worker session closed: {e}"))?;
-        task_ids.push(t.id);
-    }
-
-    tokio::spawn(aggregate_results(state.clone(), qid, task_ids, workers));
     Ok(())
 }
+
+fn build_stage0_ops(
+    table: &str,
+    _columns: &[String],
+    filter: Option<&(String, String, String)>,
+    n_partitions: usize,
+    query_id: u64,
+) -> Vec<pylon_proto::pylon::OpSpec> {
+    use std::collections::HashMap;
+    let mut ops = vec![pylon_proto::pylon::OpSpec {
+        name: "SeqScan".into(),
+        config: HashMap::from([("path".into(), format!("data/{table}.parquet"))]),
+    }];
+    // PartitionFilter: id % n_partitions == 0 (single-partition M3 first cut)
+    ops.push(pylon_proto::pylon::OpSpec {
+        name: "PartitionFilter".into(),
+        config: HashMap::from([
+            ("col".into(), "id".into()),
+            ("literal".into(), format!("0|{n_partitions}")),
+        ]),
+    });
+    if let Some((col, op_s, lit)) = filter {
+        ops.push(pylon_proto::pylon::OpSpec {
+            name: "Filter".into(),
+            config: HashMap::from([
+                ("col".into(), col.clone()),
+                ("op".into(), op_s.clone()),
+                ("literal".into(), lit.clone()),
+            ]),
+        });
+    }
+    // ExchangeSink at end of Stage 0 — pushes to stage1/task0 via in-process Flight
+    let sink_desc = format!("pylon://query/{query_id}/stage/2/task/0");
+    ops.push(pylon_proto::pylon::OpSpec {
+        name: "ExchangeSink".into(),
+        config: HashMap::from([("descriptor".into(), sink_desc)]),
+    });
+    ops
+}
+
+fn build_stage1_ops(
+    columns: &[String],
+    query_id: u64,
+) -> Vec<pylon_proto::pylon::OpSpec> {
+    use std::collections::HashMap;
+    let mut ops = Vec::new();
+    // ExchangeSource first
+    let source_desc = format!("pylon://query/{query_id}/stage/2/task/0");
+    ops.push(pylon_proto::pylon::OpSpec {
+        name: "ExchangeSource".into(),
+        config: HashMap::from([("descriptor".into(), source_desc)]),
+    });
+    // Project (M3: keep columns as before)
+    if !columns.is_empty() && !(columns.len() == 1 && columns[0] == "*") {
+        ops.push(pylon_proto::pylon::OpSpec {
+            name: "Project".into(),
+            config: HashMap::from([("cols".into(), columns.join(","))]),
+        });
+    }
+    ops
+}
+
+/// Wait for stage N to complete (sleep-based heuristic in M3 first cut).
+/// Future: tick on TaskState::TaskDone ACKs from workers.
+async fn wait_for_stage_done_inner(
+    _state: Arc<CoordState>,
+    query_id: u64,
+    stage_id: u64,
+    _expected_count: usize,
+) {
+    // M3 first cut: sleep a fixed duration
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    info!(query_id, stage = stage_id, "stage acked (M3 sleep heuristic)");
+}
+
 
 fn parse_sql(sql: &str) -> Result<Statement> {
     Parser::parse_sql(&GenericDialect {}, sql)
@@ -382,6 +533,7 @@ async fn aggregate_results(
     state.queries.lock().unwrap().insert(qid, QueryStatus {
         state: QueryState::Done,
         rows: all_rows,
+        schema: None,
         error: None,
     });
     info!(query_id = qid.0, "aggregated, last_total={last}");
@@ -461,6 +613,7 @@ impl futures::Stream for SessionOutStream {
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pylon=info")),
         )

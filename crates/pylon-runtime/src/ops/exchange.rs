@@ -43,10 +43,8 @@ impl PipelineOp for ExchangeSinkOp {
     }
 
     async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
+eprintln!("[STAGE0->FLIGHT] desc={} rows={}", self.descriptor.as_str(), batch.num_rows());
         if batch.num_rows() > 0 {
-            // For M3 first cut we route the batch directly through the
-            // in-process PylonFlightService; later we serialise via Arrow
-            // IPC streaming + push to a peer worker over gRPC.
             self.service.push(&self.descriptor, batch.clone()).await?;
             trace!(
                 rows = batch.num_rows(),
@@ -79,6 +77,11 @@ pub struct ExchangeSourceOp {
     pub service: Arc<PylonFlightService>,
     pub input_buf: Vec<RecordBatch>,
     pub upstream_done: bool,
+    /// M3 heuristic: counter of empty pops. After `producer_done_threshold`
+    /// empty polls, the source treats the producer as done (no more data will arrive).
+    /// M4+ replaces this with explicit Flight FIN signal.
+    empty_polls: u32,
+    producer_done_threshold: u32,
 }
 
 impl ExchangeSourceOp {
@@ -88,6 +91,8 @@ impl ExchangeSourceOp {
             service,
             input_buf: Vec::new(),
             upstream_done: false,
+            empty_polls: 0,
+            producer_done_threshold: 5,  // M3 heuristic
         }
     }
 }
@@ -103,20 +108,23 @@ impl PipelineOp for ExchangeSourceOp {
     }
 
     async fn get_output(&mut self) -> Result<Option<RecordBatch>> {
-        // Stage 0 of M3 first cut: in-process service; we drain one batch
-        // per poll. Multiple batches per call wouldn't break the chain.
         if let Some(b) = self.input_buf.pop() {
             return Ok(Some(b));
         }
-        // Pull from service if marked ended, drain remaining batches.
+        // Pop with heuristic: if service is empty for N consecutive polls,
+        // conclude the upstream producer is done and signal EOF.
         loop {
             match self.service.pop(&self.descriptor).await? {
-                Some(b) => return Ok(Some(b)),
+                Some(b) => {
+                    self.empty_polls = 0;
+                    return Ok(Some(b));
+                }
                 None => {
-                    if self.upstream_done {
+                    self.empty_polls += 1;
+                    if self.upstream_done || self.empty_polls >= self.producer_done_threshold {
                         return Ok(None);
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
         }

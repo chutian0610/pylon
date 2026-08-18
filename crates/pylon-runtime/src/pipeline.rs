@@ -133,12 +133,16 @@ async fn run_op(
         };
         match maybe_out {
             Ok(Some(batch)) => {
+                let oname = op.lock().await.name().to_string();
+                eprintln!("[RUN-OP] {oname} output rows={}", batch.num_rows());
                 if output.send(batch).await.is_err() {
                     return Ok(());
                 }
                 continue;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                let oname = op.lock().await.name().to_string();
+            }
             Err(e) => {
                 let name = op.lock().await.name().to_string();
                 return Err(PylonError::Internal(format!("{name} get_output: {e}")).into());

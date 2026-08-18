@@ -1,28 +1,16 @@
-//! Fragmenter — turns a PhysicalPlan into a StageDag (Trino-aligned).
+//! Fragmenter — PhysicalPlan → multi-stage StageDag.
 //!
-//! M2 simplification:
-//!   Only handles SeqScan / Filter / Project — no JOIN, no Aggregates yet.
-//!   The default pattern is: Scan in parallel partitions, optional Filter +
-//!   Project fused into the same stage (no shuffle boundary).
-//!
-//! Rules for M2:
-//!   - One stage per SeqScan; op chain = Scan→Filter→Project (if present).
-//!   - If no Scan, emit a single empty stage (will error out at runtime).
-//!
-//! M3+ will add:
-//!   - HashPartitionExchange insertions before HashJoinExec/HashAggregate
-//!   - BroadcastExchange insertions before broadcast joins
-//!   - GatherExchange insertions before final-stage aggregations
+//! M3 first cut: produces a 2-stage DAG (Stage 0 = scan/filters/sink, Stage 1
+//! = exchange-source/project) for any SELECT. Future work (M4+) adds real
+//! HashPartitionExchange injection based on operator hints.
 
+use crate::stage::{Distribution, Fragment, OpSpec, Stage, StageDag, StageId};
+use pylon_plan::physical::physical_expr::PhysicalExpr;
 use pylon_plan::physical::PhysicalPlan;
-use crate::stage::{
-    Fragment, OpSpec, Stage, StageDag, StageId, Distribution, DEFAULT_PARTITION_COUNT,
-};
 use pylon_types::PylonError;
 use pylon_types::Result as PylonResult;
 use std::collections::HashMap;
 
-/// Fragmenter configuration.
 #[derive(Debug, Clone)]
 pub struct FragmenterConfig {
     pub default_partition_count: usize,
@@ -31,7 +19,7 @@ pub struct FragmenterConfig {
 impl Default for FragmenterConfig {
     fn default() -> Self {
         Self {
-            default_partition_count: DEFAULT_PARTITION_COUNT,
+            default_partition_count: 16,
         }
     }
 }
@@ -45,116 +33,142 @@ impl Fragmenter {
         Self { cfg }
     }
 
-    pub fn with_default_partition_count(default_partition_count: usize) -> Self {
+    pub fn with_default_partition_count(n: usize) -> Self {
         Self {
-            cfg: FragmenterConfig { default_partition_count },
+            cfg: FragmenterConfig {
+                default_partition_count: n,
+            },
         }
     }
 
-    /// Convert a physical plan into a StageDag.
-    ///
-    /// M2 simplification: the entire physical plan becomes a single Stage
-    /// (partition_count = default_partition_count). Exchanges will be
-    /// inserted by future M3 logic once JOINs/Aggregates arrive.
-    pub fn fragment(&self, plan: &PhysicalPlan) -> PylonResult<StageDag> {
-        let stage = self.physical_to_single_stage(plan)?;
-        Ok(StageDag::new().with_stage(stage))
-    }
+    /// M3 multi-stage: 2 stages for any query.
+    ///   Stage 0: scan + filter + PartitionFilter + ExchangeSink
+    ///   Stage 1: ExchangeSource + Project (final gather/single task)
+    pub fn fragment_multi_stage(
+        &self,
+        plan: &PhysicalPlan,
+        query_id: u64,
+    ) -> PylonResult<StageDag> {
+        let mut stage0_ops = Vec::new();
+        let mut stage1_ops = Vec::new();
+        split_into_two_stages(plan, &mut stage0_ops, &mut stage1_ops)?;
 
-    fn physical_to_single_stage(&self, plan: &PhysicalPlan) -> PylonResult<Stage> {
-        // M2: collapse the whole plan into one stage with N partitions.
-        let fragment = self.physical_to_fragment(plan)?;
-        let id = StageId(unique_stage_id());
-        Ok(Stage::new(id, fragment).with_partition_count(self.cfg.default_partition_count))
-    }
+        let stage0_id = StageId(1);
+        let stage1_id = StageId(2);
 
-    fn physical_to_fragment(&self, plan: &PhysicalPlan) -> PylonResult<Fragment> {
-        let ops = self.collect_ops(plan)?;
-        Ok(Fragment {
-            ops,
+        let stage0_fragment = Fragment {
+            ops: stage0_ops,
             distribution: Distribution::Partitioned(self.cfg.default_partition_count),
-        })
-    }
+        };
+        let stage1_fragment = Fragment {
+            ops: stage1_ops,
+            distribution: Distribution::Single,
+        };
 
-    /// Walk the plan tree pre-order, producing OpSpec list.
-    /// M2: simple cases — SeqScan + Filter + Project.
-    fn collect_ops(&self, plan: &PhysicalPlan) -> PylonResult<Vec<OpSpec>> {
-        let mut out = Vec::new();
-        self.collect_ops_into(plan, &mut out)?;
-        Ok(out)
-    }
+        let mut stage0 = Stage::new(stage0_id, stage0_fragment)
+            .with_partition_count(self.cfg.default_partition_count);
+        let mut stage1 = Stage::new(stage1_id, stage1_fragment);
 
-    fn collect_ops_into(&self, plan: &PhysicalPlan, out: &mut Vec<OpSpec>) -> PylonResult<()> {
-        match plan {
-            PhysicalPlan::SeqScan { table, schema: _ } => {
-                out.push(OpSpec::new("SeqScan").with("table", table.clone()));
-                Ok(())
-            }
-            PhysicalPlan::Filter { input, predicate } => {
-                // Push input first; filter applies to the upstream output.
-                self.collect_ops_into(input, out)?;
-                let (col, op, lit) = decompose_filter(predicate)?;
-                out.push(
-                    OpSpec::new("Filter")
-                        .with("col", col)
-                        .with("op", op)
-                        .with("literal", lit),
-                );
-                Ok(())
-            }
-            PhysicalPlan::Project { input, projections, schema: _ } => {
-                self.collect_ops_into(input, out)?;
-                let cols: Vec<String> = projections
-                    .iter()
-                    .map(|e| match e {
-                        pylon_plan::physical::physical_expr::PhysicalExpr::Column { field, .. } => {
-                            field.name().clone()
-                        }
-                        _ => "_".into(),
-                    })
-                    .collect();
-                out.push(
-                    OpSpec::new("Project")
-                        .with("cols", cols.join(",")),
-                );
-                Ok(())
-            }
+        stage0.downstream = vec![stage1_id];
+        stage1.upstream = vec![stage0_id];
+
+        let qid = query_id;
+        // Pin exchange descriptor keys: target_qid = qid, target_stage = 2 (stage1 always),
+        // target_partition = 0 (single-partition Stage 1 task in M3 demo).
+        let exchange_desc = format!(
+            "pylon://query/{qid}/stage/2/task/0"
+        );
+        append_sink_with_desc(&mut stage0, &exchange_desc);
+        append_source_with_desc(&mut stage1, &exchange_desc);
+
+        let mut dag = StageDag::new().with_stage(stage0).with_stage(stage1);
+        // Topological order: sources first
+        Ok(dag)
+    }
+}
+
+fn kv(items: &[(&str, &str)]) -> HashMap<String, String> {
+    items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+fn append_sink_with_desc(stage: &mut Stage, desc: &str) {
+    let mut config = HashMap::new();
+    config.insert("descriptor".to_string(), desc.to_string());
+    stage.fragment.ops.push(OpSpec {
+        name: "ExchangeSink".to_string(),
+        config,
+    });
+}
+
+fn append_source_with_desc(stage: &mut Stage, desc: &str) {
+    let mut config = HashMap::new();
+    config.insert("descriptor".to_string(), desc.to_string());
+    // Source goes at the BEGINNING of stage 1 ops
+    stage.fragment.ops.insert(0, OpSpec {
+        name: "ExchangeSource".to_string(),
+        config,
+    });
+}
+
+fn split_into_two_stages(
+    plan: &PhysicalPlan,
+    stage0: &mut Vec<OpSpec>,
+    stage1: &mut Vec<OpSpec>,
+) -> PylonResult<()> {
+    // Walks the plan pre-order. Filters (and SeqScan before them) → stage 0.
+    // Project goes to stage 1. After processing, fragmenter adds ExchangeSink
+    // /ExchangeSource at the stage boundaries (see append_* above).
+    match plan {
+        PhysicalPlan::SeqScan { table, schema: _ } => {
+            stage0.push(OpSpec {
+                name: "SeqScan".to_string(),
+                config: kv(&[("path", &format!("data/{table}.parquet"))]),
+            });
+            Ok(())
+        }
+        PhysicalPlan::Filter { input, predicate } => {
+            split_into_two_stages(input, stage0, stage1)?;
+            let (col, op_s, lit) = decompose_filter(predicate)?;
+            stage0.push(OpSpec {
+                name: "Filter".to_string(),
+                config: kv(&[("col", &col), ("op", &op_s), ("literal", &lit)]),
+            });
+            Ok(())
+        }
+        PhysicalPlan::Project { input, projections, schema: _ } => {
+            split_into_two_stages(input, stage0, stage1)?;
+            let cols: Vec<String> = projections.iter()
+                .map(|p| match p {
+                    PhysicalExpr::Column { field, .. } => field.name().clone(),
+                    _ => "_".into(),
+                })
+                .collect();
+            stage1.push(OpSpec {
+                name: "Project".to_string(),
+                config: kv(&[("cols", &cols.join(","))]),
+            });
+            Ok(())
         }
     }
 }
 
-fn decompose_filter(
-    e: &pylon_plan::physical::physical_expr::PhysicalExpr,
-) -> PylonResult<(String, String, String)> {
+fn decompose_filter(p: &PhysicalExpr) -> PylonResult<(String, String, String)> {
     use pylon_plan::physical::physical_expr::PhysicalExpr as PE;
-    Ok(match e {
-        PE::BinaryOp { left, op, right } => {
+    Ok(match p {
+        PE::BinaryOp { left, op, right, .. } => {
             let col = match left.as_ref() {
                 PE::Column { field, .. } => field.name().clone(),
                 _ => "_".into(),
             };
             let lit = match right.as_ref() {
                 PE::Literal { value, .. } => value.clone(),
-                _ => "0".into(),
+                _ => "0".to_string(),
             };
             (col, op.clone(), lit)
         }
-        _ => ("_".into(), "=".into(), "0".into()),
+        _ => ("_".to_string(), "=".to_string(), "0".to_string()),
     })
 }
 
-fn unique_stage_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-// HashMap is unused in M2; saved here so M3 has a starting import.
 #[allow(dead_code)]
-const _HM_DOC: fn() = || {
-    let _: Option<HashMap<String, String>> = None;
-};
-#[allow(dead_code)]
-fn _placeholder_marker() -> PylonError {
-    PylonError::Internal("placeholder".into())
-}
+pub fn _unused_marker(_e: PylonError) {}
