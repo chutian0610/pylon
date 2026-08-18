@@ -57,6 +57,21 @@ impl Fragmenter {
         plan: &PhysicalPlan,
         query_id: u64,
     ) -> PylonResult<StageDag> {
+        // Default: in-process exchanges (A2 behavior) — no worker
+        // flight_addrs supplied.
+        self.fragment_with_workers(plan, query_id, &[])
+    }
+
+    /// M3 B-2: when workers are known, emit `ExchangeSinkRpc` for
+    /// cross-worker targets. `worker_flight_addrs[i]` is the
+    /// Arrow Flight address of worker i (the i-th registered
+    /// worker); the empty slice falls back to in-process mode.
+    pub fn fragment_with_workers(
+        &self,
+        plan: &PhysicalPlan,
+        query_id: u64,
+        worker_flight_addrs: &[String],
+    ) -> PylonResult<StageDag> {
         let n_partitions = self.cfg.default_partition_count;
         let stage0_id = StageId(1);
         let stage1_id = StageId(2);
@@ -65,6 +80,7 @@ impl Fragmenter {
             n_partitions,
             stage0_id,
             stage1_id,
+            worker_flight_addrs: worker_flight_addrs.to_vec(),
         };
         let visit = visit_plan(plan, &mut ctx, stage0_id)?;
 
@@ -100,6 +116,9 @@ struct FragmentCtx {
     n_partitions: usize,
     stage0_id: StageId,
     stage1_id: StageId,
+    /// M3 B-2: per-worker flight_addrs (in worker_id order). Empty
+    /// → in-process mode (emit `ExchangeSink`).
+    worker_flight_addrs: Vec<String>,
 }
 
 /// Result of a post-order walk. `stage0_ops` and `stage1_ops` collect
@@ -154,21 +173,15 @@ fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId
             aggs,
             schema,
         } => {
-            // A2-1 rule: any Aggregate forces a stage boundary in M3
-            // first cut. The child runs in the current stage; the
-            // Aggregate lives in the next stage. Between them is a
-            // partitioned Exchange (sink on child side, sources on
-            // the next-stage side, one source per partition).
+            // A2-1 / B-2 rule: any Aggregate forces a stage boundary
+            // in M3 first cut. The child runs in the current stage;
+            // the Aggregate lives in the next stage. Between them is
+            // a partitioned Exchange.
             //
             // In M3 first cut, the child's stage is always stage0
             // (we don't recurse past an Aggregate — there's only one
             // boundary per query). The next stage is stage1.
             let mut child = visit_plan(input, ctx, current_stage)?;
-
-            // Sanity: the current stage should be stage0 — for M3
-            // first cut we don't support nested aggregates. If a
-            // future plan has an Aggregate inside a stage that's
-            // already stage1, we'd need to recurse into stage2+.
             if current_stage != ctx.stage0_id {
                 return Err(PylonError::InvalidPlan(
                     "nested Aggregate not supported in M3 first cut fragmenter".into(),
@@ -184,7 +197,7 @@ fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId
                 .collect();
             let agg_specs: Vec<String> = aggs.iter().map(agg_spec_to_string).collect();
 
-            // 1. Tail of stage0: partitioned ExchangeSink.
+            // 1. Tail of stage0: partitioned ExchangeSink[Rpc].
             let n = ctx.n_partitions;
             let descriptors: Vec<String> = (0..n)
                 .map(|p| {
@@ -196,18 +209,39 @@ fn visit_plan(plan: &PhysicalPlan, ctx: &mut FragmentCtx, current_stage: StageId
                     )
                 })
                 .collect();
-            // The OpSpec's config is a flat string map. We encode the
-            // N descriptors as a single semicolon-separated value
-            // ("descriptors") plus the count, plus the partition keys.
-            let op_sink = OpSpec {
-                name: "ExchangeSink".to_string(),
-                config: kv(&[
+
+            // B-2 routing: if workers are known, pick the worker
+            // that runs stage1 partition p (round-robin: p %
+            // n_workers). Emit per-partition flight_addrs; emit
+            // `ExchangeSinkRpc` when the target worker ≠ source
+            // worker. M3 first cut: source worker is just "the
+            // worker running stage0 task 0" — we don't have a
+            // source_worker index in the OpSpec config (B-3
+            // dispatch will fix it). For now, always emit
+            // `ExchangeSinkRpc` if any flight_addr is supplied.
+            let (op_name, sink_config) = if ctx.worker_flight_addrs.is_empty() {
+                ("ExchangeSink".to_string(), kv(&[
                     ("descriptors", &descriptors.join(";")),
                     ("n_partitions", &n.to_string()),
                     ("partition_keys", &group_cols.join(",")),
-                ]),
+                ]))
+            } else {
+                // B-2: pick target worker for each partition.
+                let n_workers = ctx.worker_flight_addrs.len().max(1);
+                let target_flight_addrs: Vec<String> = (0..n)
+                    .map(|p| ctx.worker_flight_addrs[p % n_workers].clone())
+                    .collect();
+                ("ExchangeSinkRpc".to_string(), kv(&[
+                    ("descriptors", &descriptors.join(";")),
+                    ("n_partitions", &n.to_string()),
+                    ("partition_keys", &group_cols.join(",")),
+                    ("target_flight_addrs", &target_flight_addrs.join(";")),
+                ]))
             };
-            child.stage0_ops.push(op_sink);
+            child.stage0_ops.push(OpSpec {
+                name: op_name,
+                config: sink_config,
+            });
 
             // 2. Head of stage1: N ExchangeSource ops, one per partition.
             for p in 0..n {

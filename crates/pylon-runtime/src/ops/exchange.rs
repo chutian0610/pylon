@@ -162,6 +162,27 @@ impl ExchangeSinkOp {
 /// types we currently use for group-by keys (Int64, Utf8, Float64,
 /// UInt32, UInt64). Other types are hashed by their debug string —
 /// good enough for M3 first cut, replaced by a proper visitor in M4.
+/// Pure (sync) per-row partition computation. Returns
+/// `partition_index[row]` for each row. FNV-1a mix consistent
+/// with `ExchangeSink` (A2).
+fn compute_partitions(
+    batch: &RecordBatch,
+    indices: &[usize],
+    n_partitions: usize,
+) -> Vec<usize> {
+    let n_rows = batch.num_rows();
+    let mut out = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &col_idx in indices {
+            let arr = batch.column(col_idx).as_ref();
+            fold_array_into_hash(arr, row, &mut h);
+        }
+        out.push((h as usize) % n_partitions);
+    }
+    out
+}
+
 fn fold_array_into_hash(arr: &dyn Array, row: usize, h: &mut u64) {
     if arr.is_null(row) {
         // NULL → 0xdeadbeef sentinel; never collides with valid values
@@ -354,5 +375,233 @@ impl PipelineOp for ExchangeSourceOp {
     async fn is_finished(&self) -> bool {
         let pending = self.service.pending(&self.descriptor).await;
         self.upstream_done && self.input_buf.is_empty() && pending == 0
+    }
+}
+
+
+// ============================================================================
+// M3 B-2: ExchangeSinkRpc — cross-process via Arrow Flight DoExchange
+// ============================================================================
+//
+// `ExchangeSinkRpc` mirrors the in-process partitioned `ExchangeSink`
+// (A2) but routes batches over the wire using a real Arrow Flight
+// client (tonic). The per-row hash routing is identical; the only
+// difference is the transport: tonic Flight `DoExchange` vs. in-process
+// `PylonFlightService` push.
+//
+// M3 first cut: only the sink side has an RPC variant. The source
+// side is unchanged — it pulls from the local PylonFlightService
+// which is fed by the local Flight server (worker listens on
+// `--flight-addr`).
+//
+// Fragmenter rule (B-2): the coord fragmenter picks `ExchangeSinkRpc`
+// when the target worker is **different from** the source worker (the
+// worker running the stage0 task). When they're the same, the
+// fragmenter emits `ExchangeSink` (in-process, A2).
+
+use arrow_ipc::writer::StreamWriter;
+use futures::Stream;
+use tracing::warn;
+
+/// Per-partition target for `ExchangeSinkRpc`. The op opens a
+/// `DoExchange` stream to `flight_addr` and tags all messages with
+/// `descriptor` (in `app_metadata` on the first message).
+#[derive(Debug, Clone)]
+pub struct RpcTarget {
+    pub flight_addr: String,
+    pub descriptor: FlightDescriptor,
+}
+
+pub struct ExchangeSinkRpc {
+    /// Per-partition routing target. `targets[i]` is where rows
+    /// hashing to partition `i` go.
+    targets: Vec<RpcTarget>,
+    partition_keys: Vec<String>,
+    /// Lazily resolved column indices (None until first add_input).
+    partition_key_indices: Option<Vec<usize>>,
+    upstream_done: bool,
+}
+
+impl ExchangeSinkRpc {
+    /// Helper: send one batch via DoExchange. M3 first cut: open
+    /// a fresh channel per call, no pooling.
+    fn send_rpc_job(
+        url: String,
+        messages: Vec<arrow_flight::FlightData>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            // The do_exchange future's Send bound is implicit via the
+            // outer `Pin<Box<dyn Future + Send>>`. Build the stream
+            // inline so its type is inferred (annotation trips
+            // async_trait's HRTB check).
+            let channel = match tonic::transport::Channel::from_shared(url.clone()) {
+                Ok(c) => match c.connect().await {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        warn!("ExchangeSinkRpc connect {url}: {e}");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    warn!("ExchangeSinkRpc bad url {url}: {e}");
+                    return;
+                }
+            };
+            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let s = futures::stream::iter(messages);
+            if let Err(e) = client.do_exchange(s).await {
+                warn!("ExchangeSinkRpc do_exchange {url}: {e}");
+            }
+        })
+    }
+}
+
+impl ExchangeSinkRpc {
+    /// of downstream partitions; the op hashes `partition_keys` and
+    /// routes per row.
+    pub fn new_partitioned(targets: Vec<RpcTarget>, partition_keys: Vec<String>) -> Self {
+        assert!(!targets.is_empty(), "ExchangeSinkRpc needs ≥1 target");
+        assert!(
+            !partition_keys.is_empty(),
+            "ExchangeSinkRpc needs ≥1 partition key"
+        );
+        Self {
+            targets,
+            partition_keys,
+            partition_key_indices: None,
+            upstream_done: false,
+        }
+    }
+
+    fn resolve_partition_keys(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.partition_key_indices.is_some() {
+            return Ok(());
+        }
+        let in_schema = batch.schema();
+        let mut indices = Vec::with_capacity(self.partition_keys.len());
+        for name in &self.partition_keys {
+            let idx = in_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .ok_or_else(|| {
+                    PylonError::InvalidPlan(format!(
+                        "ExchangeSinkRpc partition_key column {name} not found in input"
+                    ))
+                })?;
+            indices.push(idx);
+        }
+        self.partition_key_indices = Some(indices);
+        Ok(())
+    }
+
+    fn slice_batch(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+        if indices.len() == batch.num_rows() {
+            return Ok(batch.clone());
+        }
+        let idx_array = arrow_array::UInt32Array::from(indices.to_vec());
+        let columns: Vec<Arc<dyn arrow_array::Array>> = batch
+            .columns()
+            .iter()
+            .map(|c| arrow_select::take::take(c.as_ref(), &idx_array, None))
+            .collect::<std::result::Result<_, _>>()?;
+        RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
+    }
+
+}
+
+#[async_trait]
+impl PipelineOp for ExchangeSinkRpc {
+    fn name(&self) -> &'static str {
+        "ExchangeSinkRpc"
+    }
+
+    async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        // Resolve column indices first (sync, no await).
+        self.resolve_partition_keys(&batch)?;
+        // Clone the indices + targets up front so the async
+        // portion below doesn't need to borrow `&mut self`.
+        let indices: Vec<usize> = self
+            .partition_key_indices
+            .as_ref()
+            .expect("resolve_partition_keys just set this")
+            .clone();
+        let targets: Vec<RpcTarget> = self.targets.clone();
+        let n_partitions = targets.len();
+
+        // Compute per-row partition index (sync helper, no async
+        // borrows).
+        let per_row_partition: Vec<usize> =
+            compute_partitions(&batch, &indices, n_partitions);
+
+        // Bucket rows by partition.
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_partitions];
+        for (row, &p) in per_row_partition.iter().enumerate() {
+            buckets[p].push(row as u32);
+        }
+
+        // Pre-build the per-partition (url, FlightData messages) so
+        // the async block in tokio::spawn only contains the RPC
+        // call (avoids async_trait's higher-ranked lifetime issues
+        // with complex futures).
+        let mut jobs: Vec<(String, Vec<arrow_flight::FlightData>)> = Vec::new();
+        for (p, idxs) in buckets.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let part_batch = Self::slice_batch(&batch, &idxs)?;
+            let target = targets[p].clone();
+            let url = format!("http://{}", target.flight_addr);
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buf, part_batch.schema().as_ref())
+                    .map_err(|e| PylonError::Internal(format!("ipc writer: {e}")))?;
+                writer.write(&part_batch)
+                    .map_err(|e| PylonError::Internal(format!("ipc write: {e}")))?;
+                writer.finish()
+                    .map_err(|e| PylonError::Internal(format!("ipc finish: {e}")))?;
+            }
+            let desc_msg = arrow_flight::FlightData {
+                flight_descriptor: None,
+                app_metadata: tonic::codegen::Bytes::from(target.descriptor.0.clone()),
+                data_body: tonic::codegen::Bytes::new(),
+                data_header: tonic::codegen::Bytes::new(),
+            };
+            let body_msg = arrow_flight::FlightData {
+                flight_descriptor: None,
+                app_metadata: tonic::codegen::Bytes::new(),
+                data_body: tonic::codegen::Bytes::from(buf),
+                data_header: tonic::codegen::Bytes::new(),
+            };
+            jobs.push((url, vec![desc_msg, body_msg]));
+        }
+        drop(batch);
+
+        // Dispatch each job in a spawned task. We Box::pin the
+        // future as a `Pin<Box<dyn Future + Send>>` to force async_trait
+        // to accept the Send bound (avoids higher-ranked lifetime
+        // issues with bare `impl Future`).
+        for (url, messages) in jobs {
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Self::send_rpc_job(url, messages);
+            tokio::spawn(fut);
+        }
+        Ok(())
+    }
+
+    async fn get_output(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(None) // sink has no output batches
+    }
+
+    async fn no_more_input(&mut self) -> Result<()> {
+        self.upstream_done = true;
+        Ok(())
+    }
+
+    async fn is_finished(&self) -> bool {
+        self.upstream_done
     }
 }

@@ -295,6 +295,45 @@ fn build_op(
             let desc = FlightDescriptor(get("descriptor")?);
             Ok(Box::new(ExchangeSourceOp::new(desc, flight_service)))
         }
+        "ExchangeSinkRpc" => {
+            // M3 B-2: cross-process partitioned sink via Arrow Flight
+            // DoExchange. Same config keys as `ExchangeSink`
+            // partitioned mode, but `target_flight_addrs` (parallel to
+            // descriptors) holds the per-partition worker flight_addr.
+            let descs: Vec<FlightDescriptor> = get("descriptors")?
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| FlightDescriptor(s.to_string()))
+                .collect();
+            let flight_addrs: Vec<String> = get("target_flight_addrs")?
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if flight_addrs.len() != descs.len() {
+                anyhow::bail!(
+                    "ExchangeSinkRpc: target_flight_addrs ({}) and descriptors ({}) length mismatch",
+                    flight_addrs.len(),
+                    descs.len()
+                );
+            }
+            let partition_keys: Vec<String> = get("partition_keys")?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let targets: Vec<pylon_runtime::ops::RpcTarget> = flight_addrs
+                .into_iter()
+                .zip(descs.into_iter())
+                .map(|(flight_addr, descriptor)| pylon_runtime::ops::RpcTarget {
+                    flight_addr,
+                    descriptor,
+                })
+                .collect();
+            Ok(Box::new(
+                pylon_runtime::ops::ExchangeSinkRpc::new_partitioned(targets, partition_keys),
+            ))
+        }
         "Aggregate" => {
             // M3 A1-4 wiring. The fragmenter emits two config keys:
             //   group_by_cols: comma-separated column names
