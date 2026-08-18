@@ -30,6 +30,8 @@ arrow-schema = "59"
 arrow-select = "59"
 arrow-buffer = "59"
 parquet = "59"
+arrow-flight = "59"
+arrow-ipc = "59"
 
 # Async
 tokio = { version = "1", features = [

@@ -9,6 +9,18 @@ workspace = true
 
 [dependencies]
 pylon-types = { path = "../pylon-types" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = "0.14"
+prost = "0.14"
 tokio = { workspace = true }
-anyhow = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow-array = { workspace = true }

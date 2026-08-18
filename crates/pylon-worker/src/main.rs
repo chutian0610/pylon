@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use pylon_proto::pylon::{TaskRequest, TaskResponse, TaskState};
 use pylon_proto::worker_client::WorkerClient;
-use pylon_runtime::ops::{FilterOp, PartitionFilterOp, ProjectOp, SeqScanOp};
+use pylon_exchange::{FlightDescriptor, PylonFlightService};
+use pylon_runtime::ops::{
+    ExchangeSinkOp, ExchangeSourceOp, FilterOp, PartitionFilterOp, ProjectOp, SeqScanOp,
+};
 use pylon_runtime::{Driver, DriverMode, Pipeline, PipelineOp};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -12,6 +15,16 @@ use tracing::{info, warn};
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
+
+    // Single in-process Flight service shared by all tasks in this worker.
+    // M3 first cut: every task's ExchangeSink/Source wires into this. Real
+    // peer-to-peer Flight RPC belongs to M3 task #4.
+    let flight_service = Arc::new(PylonFlightService::new());
+
+    run(flight_service).await
+}
+
+async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
     let coord_addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("PYLON_COORDINATOR").ok())
@@ -38,7 +51,7 @@ async fn main() -> Result<()> {
         let task_id = task_req_msg.spec.as_ref().map(|s| s.id).unwrap_or(0);
         info!(task_id, "got task request");
 
-        match run_task(task_req_msg).await {
+        match run_task(task_req_msg, flight_service.clone()).await {
             Ok(batches) => {
                 let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
                 for batch in batches {
@@ -64,10 +77,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_task(req: TaskRequest) -> Result<Vec<arrow_array::RecordBatch>> {
+async fn run_task(req: TaskRequest, flight_service: Arc<PylonFlightService>) -> Result<Vec<arrow_array::RecordBatch>> {
     let spec = req.spec.context("task spec missing")?;
     let fragment = spec.fragment.as_ref().context("fragment missing")?;
-    let ops = build_ops(fragment)?;
+    let ops = build_ops(fragment, flight_service.clone())?;
     let pipeline = Arc::new(Pipeline::new(ops));
     let driver = Driver::new(pipeline).with_mode(DriverMode::PerOpTokioTask);
 
@@ -79,15 +92,22 @@ async fn run_task(req: TaskRequest) -> Result<Vec<arrow_array::RecordBatch>> {
     Ok(collected)
 }
 
-fn build_ops(fragment: &pylon_proto::pylon::Fragment) -> Result<Vec<Box<dyn PipelineOp>>> {
+fn build_ops(
+    fragment: &pylon_proto::pylon::Fragment,
+    flight_service: Arc<PylonFlightService>,
+) -> Result<Vec<Box<dyn PipelineOp>>> {
     let mut ops: Vec<Box<dyn PipelineOp>> = Vec::new();
     for op_spec in &fragment.ops {
-        ops.push(build_op(&op_spec.name, &op_spec.config)?);
+        ops.push(build_op(&op_spec.name, &op_spec.config, flight_service.clone())?);
     }
     Ok(ops)
 }
 
-fn build_op(name: &str, config: &std::collections::HashMap<String, String>) -> Result<Box<dyn PipelineOp>> {
+fn build_op(
+    name: &str,
+    config: &std::collections::HashMap<String, String>,
+    flight_service: Arc<PylonFlightService>,
+) -> Result<Box<dyn PipelineOp>> {
     let get = |k: &str| -> Result<String> {
         config.get(k).cloned().ok_or_else(|| anyhow::anyhow!("op {name} missing config key {k}"))
     };
@@ -100,6 +120,26 @@ fn build_op(name: &str, config: &std::collections::HashMap<String, String>) -> R
             Ok(Box::new(ProjectOp::new(cols, schema)))
         }
         "PartitionFilter" => Ok(Box::new(PartitionFilterOp::new(get("col")?, &get("literal")?)?)),
+        "ExchangeSink" => {
+            let qid_str = get("query_id")?;
+            let stage_str = get("stage_id")?;
+            let part_str = get("partition")?;
+            let desc = FlightDescriptor(format!(
+                "pylon://query/{}/stage/{}/task/{}",
+                qid_str, stage_str, part_str
+            ));
+            Ok(Box::new(ExchangeSinkOp::new(desc, flight_service.clone())))
+        }
+        "ExchangeSource" => {
+            let qid_str = get("query_id")?;
+            let stage_str = get("stage_id")?;
+            let part_str = get("partition")?;
+            let desc = FlightDescriptor(format!(
+                "pylon://query/{}/stage/{}/task/{}",
+                qid_str, stage_str, part_str
+            ));
+            Ok(Box::new(ExchangeSourceOp::new(desc, flight_service)))
+        }
         other => Err(anyhow::anyhow!("unknown op: {other}")),
     }
 }
