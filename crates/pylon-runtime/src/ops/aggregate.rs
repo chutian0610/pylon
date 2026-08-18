@@ -221,6 +221,17 @@ impl HashAggregateOp {
         Ok(())
     }
 
+    /// Pre-resolve the output schema before any data arrives. Useful
+    /// when the caller knows the post-aggregation schema (e.g. a
+    /// coordinator that built the PhysicalPlan) and especially when
+    /// some partitions may receive zero rows — those still need a
+    /// well-formed zero-row batch emitted at `no_more_input`.
+    pub fn resolve_output_schema(&mut self, schema: SchemaRef) {
+        if self.output_schema.fields().is_empty() {
+            self.output_schema = schema;
+        }
+    }
+
     /// Resolve the indices of the group_by columns in the input schema.
     fn group_by_indices(&self, batch: &RecordBatch) -> Result<Vec<usize>> {
         let in_schema = batch.schema();

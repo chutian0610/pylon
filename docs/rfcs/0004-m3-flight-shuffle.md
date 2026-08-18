@@ -1,7 +1,7 @@
 # RFC 0004 — M3 Arrow Flight Shuffle Protocol
 
-- **Status**: Draft
-- **Date**: 2026-08-18
+- **Status**: Implemented (2026-08-18)
+- **Date**: 2026-08-18 (Draft) → 2026-08-18 (Implemented)
 - **Author**: Pylon Working Group
 - **Discussion**: Builds on RFC-0003 §5 (control + data plane) and M2 placeholder batch limitation
 
@@ -188,23 +188,35 @@ ExchangeSpec {
 
 ## 12. 实施 DoD
 
-| 项 | 验收 |
-|---|---|
-| `pylon-exchange` crate 实现 FlightServer trait + WorkerFlightService impl | `cargo build -p pylon-exchange` 通过 |
-| `ExchangeSinkOp` 把本 worker batch 推到 Arrow Flight stream | unit test |
-| `ExchangeSourceOp` 从 Arrow Flight stream 拉 batch 回 pipeline | unit test |
-| 2-worker E2E: `SELECT region, COUNT(*) GROUP BY region` 跨 worker 走 Flight, 结果准确 | integration test |
-| M3 阶段 `git commit` 干净，5+ 个新单元测试通过 | final |
+| 项 | 验收 | 实际 |
+|---|---|---|
+| `pylon-exchange` crate 实现 FlightServer trait + WorkerFlightService impl | `cargo build -p pylon-exchange` 通过 | ✅ `flight_rpc.rs::FlightServerImpl` |
+| `ExchangeSinkOp` 把本 worker batch 推到 Arrow Flight stream | unit test | ✅ `tests/exchange_test.rs` |
+| `ExchangeSourceOp` 从 Arrow Flight stream 拉 batch 回 pipeline | unit test | ✅ 同上 |
+| 2-worker E2E: `SELECT region, COUNT(*) GROUP BY region` 跨 worker 走 Flight, 结果准确 | integration test | ✅ `tools/e2e/two_worker_smoke.sh` (改成 `SELECT name, COUNT(*) FROM sample GROUP BY name`，sample 列名不同) |
+| M3 阶段 `git commit` 干净，5+ 个新单元测试通过 | final | ✅ 38+ 个新单测，91 passing (33 suites) |
 
 ## 13. 决策 checklist
 
-- [ ] DEC-001 控制平面仍 gRPC (RFC-0003)
-- [ ] DEC-002 数据平面 worker↔worker Arrow Flight (本 RFC)
-- [ ] DEC-003 IPC streaming format + DoExchange RPC
-- [ ] DEC-004 每 worker 双 server (gRPC + Flight) 同进程
-- [ ] DEC-005 默认 partition 16 + 默认 batch 4 MiB，与 RFC-0003 决策一致
+- [x] DEC-001 控制平面仍 gRPC (RFC-0003) — `crates/pylon-proto/proto/pylon.proto` 的 `Worker.OpenSession` bidi
+- [x] DEC-002 数据平面 worker↔worker Arrow Flight (本 RFC) — `crates/pylon-runtime/src/ops/exchange.rs::ExchangeSinkRpc` 走 tonic `DoExchange`
+- [x] DEC-003 IPC streaming format + DoExchange RPC — `crates/pylon-exchange/src/flight_rpc.rs::FlightServerImpl::do_exchange` + `crates/pylon-exchange/src/flight_client.rs::PylonFlightClient`
+- [x] DEC-004 每 worker 双 server (gRPC + Flight) 同进程 — `crates/pylon-worker/src/main.rs` 同进程跑 `WorkerServer` + `FlightServiceServer`
+- [x] DEC-005 默认 partition 16 + 默认 batch 4 MiB，与 RFC-0003 决策一致 — M3 B-3.5 first cut 改用 `default_partition_count=2` for the 2-worker demo; 4 MiB batch default 保留
 
 ## 14. Sign-off
 
-Date: 2026-08-18
-下一步：task #2 (pylon-exchange crate + Arrow Flight deps)
+Date: 2026-08-18 (Implemented)
+
+落地拆成 12 个 commit 推到 `codex/m3-hash-partition-exchange`：
+- A1-1..A1-5 + A1 rollup (`Logical::Aggregate` + `HashAggregateOp` + worker wiring + 1-stage E2E)
+- A2-1..A2-2 + A2 rollup (`Fragmenter` post-order + `HashPartitionExchange` + 2-stage in-process E2E)
+- B-1 (`Discovery` + `RegisterWorker` proto + worker Flight server)
+- B-2 (`ExchangeSinkRpc` over tonic `DoExchange`)
+- B-3 (2-worker smoke E2E script)
+- B-3.5 gap1 (worker 真 Arrow IPC 编码 + coord decode)
+- B-3.5 gap2 (coord dispatch 切 `Fragmenter::fragment_with_workers` + 真 2-worker shuffle E2E)
+
+Sign-off packet: [docs/notes/m3-status.md](../notes/m3-status.md)。End-to-end 验证在 `tools/e2e/two_worker_smoke.sh` —— 2 个 OS 进程 + 1 coord + 真 Arrow Flight `DoExchange` 跑通 `SELECT name, COUNT(*) FROM sample GROUP BY name` 端到端。
+
+下一步 (M4)：FTE (写 Arrow IPC stream 到 S3) + Spill + 容错。RFC-0006 待写。

@@ -77,23 +77,49 @@
 
 ---
 
-## 里程碑 3 — Iceberg + Lakekeeper (11–12 月)
+## 里程碑 3 — Cross-worker Arrow Flight Shuffle (2026-08-18)
 
-**目标**：真实数据源接入，与 Iceberg 生态打通。
+**目标**：把 M2 的 "coord 作为 gatherer" 换成 worker↔worker 的 Arrow Flight 流；coord 只路由，不持数据；多 stage query 能跑。
 
-定义完成（DoD）：
-- [ ] Lakekeeper 实例部署，跑元数据
-- [ ] `pylon-catalog::LakekeeperClient`：list/load/commit
-- [ ] `pylon-iceberg::reader`：snapshot → manifest → Parquet → RecordBatch
-- [ ] SQL `SELECT * FROM iceberg-table` 端到端
-- [ ] TPC-H SF100 全套跑过（除 TPC-H Q15 包含 view creation）
-- [ ] benchmark 与 Trino 457 release 对比：
+**实际交付（范围调整）**：原 M3 scope 是 Iceberg + Lakekeeper + TPC-H SF100。8 月这一轮把范围换成 RFC-0004 的跨 worker shuffle 基底（A1 Aggregate 节点 / A2 Fragmenter / B-1 Worker Discovery / B-2 ExchangeSinkRpc 跨 Flight RPC / B-3.5 真跨进程 E2E）。Iceberg 那边推后到 M3.5+/后续轮次，catalog/iceberg/storage 三个 crate 仍是 stub。详细 sign-off 见 [docs/notes/m3-status.md](../notes/m3-status.md)。
 
-| Metric | Pylon | Trino | Delta |
-|---|---|---|---|
-| TPC-H total runtime | ? | ? | ? |
-| Peak memory | ? | ? | ? |
-| Cold start time | ? | ? | ? |
+定义完成（DoD 调整版）：
+- [x] `LogicalPlan::Aggregate` + `HashAggregateOp` (COUNT/SUM/MIN/MAX) — A1
+- [x] `Fragmenter` post-order walk + `HashPartitionExchange` 注入 + per-row FNV-1a hash routing — A2
+- [x] 1-stage aggregate E2E (`SELECT name, COUNT(*), SUM(amount) GROUP BY name` over `sample.parquet`，结果对) — A1
+- [x] 1-worker 2-stage partitioned aggregate E2E (4 partitions, in-process `ExchangeSink`) — A2
+- [x] `pylon_coord::Discovery` + `RegisterWorker` proto RPC + worker 端 `flight_addr` 上报 — B-1
+- [x] Worker 进程同进程起 Arrow Flight server (`arrow_flight::flight_service_server::FlightService` impl) — B-1
+- [x] `ExchangeSinkRpc` op 走真 tonic Flight `DoExchange`（per-row hash 路由到 N 个 target `flight_addr`）— B-2
+- [x] 2-worker 跨进程 E2E (`SELECT name, COUNT(*) GROUP BY name` 跑过，stage0 在 worker 0 扫 + `ExchangeSinkRpc` per-row hash 路由到 2 个 partition target，stage1 partition p 派给 worker p%2 跑 `ExchangeSource + HashAggregate`，coord 合并结果）— B-3 / B-3.5
+
+| Stage | commit | status |
+|---|---|---|
+| A1-1 Logical::Aggregate | 2e1d9d8 | ✓ |
+| A1-2 Physical lowering | e828af4 | ✓ |
+| A1-3 HashAggregateOp | 2247723 | ✓ |
+| A1-4 worker wiring | 692e267 | ✓ |
+| A1-5 1-stage E2E | 7ee6848 | ✓ |
+| A1 rollup | d3e8889 | ✓ |
+| A2-1 Fragmenter + HashPartitionExchange | a0483aa | ✓ |
+| A2-2 2-stage in-process E2E | 880c65e | ✓ |
+| A2 rollup | ac95641 | ✓ |
+| B-1 Discovery + Flight server | a9ed2ac | ✓ |
+| B-2 ExchangeSinkRpc | 122f3f4 | ✓ |
+| B-3 2-worker smoke | e9b3a03 | ✓ |
+| B-3.5 gap1 (真 IPC) | 1435fb8 | ✓ |
+| B-3.5 gap2 (真 cross-worker E2E) | 178d5eb | ✓ |
+
+headline numbers:
+- 91 unit tests passing (33 suites; up from 17 at end of M1)
+- `tools/e2e/two_worker_smoke.sh` 跑过：`SELECT name, COUNT(*) FROM sample GROUP BY name` 在 1 coord + 2 worker 上跑通，结果 100k 行 `(name, count=1)`
+
+**Out of scope (deferred)**：
+- [ ] Lakekeeper / Iceberg / TPC-H SF100（推到 M3.5+）
+- [ ] HashJoin / Distinct / Window fragmenter rules（fragmenter 框架通用，只有 Aggregate 规则实装）
+- [ ] Nested aggregate（显式 reject）
+- [ ] 同 worker `ExchangeSource` 走真 Flight RPC（当前 in-process `PylonFlightService` only；跨 worker 已经走真 RPC）
+- [ ] Coordinator HA / TLS / OIDC
 
 ---
 
