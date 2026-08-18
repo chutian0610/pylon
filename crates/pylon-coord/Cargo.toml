@@ -27,6 +27,7 @@ axum = { workspace = true }
 tonic = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 serde = { version = "1", features = ["derive"] }

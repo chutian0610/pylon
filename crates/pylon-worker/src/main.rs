@@ -8,7 +8,7 @@ use pylon_proto::pylon::{
     RegisterWorkerRequest, TaskRequest, TaskResponse, TaskState,
 };
 use pylon_proto::worker_client::WorkerClient;
-use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightService};
+use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightClient, PylonFlightService};
 use pylon_runtime::ops::{
     AggSpec, ExchangeSinkOp, ExchangeSourceOp, FilterOp, HashAggregateOp,
     PartitionFilterOp, ProjectOp, SeqScanOp,
@@ -357,8 +357,43 @@ fn build_op(
     }
 }
 
-fn encode_batch_ipc(_batch: &arrow_array::RecordBatch) -> Result<Vec<u8>> {
-    Ok(vec![])
+/// Encode a RecordBatch as Arrow IPC streaming bytes (one schema
+/// message + one RecordBatch message + EOS). M3 B-3.5: replaces the
+/// M2 placeholder that emitted `vec![]`.
+///
+/// The "endpoint" passed to PylonFlightClient is a fake in-process
+/// string — the client just uses the descriptor as a key into the
+/// buffer; no actual Flight RPC happens here (coord reads the bytes
+/// out of `TaskResponse.batch` and decodes them locally).
+fn encode_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Vec<u8>> {
+    use pylon_exchange::PylonFlightClient;
+    // The worker is already running inside a tokio runtime (from
+    // `#[tokio::main]`), so we drive the async client via
+    // `Handle::current().block_on`. We use a dedicated single-thread
+    // runtime for the bytes to avoid holding the main runtime
+    // blocked — but in M3 first cut the volumes are tiny so the
+    // simpler approach is fine.
+    // Use a fresh per-batch runtime to avoid re-entering the worker's outer runtime.
+    std::thread::scope(|s| {
+        s.spawn(|| -> Result<Vec<u8>> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("encode_batch_ipc runtime: {e}"))?;
+            runtime.block_on(async move {
+                let client = PylonFlightClient::connect(
+                    "in-process://worker".into(),
+                    "task-batch".into(),
+                )
+                .await?;
+                client.send(batch.clone()).await?;
+                client.close().await?;
+                Ok::<Vec<u8>, anyhow::Error>(client.take_bytes().await)
+            })
+        })
+        .join()
+        .unwrap()
+    })
 }
 
 fn init_tracing() {

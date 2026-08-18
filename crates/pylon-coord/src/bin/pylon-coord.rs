@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const HTTP_PORT: u16 = 8080;
 const GRPC_PORT: u16 = 9090;
@@ -637,22 +637,36 @@ impl Worker for CoordGrpc {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(resp) => {
-                        let n = resp.rows_emitted;
                         let tid = resp.task_id;
-                        if n > 0 {
-                            let schema: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
-                                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-                                arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
-                            ]));
-                            let ids: arrow_array::Int64Array = (0..n).map(|_| tid as i64).collect();
-                            let names_vec: Vec<String> = (0..n).map(|i| format!("worker-tid-{tid}-row-{i}")).collect();
-                            let names: arrow_array::StringArray = arrow_array::StringArray::from(names_vec);
-                            let cols: Vec<Arc<dyn arrow_array::Array>> = vec![
-                                Arc::new(ids),
-                                Arc::new(names),
-                            ];
-                            if let Ok(b) = arrow_array::RecordBatch::try_new(schema, cols) {
-                                completed.lock().unwrap().entry(tid).or_default().push(b);
+                        // M3 B-3.5: decode the real Arrow IPC streaming
+                        // bytes from the worker. A single response
+                        // carries one full IPC stream (schema + N
+                        // batches + EOS), so we may decode multiple
+                        // RecordBatches per response.
+                        if !resp.batch.is_empty() {
+                            match decode_ipc_stream(&resp.batch) {
+                                Ok(batches) if !batches.is_empty() => {
+                                    let n: usize =
+                                        batches.iter().map(|b| b.num_rows()).sum();
+                                    debug!(worker = worker_id.0, task_id = tid, batches = batches.len(), rows = n, "decoded IPC stream");
+                                    completed
+                                        .lock()
+                                        .unwrap()
+                                        .entry(tid)
+                                        .or_default()
+                                        .extend(batches);
+                                }
+                                Ok(_) => {
+                                    // Empty stream (just schema + EOS). Ignore.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        worker = worker_id.0,
+                                        task_id = tid,
+                                        error = %e,
+                                        "failed to decode TaskResponse.batch IPC stream"
+                                    );
+                                }
                             }
                         }
                     }
@@ -663,6 +677,15 @@ impl Worker for CoordGrpc {
 
         Ok(Response::new(SessionOutStream { inner: ReceiverStream::new(rx) }))
     }
+}
+
+/// Decode an Arrow IPC streaming payload (schema + N RecordBatch
+/// messages + EOS) into the contained RecordBatches. M3 B-3.5.
+fn decode_ipc_stream(bytes: &[u8]) -> anyhow::Result<Vec<arrow_array::RecordBatch>> {
+    use arrow_ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None)?;
+    reader.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub struct SessionOutStream { inner: ReceiverStream<TaskRequest> }
