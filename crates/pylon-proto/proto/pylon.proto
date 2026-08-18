@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package pylon;
+
+// ---- worker ↔ coord control plane ----
+
+service Worker {
+  // The single bidi stream used for the lifetime of a worker connection.
+  // Coord sends TaskRequest, worker streams TaskResponse back.
+  rpc OpenSession (stream TaskResponse) returns (stream TaskRequest);
+}
+
+message TaskRequest {
+  TaskSpec spec = 1;
+}
+
+message TaskResponse {
+  uint64 task_id = 1;
+  TaskState state = 2;
+  uint64 rows_emitted = 3;
+
+  // Arrow IPC streaming-encoded RecordBatch (0..N).
+  // If state == DONE or FAILED, the stream is closed implicitly.
+  bytes batch = 4;
+
+  string message = 5;  // for FAILED: error msg
+}
+
+enum TaskState {
+  TASK_RUNNING = 0;
+  TASK_DONE = 1;
+  TASK_FAILED = 2;
+  TASK_CANCELLED = 3;
+}
+
+// ---- Shared message types ----
+
+message TaskSpec {
+  uint64 id = 1;
+  uint64 query_id = 2;
+  uint64 stage_id = 3;
+  uint32 partition = 4;
+  Fragment fragment = 5;
+  repeated ExchangeSpec sources = 6;
+  repeated ExchangeSpec sinks = 7;
+  uint64 memory_budget_bytes = 8;
+}
+
+message Fragment {
+  repeated OpSpec ops = 1;
+  Distribution distribution = 2;
+}
+
+message OpSpec {
+  string name = 1;
+  map<string, string> config = 2;
+}
+
+enum Distribution {
+  DISTRIB_SINGLE = 0;
+  DISTRIB_PARTITIONED = 1;
+  DISTRIB_BROADCAST = 2;
+}
+
+message ExchangeSpec {
+  ExchangeKind kind = 1;
+  string target_worker = 2;
+  uint32 target_partition = 3;
+  uint32 source_partition = 4;
+}
+
+enum ExchangeKind {
+  EX_PARTITIONED = 0;
+  EX_BROADCAST = 1;
+  EX_GATHER = 2;
+  EX_LOCAL = 3;
+}

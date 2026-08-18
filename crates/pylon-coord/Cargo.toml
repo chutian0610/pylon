@@ -7,12 +7,32 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "pylon-coord"
+path = "src/bin/pylon-coord.rs"
+
 [dependencies]
 pylon-types = { path = "../pylon-types" }
 pylon-plan = { path = "../pylon-plan" }
+pylon-runtime = { path = "../pylon-runtime" }
+pylon-proto = { path = "../pylon-proto" }
 anyhow = { workspace = true }
+parking_lot = "0.12"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+futures = { workspace = true }
+axum = { workspace = true }
+tonic = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlparser = { workspace = true }
 
 [dev-dependencies]
 pylon-plan = { path = "../pylon-plan" }

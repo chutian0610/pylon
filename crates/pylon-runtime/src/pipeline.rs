@@ -1,16 +1,9 @@
 //! Pipeline: a chain of operators with shared state — Trino alignment.
-//!
-//! In our model:
-//! - Pipeline owns the operator chain (shared across drivers)
-//! - Pipeline holds StateBridges (e.g. HashJoinBridge for shared build state)
-//! - M Drivers process the pipeline concurrently (M=1 in M2 default)
-//!
-//! Pipeline data lives on the worker (coordinator never owns an actual Pipeline).
-//! Coordinator owns `Fragment` (the spec) and constructs `TaskSpec` from it.
 
 use crate::bridge::StateBridge;
 use crate::op::PipelineOp;
 use pylon_types::Result as PylonResult;
+use pylon_types::{PylonError, RecordBatch};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -43,35 +36,22 @@ impl Pipeline {
             state_bridges: Vec::new(),
         }
     }
-
-    pub fn with_bridge(mut self, bridge: Arc<dyn StateBridge>) -> Self {
-        self.state_bridges.push(bridge);
-        self
+    pub fn with_bridge(mut self, b: Arc<dyn StateBridge>) -> Self {
+        self.state_bridges.push(b); self
     }
-
-    pub fn op_count(&self) -> usize {
-        self.ops.len()
-    }
+    pub fn op_count(&self) -> usize { self.ops.len() }
 }
 
-/// Default M2 driver mode: each op is a separate tokio task.
-/// N ops = N concurrent tasks per pipeline. Data flows through mpsc channels.
-///
-/// This is functionally equivalent to the M1 driver, but the abstraction
-/// (Pipeline) is now Trino-aligned: Pipeline=op chain, Driver=runs the chain.
 pub async fn run_pipeline_per_op_task(
     pipeline: Arc<Pipeline>,
-    input: Option<mpsc::Receiver<pylon_types::RecordBatch>>,
-) -> PylonResult<mpsc::Receiver<pylon_types::RecordBatch>> {
-    use pylon_types::RecordBatch;
-
+    input: Option<mpsc::Receiver<RecordBatch>>,
+) -> PylonResult<mpsc::Receiver<RecordBatch>> {
     let n_ops = pipeline.ops.len();
     if n_ops == 0 {
         let (_tx, rx) = mpsc::channel::<RecordBatch>(1);
         return Ok(rx);
     }
     let (final_tx, final_rx) = mpsc::channel::<RecordBatch>(DEFAULT_CHANNEL_CAPACITY);
-
     let mut joins: JoinSet<()> = JoinSet::new();
     let mut next_input: Option<mpsc::Receiver<RecordBatch>> = input;
 
@@ -94,9 +74,7 @@ pub async fn run_pipeline_per_op_task(
 
     tokio::spawn(async move {
         while let Some(res) = joins.join_next().await {
-            if let Err(e) = res {
-                warn!(target: "pylon::pipeline", error = %e, "op task panicked");
-            }
+            if let Err(e) = res { warn!(target: "pylon::pipeline", panic = %e, "task panic"); }
         }
         debug!(target: "pylon::pipeline", "all ops exited");
     });
@@ -113,14 +91,13 @@ pub async fn run_pipeline_per_op_task(
 
 async fn run_op(
     op: Arc<Mutex<Box<dyn PipelineOp>>>,
-    mut input: Option<mpsc::Receiver<pylon_types::RecordBatch>>,
-    output: mpsc::Sender<pylon_types::RecordBatch>,
+    mut input: Option<mpsc::Receiver<RecordBatch>>,
+    output: mpsc::Sender<RecordBatch>,
 ) -> PylonResult<()> {
-    use pylon_types::RecordBatch;
-
     let mut upstream_done = false;
+
     loop {
-        // Step 1: feed input if available and op needs it
+        // Phase A: feed input (lock→unlock with no holds across await)
         if !upstream_done {
             let needs = {
                 let g = op.lock().await;
@@ -128,57 +105,52 @@ async fn run_op(
             };
             if needs {
                 if let Some(rx) = input.as_mut() {
-                    match rx.try_recv() {
+                    let recv = rx.try_recv();
+                    match recv {
                         Ok(batch) => {
-                            let mut g = op.lock().await;
-                            g.add_input(batch).await?;
+                            let name = op.lock().await.name().to_string();
+                            op.lock().await.add_input(batch).await
+                                .map_err(|e| PylonError::Internal(format!("{name} add_input: {e}")))?;
                         }
                         Err(mpsc::error::TryRecvError::Empty) => {}
                         Err(mpsc::error::TryRecvError::Disconnected) => {
-                            let mut g = op.lock().await;
-                            g.no_more_input().await?;
+                            let name = op.lock().await.name().to_string();
+                            op.lock().await.no_more_input().await
+                                .map_err(|e| PylonError::Internal(format!("{name} no_more_input: {e}")))?;
                             upstream_done = true;
                         }
                     }
                 } else {
-                    upstream_done = true; // source op
+                    upstream_done = true;
                 }
             }
         }
 
-        // Step 2: drain op's output
-        {
+        // Phase B: drain output
+        let maybe_out = {
             let mut g = op.lock().await;
-            if let Some(batch) = g.get_output().await? {
-                drop(g);
+            g.get_output().await
+        };
+        match maybe_out {
+            Ok(Some(batch)) => {
                 if output.send(batch).await.is_err() {
-                    return Ok(()); // downstream closed
+                    return Ok(());
                 }
                 continue;
             }
-        }
-
-        // Step 3: finished?
-        {
-            let g = op.lock().await;
-            if g.is_finished().await {
-                return Ok(());
+            Ok(None) => {}
+            Err(e) => {
+                let name = op.lock().await.name().to_string();
+                return Err(PylonError::Internal(format!("{name} get_output: {e}")).into());
             }
         }
 
-        // Step 4: blocked? (Trino-style is_blocked)
-        // For M2 default mode, just yield; real driver would poll a future.
+        // Phase C: finished?
         {
             let g = op.lock().await;
-            if g.is_blocked().await?.is_some() {
-                drop(g);
-                tokio::task::yield_now().await;
-                continue;
-            }
+            if g.is_finished().await { return Ok(()); }
         }
 
-        // Step 5: idle yield
         tokio::task::yield_now().await;
     }
 }
-

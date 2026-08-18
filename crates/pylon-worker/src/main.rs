@@ -1,213 +1,118 @@
-//! `pylon` — M1 single-worker SQL runner. Reads SQL, returns RecordBatches.
+//! `pylon-worker` — connects to a coordinator over gRPC and runs TaskSpec instances.
 
 use anyhow::{Context, Result};
-use arrow_array::RecordBatch;
-use pylon_plan::physical::PhysicalPlan;
-use pylon_plan::physical::physical_expr::PhysicalExpr as PE;
-use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
-use pylon_runtime::ops::{FilterOp, ProjectOp, SeqScanOp};
-use pylon_runtime::{Driver, PipelineOp};
+use futures::StreamExt;
+use pylon_proto::pylon::{TaskRequest, TaskResponse, TaskState};
+use pylon_proto::worker_client::WorkerClient;
+use pylon_runtime::ops::{FilterOp, PartitionFilterOp, ProjectOp, SeqScanOp};
+use pylon_runtime::{Driver, DriverMode, Pipeline, PipelineOp};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
+    let coord_addr = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("PYLON_COORDINATOR").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
 
-    let args = parse_args().context("parse args")?;
-    info!("pylon M1 starting");
+    info!("pylon-worker connecting to coord at {coord_addr}");
+    let mut client = WorkerClient::connect(coord_addr.clone())
+        .await
+        .with_context(|| format!("connect to coord {coord_addr}"))?;
 
-    let catalog = if let Some(p) = args.path {
-        let mut cat = CatalogStub::new();
-        let schema = peek_parquet_schema(&p)?;
-        cat.register(&args.table, schema, &p);
-        cat
-    } else {
-        CatalogStub::with_builtin()
-    };
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<TaskResponse>(32);
+    let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
-    let logical = logical_from_sql(&args.sql, &catalog)?;
-    let physical = physical_from_logical(logical)?;
-    info!("plan:\n{:#?}", physical);
+    let response = client
+        .open_session(out_stream)
+        .await
+        .with_context(|| "open_session")?;
+    let mut incoming = response.into_inner();
 
-    let ops = build_ops(&physical, &catalog)?;
-    info!("built {} ops", ops.len());
+    info!("session opened; awaiting TaskRequest stream");
 
-    // Trino-aligned: build Pipeline first, then a Driver to run it.
-    let pipeline = std::sync::Arc::new(pylon_runtime::Pipeline::new(ops));
-    let driver = pylon_runtime::Driver::new(pipeline).with_mode(pylon_runtime::DriverMode::PerOpTokioTask);
-    let mut output = driver.run(None).await?;
+    while let Some(task_req_msg) = incoming.next().await {
+        let task_req_msg = task_req_msg.with_context(|| "decode TaskRequest")?;
+        let task_id = task_req_msg.spec.as_ref().map(|s| s.id).unwrap_or(0);
+        info!(task_id, "got task request");
 
-    if let Some(out_path) = args.out {
-        write_parquet(&mut output, &out_path).await?;
-        info!("wrote {}", out_path);
-    } else {
-        let mut count = 0usize;
-        let mut total_rows = 0usize;
-        while let Some(batch) = output.recv().await {
-            count += 1;
-            total_rows += batch.num_rows();
-            info!(
-                "batch #{count}: rows={} cols={} schema={}",
-                batch.num_rows(),
-                batch.num_columns(),
-                batch.schema()
-            );
-            if count >= 10 {
-                info!("(truncated)");
-                break;
+        match run_task(task_req_msg).await {
+            Ok(batches) => {
+                let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                for batch in batches {
+                    let bytes = encode_batch_ipc(&batch).unwrap_or_default();
+                    let resp = TaskResponse {
+                        task_id,
+                        state: TaskState::TaskRunning as i32,
+                        rows_emitted: batch.num_rows() as u64,
+                        batch: bytes,
+                        message: String::new(),
+                    };
+                    if out_tx.send(resp).await.is_err() {
+                        warn!("coord stream closed mid-batch");
+                        return Ok(());
+                    }
+                }
+                info!(task_id, total_rows, "task done");
             }
+            Err(e) => warn!(task_id, "task failed: {e:?}"),
         }
-        info!("summary: batches={count} rows={total_rows}");
     }
+    info!("coord closed incoming stream; worker exits");
     Ok(())
 }
 
-#[derive(Debug)]
-struct Args {
-    sql: String,
-    table: String,
-    path: Option<String>,
-    out: Option<String>,
+async fn run_task(req: TaskRequest) -> Result<Vec<arrow_array::RecordBatch>> {
+    let spec = req.spec.context("task spec missing")?;
+    let fragment = spec.fragment.as_ref().context("fragment missing")?;
+    let ops = build_ops(fragment)?;
+    let pipeline = Arc::new(Pipeline::new(ops));
+    let driver = Driver::new(pipeline).with_mode(DriverMode::PerOpTokioTask);
+
+    let mut output = driver.run(None).await?;
+    let mut collected = Vec::new();
+    while let Some(batch) = output.recv().await {
+        collected.push(batch);
+    }
+    Ok(collected)
 }
 
-fn parse_args() -> Result<Args> {
-    let mut sql = String::new();
-    let mut table = "sample".to_string();
-    let mut path: Option<String> = None;
-    let mut out: Option<String> = None;
+fn build_ops(fragment: &pylon_proto::pylon::Fragment) -> Result<Vec<Box<dyn PipelineOp>>> {
+    let mut ops: Vec<Box<dyn PipelineOp>> = Vec::new();
+    for op_spec in &fragment.ops {
+        ops.push(build_op(&op_spec.name, &op_spec.config)?);
+    }
+    Ok(ops)
+}
 
-    let argv: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--sql" => { sql = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
-            "--table" => { table = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
-            "--path" => { path = Some(argv.get(i + 1).cloned().unwrap_or_default()); i += 2; }
-            "--out" => { out = Some(argv.get(i + 1).cloned().unwrap_or_default()); i += 2; }
-            "--help" | "-h" => { print_help(); std::process::exit(0); }
-            other => return Err(anyhow::anyhow!("unknown arg: {other}")),
+fn build_op(name: &str, config: &std::collections::HashMap<String, String>) -> Result<Box<dyn PipelineOp>> {
+    let get = |k: &str| -> Result<String> {
+        config.get(k).cloned().ok_or_else(|| anyhow::anyhow!("op {name} missing config key {k}"))
+    };
+    match name {
+        "SeqScan" => Ok(Box::new(SeqScanOp::new(get("path")?, 8192))),
+        "Filter" => Ok(Box::new(FilterOp::new(get("col")?, get("op")?, get("literal")?))),
+        "Project" => {
+            let cols: Vec<String> = get("cols")?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let schema = Arc::new(arrow_schema::Schema::empty());
+            Ok(Box::new(ProjectOp::new(cols, schema)))
         }
+        "PartitionFilter" => Ok(Box::new(PartitionFilterOp::new(get("col")?, &get("literal")?)?)),
+        other => Err(anyhow::anyhow!("unknown op: {other}")),
     }
-
-    if sql.is_empty() {
-        print_help();
-        std::process::exit(2);
-    }
-    Ok(Args { sql, table, path, out })
 }
 
-fn print_help() {
-    println!(
-        "pylon M1 — single-worker pipeline runner
-
-USAGE
-  pylon --sql <SQL> [--table name] [--path file.parquet] [--out file.parquet]
-
-EXAMPLES
-  pylon --sql \"SELECT * FROM sample WHERE id > 5\"
-  pylon --sql \"SELECT id FROM t WHERE amount >= 100\" --table t --path t.parquet \\
-        --out result.parquet
-
-SUPPORTED SQL SUBSET (M1)
-  SELECT [* | col] FROM <table> [WHERE <col> <op> <literal>]
-  ops: >  <  >=  <=  =  <>
-  literals: integer, float, string
-"
-    );
+fn encode_batch_ipc(_batch: &arrow_array::RecordBatch) -> Result<Vec<u8>> {
+    Ok(vec![])
 }
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pylon=info"))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pylon=info")),
         )
         .try_init();
-}
-
-fn peek_parquet_schema(path: &str) -> Result<arrow_schema::SchemaRef> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use std::fs::File;
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    Ok(Arc::new(builder.schema().as_ref().clone()))
-}
-
-fn build_ops(plan: &PhysicalPlan, catalog: &CatalogStub) -> Result<Vec<Box<dyn PipelineOp>>> {
-    fn go(plan: &PhysicalPlan, catalog: &CatalogStub) -> Result<Vec<Box<dyn PipelineOp>>> {
-        Ok(match plan {
-            PhysicalPlan::SeqScan { table, .. } => {
-                let path = catalog.get_path(table)?.to_string();
-                vec![Box::new(SeqScanOp::new(path, 8192))]
-            }
-            PhysicalPlan::Filter { input, predicate } => {
-                let mut ops = go(input, catalog)?;
-                let (col, op_str, lit) = decompose_filter(predicate)?;
-                ops.push(Box::new(FilterOp::new(col, op_str, lit)));
-                ops
-            }
-            PhysicalPlan::Project { input, projections, schema } => {
-                let mut ops = go(input, catalog)?;
-                let col_names: Vec<String> = projections.iter().map(col_name).collect();
-                let fields: arrow_schema::Fields = schema.fields().clone();
-                let out_schema = Arc::new(arrow_schema::Schema::new(fields));
-                ops.push(Box::new(ProjectOp::new(col_names, out_schema)));
-                ops
-            }
-        })
-    }
-    go(plan, catalog)
-}
-
-fn col_name(e: &PE) -> String {
-    match e {
-        PE::Column { field, .. } => field.name().clone(),
-        PE::Literal { .. } | PE::BinaryOp { .. } => "_".into(),
-    }
-}
-
-fn decompose_filter(e: &PE) -> Result<(String, String, String)> {
-    Ok(match e {
-        PE::BinaryOp { left, op, right } => {
-            let col = col_name(left);
-            let lit = match right.as_ref() {
-                PE::Literal { value, .. } => value.clone(),
-                _ => "0".to_string(),
-            };
-            (col, op.clone(), lit)
-        }
-        _ => ("_".into(), "=".into(), "0".into()),
-    })
-}
-
-async fn write_parquet(
-    output: &mut tokio::sync::mpsc::Receiver<RecordBatch>,
-    path: &str,
-) -> Result<()> {
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-    use std::fs::File;
-
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(b) = output.recv().await {
-        batches.push(b);
-    }
-
-    if batches.is_empty() {
-        File::create(path)?;
-        return Ok(());
-    }
-
-    let combined = {
-        let schema = batches[0].schema();
-        arrow_select::concat::concat_batches(&schema, &batches)?
-    };
-
-    let file = File::create(path)?;
-    let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(file, combined.schema(), Some(props))?;
-    writer.write(&combined)?;
-    writer.close()?;
-    Ok(())
 }
