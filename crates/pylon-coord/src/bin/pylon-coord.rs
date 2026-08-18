@@ -51,6 +51,11 @@ impl Clone for QueryStatus {
 struct WorkerHandle {
     tx: mpsc::Sender<TaskRequest>,
     completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>>,
+    /// Arrow Flight host:port registered via `RegisterWorker`. `None`
+    /// for M2-style workers that didn't call the new RPC. The
+    /// fragmenter uses this to fill `ExchangeSpec.target_worker`
+    /// when dispatching a cross-worker shuffle.
+    flight_addr: Option<String>,
 }
 
 struct CoordState {
@@ -58,6 +63,9 @@ struct CoordState {
     queries: Mutex<HashMap<QueryId, QueryStatus>>,
     worker_seq: AtomicU64,
     query_seq: AtomicU64,
+    /// M3 B-1: worker discovery (RegisterWorker registrations +
+    /// flight_addr store). See `pylon_coord::discovery`.
+    discovery: pylon_coord::Discovery,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -70,6 +78,7 @@ async fn main() -> Result<()> {
         queries: Mutex::new(HashMap::new()),
         worker_seq: AtomicU64::new(0),
         query_seq: AtomicU64::new(0),
+        discovery: pylon_coord::Discovery::new(),
     });
 
     let grpc = tonic::transport::Server::builder()
@@ -193,7 +202,11 @@ fn format_row(b: &arrow_array::RecordBatch, r: usize) -> String {
 async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse {
     let workers = state.workers.lock().unwrap();
     let list: Vec<_> = workers.iter().map(|(id, h)| {
-        serde_json::json!({"id": id.0, "tx_capacity": h.tx.capacity()})
+        serde_json::json!({
+            "id": id.0,
+            "tx_capacity": h.tx.capacity(),
+            "flight_addr": h.flight_addr,
+        })
     }).collect();
     (StatusCode::OK, Json(serde_json::json!({"workers": list}))).into_response()
 }
@@ -548,19 +561,75 @@ use sqlparser::parser::Parser;
 impl Worker for CoordGrpc {
     type OpenSessionStream = SessionOutStream;
 
+    async fn register_worker(
+        &self,
+        request: tonic::Request<pylon_proto::pylon::RegisterWorkerRequest>,
+    ) -> Result<tonic::Response<pylon_proto::pylon::RegisterWorkerResponse>, tonic::Status> {
+        let req = request.into_inner();
+        if req.flight_addr.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "flight_addr is required",
+            ));
+        }
+        let worker_id = self
+            .state
+            .worker_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reg = self.state.discovery.register(
+            worker_id,
+            req.flight_addr,
+            req.grpc_addr,
+        );
+        info!(
+            worker_id = reg.worker_id,
+            flight_addr = %reg.flight_addr,
+            "worker registered via RegisterWorker"
+        );
+        Ok(tonic::Response::new(
+            pylon_proto::pylon::RegisterWorkerResponse {
+                worker_id: reg.worker_id,
+            },
+        ))
+    }
+
     async fn open_session(
         &self,
         request: Request<Streaming<TaskResponse>>,
     ) -> Result<Response<Self::OpenSessionStream>, Status> {
         let peer = request.remote_addr();
-        info!(?peer, "worker connected");
+        // M3 B-1: if the worker passed x-pylon-worker-id (returned by
+        // RegisterWorker), pair the session with the prior
+        // registration and use that worker_id. Otherwise fall back
+        // to the M2 auto-assign path (no flight_addr).
+        let header_worker_id: Option<u64> = request
+            .metadata()
+            .get("x-pylon-worker-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        let pre_registered = header_worker_id
+            .and_then(|id| self.state.discovery.lookup(id));
+
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<TaskRequest>(16);
 
-        let worker_id = WorkerId(self.state.worker_seq.fetch_add(1, Ordering::Relaxed));
+        let (worker_id, flight_addr) = match pre_registered {
+            Some(reg) => {
+                info!(?peer, registered_worker_id = reg.worker_id, flight_addr = %reg.flight_addr, "worker connected (registered)");
+                (WorkerId(reg.worker_id), Some(reg.flight_addr.clone()))
+            }
+            None => {
+                let id = WorkerId(self.state.worker_seq.fetch_add(1, Ordering::Relaxed));
+                info!(?peer, worker_id = id.0, "worker connected (M2 auto-assign)");
+                (id, None)
+            }
+        };
         let completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let handle = Arc::new(WorkerHandle { tx, completed: completed.clone() });
+        let handle = Arc::new(WorkerHandle {
+            tx,
+            completed: completed.clone(),
+            flight_addr,
+        });
         self.state.workers.lock().unwrap().insert(worker_id, handle.clone());
         info!(worker_id = worker_id.0, "registered");
 

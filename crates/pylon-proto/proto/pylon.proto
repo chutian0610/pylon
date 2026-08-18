@@ -5,9 +5,29 @@ package pylon;
 // ---- worker ↔ coord control plane ----
 
 service Worker {
+  // Unary handshake: worker reports its Arrow Flight address and
+  // gets back a stable worker_id. Worker then opens the bidi session.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
   // The single bidi stream used for the lifetime of a worker connection.
   // Coord sends TaskRequest, worker streams TaskResponse back.
   rpc OpenSession (stream TaskResponse) returns (stream TaskRequest);
+}
+
+message RegisterWorkerRequest {
+  // Host:port the worker is listening on for Arrow Flight
+  // (peer-to-peer shuffle transport). Required for M3 cross-worker
+  // exchange.
+  string flight_addr = 1;
+  // Optional: the gRPC address the worker is reachable at. For
+  // diagnostics / debugging; not used for routing in M3 first cut.
+  string grpc_addr = 2;
+}
+
+message RegisterWorkerResponse {
+  // Coordinator-assigned worker id. Stable for the lifetime of the
+  // session.
+  uint64 worker_id = 1;
 }
 
 message TaskRequest {

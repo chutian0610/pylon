@@ -17,6 +17,7 @@ tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = "0.14"
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

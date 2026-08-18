@@ -1,10 +1,14 @@
 //! `pylon-worker` — connects to a coordinator over gRPC and runs TaskSpec instances.
 
 use anyhow::{Context, Result};
+use arrow_flight::flight_service_server::FlightServiceServer;
 use futures::StreamExt;
-use pylon_proto::pylon::{TaskRequest, TaskResponse, TaskState};
+use tonic::Request;
+use pylon_proto::pylon::{
+    RegisterWorkerRequest, TaskRequest, TaskResponse, TaskState,
+};
 use pylon_proto::worker_client::WorkerClient;
-use pylon_exchange::{FlightDescriptor, PylonFlightService};
+use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightService};
 use pylon_runtime::ops::{
     AggSpec, ExchangeSinkOp, ExchangeSourceOp, FilterOp, HashAggregateOp,
     PartitionFilterOp, ProjectOp, SeqScanOp,
@@ -17,15 +21,73 @@ use tracing::{info, warn};
 async fn main() -> Result<()> {
     init_tracing();
 
+    // M3 B-1: parse --flight-addr (host:port the worker listens on
+    // for Arrow Flight). Defaults to 127.0.0.1:0 (kernel-assigned).
+    let flight_addr: String = std::env::args()
+        .skip(1)
+        .find(|a| a == "--flight-addr")
+        .and_then(|_| {
+            let pos = std::env::args()
+                .position(|a| a == "--flight-addr")
+                .expect("flag found");
+            std::env::args().nth(pos + 1)
+        })
+        .or_else(|| std::env::var("PYLON_FLIGHT_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+    let grpc_local_addr: String = std::env::args()
+        .skip(1)
+        .find(|a| a == "--grpc-addr")
+        .and_then(|_| {
+            let pos = std::env::args()
+                .position(|a| a == "--grpc-addr")
+                .expect("flag found");
+            std::env::args().nth(pos + 1)
+        })
+        .or_else(|| std::env::var("PYLON_GRPC_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+
     // Single in-process Flight service shared by all tasks in this worker.
-    // M3 first cut: every task's ExchangeSink/Source wires into this. Real
-    // peer-to-peer Flight RPC belongs to M3 task #4.
+    // M3 B-1: now also served as Arrow Flight RPC server.
     let flight_service = Arc::new(PylonFlightService::new());
 
-    run(flight_service).await
+    // M3 B-1: resolve the Flight port. We bind to it ourselves so
+    // we can read back the kernel-assigned port (when --flight-addr
+    // is "127.0.0.1:0"). The actual tonic server runs in a
+    // background task.
+    let flight_listen = flight_addr
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("parse flight addr {flight_addr}"))?;
+    let flight_listener = tokio::net::TcpListener::bind(flight_listen)
+        .await
+        .with_context(|| format!("bind flight addr {flight_listen}"))?;
+    let bound_flight_addr = flight_listener
+        .local_addr()
+        .context("flight listener local_addr")?;
+    info!(
+        requested = %flight_listen,
+        bound = %bound_flight_addr,
+        "pylon-worker Flight listener bound"
+    );
+    let flight_server = FlightServerImpl::new(flight_service.clone());
+    let incoming_flight = tokio_stream::wrappers::TcpListenerStream::new(flight_listener);
+    tokio::spawn(async move {
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(flight_server))
+            .serve_with_incoming(incoming_flight)
+            .await
+        {
+            warn!("flight server exited: {e}");
+        }
+    });
+
+    run(flight_service, bound_flight_addr.to_string(), grpc_local_addr).await
 }
 
-async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
+async fn run(
+    flight_service: Arc<PylonFlightService>,
+    flight_addr: String,
+    grpc_addr: String,
+) -> Result<()> {
     let coord_addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("PYLON_COORDINATOR").ok())
@@ -36,11 +98,35 @@ async fn run(flight_service: Arc<PylonFlightService>) -> Result<()> {
         .await
         .with_context(|| format!("connect to coord {coord_addr}"))?;
 
+    // M3 B-1: register worker with coord → get back worker_id.
+    let reg = client
+        .register_worker(RegisterWorkerRequest {
+            flight_addr: flight_addr.clone(),
+            grpc_addr: grpc_addr.clone(),
+        })
+        .await
+        .with_context(|| "register_worker")?
+        .into_inner();
+    let worker_id = reg.worker_id;
+    info!(
+        worker_id,
+        flight_addr = %flight_addr,
+        grpc_addr = %grpc_addr,
+        "registered with coord"
+    );
+
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<TaskResponse>(32);
     let out_stream = tokio_stream::wrappers::ReceiverStream::new(out_rx);
 
+    // M3 B-1: pass worker_id as metadata so coord can pair this
+    // session with the prior RegisterWorker (and look up flight_addr).
+    let mut req = Request::new(out_stream);
+    req.metadata_mut().insert(
+        "x-pylon-worker-id",
+        worker_id.to_string().parse().expect("ascii worker_id"),
+    );
     let response = client
-        .open_session(out_stream)
+        .open_session(req)
         .await
         .with_context(|| "open_session")?;
     let mut incoming = response.into_inner();

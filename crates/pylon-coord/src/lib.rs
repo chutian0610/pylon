@@ -16,6 +16,7 @@ pub mod query;
 pub mod stage;
 pub mod task;
 pub mod scheduler;
+pub mod discovery;
 pub mod fragment;
 
 pub use query::{Query, QueryId, QueryState};
@@ -26,4 +27,5 @@ pub use task::{ExchangeKind, ExchangeSpec, Partition, TaskId, TaskSpec};
 pub use scheduler::{
     CapacityScheduler, Scheduler, WorkerAddr, WorkerCapacity, WorkerId,
 };
+pub use discovery::{Discovery, RegisteredWorker};
 pub use fragment::{Fragmenter, FragmenterConfig};

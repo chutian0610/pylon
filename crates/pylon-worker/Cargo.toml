@@ -17,6 +17,7 @@ pylon-plan = { path = "../pylon-plan" }
 pylon-runtime = { path = "../pylon-runtime" }
 pylon-proto = { path = "../pylon-proto" }
 pylon-exchange = { path = "../pylon-exchange" }
+arrow-flight = { workspace = true }
 pylon-coord = { path = "../pylon-coord" }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tokio-stream = "0.1"

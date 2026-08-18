@@ -42,6 +42,7 @@ tokio = { version = "1", features = [
     "fs",
 ] }
 async-trait = "0.1"
+tokio-stream = "0.1"
 futures = "0.3"
 
 # Errors + util
