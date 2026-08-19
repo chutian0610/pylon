@@ -62,6 +62,14 @@ pub trait ExecutionPlan: Send + Sync + fmt::Debug {
     fn requires_exchange(&self) -> bool {
         false
     }
+
+    /// Downcast hook: returns `&dyn Any` so the fragmenter (and
+    /// eventually stats / optimizer / worker) can recover the
+    /// concrete type when it needs concrete fields (table name,
+    /// projections, predicate, group_by, aggs) for emitting an
+    /// `OpSpec`. Operators that don't need typed fields can ignore
+    /// this method.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Distribution requirement declared by an operator on each child.
@@ -116,6 +124,7 @@ impl ExecutionPlan for SeqScanExec {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
     fn properties(&self) -> &PlanProperties { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -179,6 +188,7 @@ impl ExecutionPlan for FilterExec {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
     fn properties(&self) -> &PlanProperties { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -248,6 +258,7 @@ impl ExecutionPlan for ProjectExec {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
     fn properties(&self) -> &PlanProperties { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -332,6 +343,7 @@ impl ExecutionPlan for AggregateExec {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
     fn properties(&self) -> &PlanProperties { &self.properties }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 
     fn requires_exchange(&self) -> bool {
         // Fragmenter rule: cut a stage at every `Aggregate`. R2.2.a
