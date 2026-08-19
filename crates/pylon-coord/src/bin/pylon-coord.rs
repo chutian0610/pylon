@@ -332,7 +332,7 @@ async fn plan_and_dispatch(
         }
     };
     // Use 2 partitions for M3 first cut cross-worker demo.
-    let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 2 });
+    let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 2, ..Default::default() });
     let dag = match fragmenter.fragment(&physical_plan, qid_u64, &worker_flight_addrs) {
         Ok(d) => d,
         Err(e) => {
