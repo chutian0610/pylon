@@ -24,9 +24,20 @@
 
 #![warn(missing_docs)]
 
+mod connector;
+mod page;
+mod source;
+
 pub use pylon_types::{
     ConnectorError, ConnectorErrorCode, RecordBatchStream, SendableRecordBatchStream,
 };
+
+pub use connector::{Connector, ConnectorConfig, ConnectorFactory};
+pub use page::ConnectorPage;
+pub use source::{DataSink, DataSource, WriteStats};
+
+/// A result returned by connector SPI operations.
+pub type ConnectorResult<T> = std::result::Result<T, ConnectorError>;
 
 /// A semantic version for the stable connector interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,4 +75,4 @@ impl SpiVersion {
 }
 
 /// The connector interface version implemented by this crate.
-pub const SPI_VERSION: SpiVersion = SpiVersion::new(0, 1, 0);
+pub const SPI_VERSION: SpiVersion = SpiVersion::new(0, 2, 0);
