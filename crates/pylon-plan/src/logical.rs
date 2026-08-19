@@ -6,8 +6,9 @@
 //! aggregation arrive in M4+.
 
 use arrow_schema::{DataType, Field, SchemaRef};
+use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalPlan {
     Scan {
         table: String,
@@ -35,7 +36,7 @@ pub enum LogicalPlan {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     /// Reference to an input column. The `Field` carries the resolved
     /// name + data type from the input schema.
@@ -68,6 +69,95 @@ pub enum Expr {
         data_type: DataType,
         input_data_types: Vec<DataType>,
     },
+}
+
+/// Returns the schema that this plan produces row-by-row as
+/// output. Used by optimizer rules that need to verify whether a
+/// predicate references columns that exist in the input
+/// subtree (predicate pushdown) or whether a projection
+/// expression can be evaluated against the inner subtree
+/// (project collapse).
+///
+/// The M3 first cut computes the schema inline rather than
+/// caching it on the plan node — schemas are small, plans
+/// are shallow, and recomputation keeps the `LogicalPlan`
+/// enum minimal. M4 may add a `schema: SchemaRef` field to
+/// every variant and remove this helper.
+pub fn input_schema(plan: &LogicalPlan) -> arrow_schema::SchemaRef {
+    use std::sync::Arc;
+    match plan {
+        LogicalPlan::Scan { schema, .. } => schema.clone(),
+        LogicalPlan::Filter { input, .. } => input_schema(input),
+        LogicalPlan::Project { input, projections } => {
+            // Project may rename / drop columns. Compute the
+            // output field list from the projections.
+            let parent = input_schema(input);
+            let mut fields: Vec<Arc<arrow_schema::Field>> =
+                Vec::with_capacity(projections.len());
+            for (i, e) in projections.iter().enumerate() {
+                fields.push(projection_field(e, &parent, i));
+            }
+            Arc::new(arrow_schema::Schema::new(
+                fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+            ))
+        }
+        LogicalPlan::Aggregate { schema, .. } => schema.clone(),
+    }
+}
+
+fn projection_field(
+    e: &Expr,
+    parent_schema: &arrow_schema::Schema,
+    index: usize,
+) -> Arc<arrow_schema::Field> {
+    match e {
+        Expr::Column(f) => Arc::new(f.clone()),
+        Expr::AggregateFunction { name, data_type, .. } => {
+            Arc::new(arrow_schema::Field::new(name, data_type.clone(), true))
+        }
+        // Literal / BinaryOp / Wildcard: M3 first cut is permissive
+        // — generate a synthetic field name `_<index>`. Rules that
+        // need real column refs (ProjectCollapse) treat these as
+        // opaque; rules that just need schema shape treat the name
+        // as a placeholder.
+        _ => Arc::new(arrow_schema::Field::new(
+            format!("_{index}"),
+            parent_schema
+                .fields()
+                .get(index.min(parent_schema.fields().len().saturating_sub(1)))
+                .map(|f| f.data_type().clone())
+                .unwrap_or(arrow_schema::DataType::Null),
+            true,
+        )),
+    }
+}
+
+/// Returns the set of column names referenced anywhere in `e`.
+/// Used by `PredicatePushdown` to decide whether a predicate can
+/// be pushed past a Project (all referenced columns must exist in
+/// the input subtree's schema).
+pub fn expr_columns(e: &Expr) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_columns(e, &mut out);
+    out
+}
+
+fn collect_columns(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expr::Column(f) => {
+            out.insert(f.name().to_string());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_columns(left, out);
+            collect_columns(right, out);
+        }
+        Expr::AggregateFunction { args, .. } => {
+            for a in args {
+                collect_columns(a, out);
+            }
+        }
+        Expr::Literal(_) | Expr::Wildcard => {}
+    }
 }
 
 /// Helper: `is_aggregate(expr)` — true if the (sub)expression contains
