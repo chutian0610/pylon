@@ -91,12 +91,23 @@ impl Fragmenter {
             wrap_legacy_plan(plan);
         let visit = visit_v2(&root, &mut ctx, stage0_id, worker_flight_addrs)?;
 
+        // R2.2.b: stage0 carries the canonical plan root so future
+        // schedulers (M4 cost-based, hash-affinity) can read
+        // `properties()` / `required_input_distribution()` /
+        // `requires_exchange()` off the Arc<dyn> rather than
+        // re-deriving from `OpSpec`. Stage1's plan tree would be
+        // the (currently-not-materialized) post-aggregate subtree;
+        // left as `None` for M3 — populated when R3 introduces
+        // explicit stages per OpSpec boundary. Today's
+        // `CapacityScheduler::assign` only reads `partition_count`
+        // + `fragment.ops`, so this change is wire-stable.
         let stage0 = Stage {
             id: stage0_id,
             fragment: Fragment {
                 ops: visit.stage0_ops,
                 distribution: Distribution::Partitioned(n_partitions),
             },
+            plan: Some(root),
             partition_count: n_partitions,
             memory_budget_bytes: 256 * 1024 * 1024,
             upstream: Vec::new(),
@@ -112,6 +123,7 @@ impl Fragmenter {
                 ops: visit.stage1_ops,
                 distribution: Distribution::Partitioned(n_partitions),
             },
+            plan: None,
             partition_count: n_partitions,
             memory_budget_bytes: 256 * 1024 * 1024,
             upstream: vec![stage0_id],
