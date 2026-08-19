@@ -2,6 +2,7 @@
 //!
 //! Fragmenter lives in `pylon-coord` (Trino-aligned placement).
 
+pub mod catalog;
 pub mod logical;
 pub mod optimizer;
 pub mod physical;

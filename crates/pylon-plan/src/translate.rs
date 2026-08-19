@@ -9,6 +9,7 @@
 //! Supported aggregates: `COUNT(*)`, `SUM(<col>)`, `MIN(<col>)`, `MAX(<col>)`.
 //! Anything more complex returns an error.
 
+use crate::catalog::SchemaProvider;
 use crate::logical::{is_aggregate_expr, Expr as LExpr, LogicalPlan};
 use crate::physical::expr::{
     AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr,
@@ -75,6 +76,12 @@ impl CatalogStub {
     }
 }
 
+impl SchemaProvider for CatalogStub {
+    fn get_schema(&self, table: &str) -> Result<SchemaRef, PylonError> {
+        CatalogStub::get_schema(self, table)
+    }
+}
+
 pub fn parse_sql(sql: &str) -> Result<Statement, PylonError> {
     Parser::parse_sql(&GenericDialect {}, sql)
         .map_err(|e| PylonError::InvalidPlan(format!("sql parse error: {e}")))?
@@ -83,7 +90,10 @@ pub fn parse_sql(sql: &str) -> Result<Statement, PylonError> {
         .ok_or_else(|| PylonError::InvalidPlan("empty sql".into()))
 }
 
-pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan, PylonError> {
+pub fn logical_from_sql(
+    sql: &str,
+    catalog: &dyn SchemaProvider,
+) -> Result<LogicalPlan, PylonError> {
     let stmt = parse_sql(sql)?;
     let query = match stmt {
         Statement::Query(q) => q,
