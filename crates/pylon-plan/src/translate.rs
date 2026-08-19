@@ -10,8 +10,12 @@
 //! Anything more complex returns an error.
 
 use crate::logical::{is_aggregate_expr, Expr as LExpr, LogicalPlan};
-use crate::physical::physical_expr::{PhysicalExpr};
-use crate::physical::PhysicalPlan;
+use crate::physical::expr::{
+    AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr,
+};
+use crate::physical::exec::{
+    AggregateExec, ExecutionPlan, FilterExec, ProjectExec, SeqScanExec,
+};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use pylon_types::PylonError;
@@ -277,20 +281,28 @@ pub fn logical_from_sql(sql: &str, catalog: &CatalogStub) -> Result<LogicalPlan,
     })
 }
 
-pub fn physical_from_logical(logical: LogicalPlan) -> Result<PhysicalPlan, PylonError> {
-    Ok(match logical {
-        LogicalPlan::Scan { table, schema } => PhysicalPlan::SeqScan { table, schema },
-        LogicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-            input: Box::new(physical_from_logical(*input)?),
-            predicate: physical_from_logical_expr(&predicate),
-        },
+pub fn physical_from_logical(
+    logical: LogicalPlan,
+) -> Result<Arc<dyn ExecutionPlan>, PylonError> {
+    match logical {
+        LogicalPlan::Scan { table, schema } => {
+            Ok(Arc::new(SeqScanExec::new(table, schema)) as Arc<dyn ExecutionPlan>)
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            let input = physical_from_logical(*input)?;
+            let predicate = physical_from_logical_expr(&predicate);
+            let schema = input.schema();
+            Ok(Arc::new(
+                FilterExec::new(input, predicate, schema)
+            ) as Arc<dyn ExecutionPlan>)
+        }
         LogicalPlan::Project { input, projections } => {
             let projected_schema = compute_projected_schema(&projections, &input_schema(&input))?;
-            PhysicalPlan::Project {
-                input: Box::new(physical_from_logical(*input)?),
-                projections: projections.iter().map(physical_from_logical_expr).collect(),
-                schema: projected_schema,
-            }
+            let input = physical_from_logical(*input)?;
+            let projections = projections.iter().map(physical_from_logical_expr).collect();
+            Ok(Arc::new(
+                ProjectExec::new(input, projections, projected_schema)
+            ) as Arc<dyn ExecutionPlan>)
         }
         LogicalPlan::Aggregate {
             input,
@@ -298,17 +310,14 @@ pub fn physical_from_logical(logical: LogicalPlan) -> Result<PhysicalPlan, Pylon
             aggs,
             schema,
         } => {
-            // A1-2 will replace this with proper aggregate lowering.
-            // For A1-1 we plumb the new variant through so the rest of
-            // the pipeline keeps compiling.
-            PhysicalPlan::Aggregate {
-                input: Box::new(physical_from_logical(*input)?),
-                group_by: group_by.iter().map(physical_from_logical_expr).collect(),
-                aggs: aggs.iter().map(physical_from_logical_expr).collect(),
-                schema,
-            }
+            let input = physical_from_logical(*input)?;
+            let group_by = group_by.iter().map(physical_from_logical_expr).collect();
+            let aggs = aggs.iter().map(physical_from_logical_expr).collect();
+            Ok(Arc::new(
+                AggregateExec::new(input, group_by, aggs, schema)
+            ) as Arc<dyn ExecutionPlan>)
         }
-    })
+    }
 }
 
 fn compute_projected_schema(
@@ -684,34 +693,36 @@ fn is_numeric_or_orderable(dt: &DataType) -> bool {
     )
 }
 
-fn physical_from_logical_expr(e: &LExpr) -> PhysicalExpr {
+fn physical_from_logical_expr(e: &LExpr) -> Arc<dyn PhysicalExpr> {
     match e {
-        LExpr::Column(field) => PhysicalExpr::Column {
-            index: 0,
-            field: field.clone(),
-        },
-        LExpr::Literal(s) => PhysicalExpr::Literal {
-            value: s.clone(),
-            data_type: DataType::Utf8,
-        },
-        LExpr::BinaryOp { left, op, right } => PhysicalExpr::BinaryOp {
-            left: Box::new(physical_from_logical_expr(left)),
-            op: op.clone(),
-            right: Box::new(physical_from_logical_expr(right)),
-        },
-        LExpr::Wildcard => PhysicalExpr::Column {
-            index: 0,
-            field: Field::new("_", DataType::Null, true),
-        },
-        LExpr::AggregateFunction { func, name, args, data_type, input_data_types } => {
-            PhysicalExpr::AggregateFunction {
-                func: func.clone(),
-                name: name.clone(),
-                args: args.iter().map(physical_from_logical_expr).collect(),
-                data_type: data_type.clone(),
-                input_data_types: input_data_types.clone(),
-            }
-        }
+        LExpr::Column(field) => Arc::new(ColumnExpr::new(0, field.clone())) as Arc<dyn PhysicalExpr>,
+        LExpr::Literal(s) => Arc::new(LiteralExpr::new(s.clone(), DataType::Utf8)) as Arc<dyn PhysicalExpr>,
+        LExpr::BinaryOp { left, op, right } => Arc::new(
+            BinaryOpExpr::new(
+                physical_from_logical_expr(left),
+                op.clone(),
+                physical_from_logical_expr(right),
+            )
+        ) as Arc<dyn PhysicalExpr>,
+        LExpr::Wildcard => Arc::new(ColumnExpr::new(
+            0,
+            Field::new("_", DataType::Null, true),
+        )) as Arc<dyn PhysicalExpr>,
+        LExpr::AggregateFunction {
+            func,
+            name,
+            args,
+            data_type,
+            input_data_types,
+        } => Arc::new(
+            AggregateFunctionExpr::new(
+                func.clone(),
+                name.clone(),
+                args.iter().map(physical_from_logical_expr).collect(),
+                data_type.clone(),
+                input_data_types.clone(),
+            )
+        ) as Arc<dyn PhysicalExpr>,
     }
 }
 

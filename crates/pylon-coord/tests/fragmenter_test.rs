@@ -1,12 +1,22 @@
 //! A2-1 unit tests: Fragmenter post-order walk with HashPartitionExchange
 //! injection at Aggregate boundaries.
+//!
+//! Post-R2.3: every plan fixture uses the new struct form
+//! (`SeqScanExec`, `FilterExec`, `AggregateExec`, `ProjectExec`,
+//! plus the `expr::*` structs). The traits are still in play —
+//! the Fragmenter's internal walker uses trait methods, while
+//! these fixtures use the concrete types for clarity.
 
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
-use pylon_plan::physical::physical_expr::PhysicalExpr;
-use pylon_plan::physical::PhysicalPlan;
+use pylon_plan::physical::exec::{
+    AggregateExec, ExecutionPlan, FilterExec, SeqScanExec,
+};
+use pylon_plan::physical::expr::{
+    AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr,
+};
 
 fn schema_two() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -15,50 +25,44 @@ fn schema_two() -> Arc<Schema> {
     ]))
 }
 
-fn scan_only() -> PhysicalPlan {
-    PhysicalPlan::SeqScan {
-        table: "sample".into(),
-        schema: schema_two(),
-    }
-}
-
-fn filter_scan() -> PhysicalPlan {
-    PhysicalPlan::Filter {
-        input: Box::new(scan_only()),
-        predicate: PhysicalExpr::BinaryOp {
-            left: Box::new(PhysicalExpr::Column {
-                index: 0,
-                field: Field::new("id", DataType::Int64, false),
-            }),
-            op: ">".into(),
-            right: Box::new(PhysicalExpr::Literal {
-                value: "5".into(),
-                data_type: DataType::Utf8,
-            }),
-        },
-    }
-}
-
-fn agg_count_by_name(input: PhysicalPlan) -> PhysicalPlan {
-    let agg_schema = Arc::new(Schema::new(vec![
+fn agg_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
         Field::new("count", DataType::Int64, true),
-    ]));
-    PhysicalPlan::Aggregate {
-        input: Box::new(input),
-        group_by: vec![PhysicalExpr::Column {
-            index: 1,
-            field: Field::new("name", DataType::Utf8, false),
-        }],
-        aggs: vec![PhysicalExpr::AggregateFunction {
-            func: "count".into(),
-            name: "count".into(),
-            args: Vec::new(),
-            data_type: DataType::Int64,
-            input_data_types: Vec::new(),
-        }],
-        schema: agg_schema,
-    }
+    ]))
+}
+
+fn scan_only() -> Arc<dyn ExecutionPlan> {
+    Arc::new(SeqScanExec::new("sample", schema_two()))
+}
+
+fn filter_scan() -> Arc<dyn ExecutionPlan> {
+    let input = scan_only();
+    let id_col: Arc<dyn PhysicalExpr> =
+        Arc::new(ColumnExpr::new(0, input.schema().field(0).clone()));
+    let five: Arc<dyn PhysicalExpr> = Arc::new(LiteralExpr::new("5", DataType::Utf8));
+    let pred: Arc<dyn PhysicalExpr> = Arc::new(BinaryOpExpr::new(
+        id_col,
+        ">".to_string(),
+        five,
+    ));
+    let schema = input.schema();
+    Arc::new(FilterExec::new(input, pred, schema))
+}
+
+fn agg_count_by_name(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let group_by: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(ColumnExpr::new(
+        1,
+        input.schema().field(1).clone(),
+    ))];
+    let aggs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(AggregateFunctionExpr::new(
+        "count",
+        "count",
+        vec![],
+        DataType::Int64,
+        vec![],
+    ))];
+    Arc::new(AggregateExec::new(input, group_by, aggs, agg_schema()))
 }
 
 fn op_names(dag: &pylon_coord::StageDag, stage_idx: usize) -> Vec<&str> {
@@ -71,8 +75,6 @@ fn op_names(dag: &pylon_coord::StageDag, stage_idx: usize) -> Vec<&str> {
 }
 
 fn stage0_descriptors(dag: &pylon_coord::StageDag) -> Vec<String> {
-    // The ExchangeSink in stage0 has a "descriptors" key in its config.
-    // (If no ExchangeSink, this returns an empty vec.)
     let sink = dag.stages[0]
         .fragment
         .ops
@@ -107,12 +109,7 @@ fn plan_with_aggregate_cuts_boundary_at_aggregate() {
         default_partition_count: 4,
     });
     let dag = f.fragment(&plan, 99, &["test_addr".to_string()]).unwrap();
-    // Stage 0: Scan, Filter, ExchangeSink
     assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter", "ExchangeSinkRpc"]);
-    // Stage 1: 4× (ExchangeSource + Aggregate) per partition.
-    // Fragmenter layout: N sources first, then N aggregates, so
-    // [ExchangeSource, ExchangeSource, ExchangeSource, ExchangeSource,
-    //  Aggregate, Aggregate, Aggregate, Aggregate].
     let s1_names = op_names(&dag, 1);
     assert_eq!(s1_names.len(), 8, "4 sources + 4 aggregates");
     assert_eq!(&s1_names[..4], &["ExchangeSource"; 4]);
@@ -128,14 +125,9 @@ fn aggregate_emits_n_partition_descriptors() {
     });
     let dag = f.fragment(&plan, 7, &["test_addr".to_string()]).unwrap();
     let descs = stage0_descriptors(&dag);
-    assert_eq!(descs.len(), n, "n descriptors for n partitions");
-    // All descriptors are well-formed and have the right qid/stage/partition.
+    assert_eq!(descs.len(), n);
     for (i, d) in descs.iter().enumerate() {
-        assert_eq!(
-            d,
-            &format!("pylon://query/7/stage/2/task/{i}"),
-            "descriptor {i}"
-        );
+        assert_eq!(d, &format!("pylon://query/7/stage/2/task/{i}"));
     }
 }
 
@@ -173,14 +165,8 @@ fn aggregate_op_spec_carries_partition_keys_and_agg_specs() {
         .iter()
         .find(|o| o.name == "Aggregate")
         .expect("Aggregate op present");
-    assert_eq!(
-        agg.config.get("group_by_cols").map(|s| s.as_str()),
-        Some("name")
-    );
-    assert_eq!(
-        agg.config.get("agg_specs").map(|s| s.as_str()),
-        Some("count()")
-    );
+    assert_eq!(agg.config.get("group_by_cols").map(|s| s.as_str()), Some("name"));
+    assert_eq!(agg.config.get("agg_specs").map(|s| s.as_str()), Some("count()"));
 }
 
 #[test]
@@ -212,11 +198,6 @@ fn partitioned_sink_op_spec_carries_partition_keys_and_n_partitions() {
 
 #[test]
 fn descriptor_partition_assignment_is_consistent() {
-    // For an Aggregate, the partition chosen for a given group_key
-    // value is determined by the hash function — but it must be the
-    // SAME on both the sink side and the source side. The fragmenter
-    // uses the descriptor index (i) to encode the partition, so the
-    // sink's i-th descriptor and the source's i-th descriptor match.
     let n = 6;
     let plan = agg_count_by_name(scan_only());
     let f = Fragmenter::new(FragmenterConfig {
@@ -247,7 +228,6 @@ fn descriptor_partition_assignment_is_consistent() {
 
 #[test]
 fn plan_with_aggregate_below_filter_still_cuts_once() {
-    // Even with Filter+Aggregate (no Project), exactly one boundary.
     let plan = agg_count_by_name(filter_scan());
     let f = Fragmenter::new(FragmenterConfig {
         default_partition_count: 4,

@@ -7,4 +7,3 @@ pub mod physical;
 pub mod translate;
 
 pub use logical::LogicalPlan;
-pub use physical::PhysicalPlan;

@@ -7,6 +7,7 @@
 //! responsible for the layout (and guarantees the dependency graph is a DAG).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const DEFAULT_PARTITION_COUNT: usize = 16;
 
@@ -86,6 +87,14 @@ impl Fragment {
 pub struct Stage {
     pub id: StageId,
     pub fragment: Fragment,
+    /// R2.2.b: optional canonical-plan reference, populated by the
+    /// fragmenter. Carries the `Arc<dyn ExecutionPlan>` tree so
+    /// future schedulers (M4 cost-based + hash-affinity) can read
+    /// per-stage metadata (`properties()`, `required_input_distribution()`,
+    /// `requires_exchange()`) without re-deriving from `OpSpec`.
+    /// `None` when the fragmenter skipped plan injection (M3 tests
+    /// that build `Stage` directly).
+    pub plan: Option<Arc<dyn pylon_plan::physical::exec::ExecutionPlan>>,
     pub partition_count: usize,
     pub memory_budget_bytes: usize,
     pub upstream: Vec<StageId>,
@@ -96,12 +105,24 @@ impl Stage {
     pub fn new(id: StageId, fragment: Fragment) -> Self {
         Self {
             id,
+            plan: None,
             partition_count: fragment.distribution.partition_count(),
             fragment,
             memory_budget_bytes: 256 * 1024 * 1024, // 256 MiB default
             upstream: Vec::new(),
             downstream: Vec::new(),
         }
+    }
+
+    /// R2.2.b: attach the canonical plan root. Used by the
+    /// fragmenter after `wrap_legacy_plan` produces an
+    /// `Arc<dyn ExecutionPlan>`; future schedulers read this.
+    pub fn with_plan(
+        mut self,
+        plan: Arc<dyn pylon_plan::physical::exec::ExecutionPlan>,
+    ) -> Self {
+        self.plan = Some(plan);
+        self
     }
 
     pub fn with_partition_count(mut self, n: usize) -> Self {
