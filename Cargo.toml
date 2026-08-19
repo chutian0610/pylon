@@ -4,6 +4,7 @@ members = [
     "crates/pylon-types",
     "crates/pylon-plan",
     "crates/pylon-runtime",
+    "crates/pylon-connector-spi",
     "crates/pylon-exchange",
     "crates/pylon-catalog",
     "crates/pylon-iceberg",

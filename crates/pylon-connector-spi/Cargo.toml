@@ -1,0 +1,28 @@
+[package]
+name = "pylon-connector-spi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# R0 axiom (RFC 0005 § 3, rule #1):
+#   `pylon-connector-spi` depends only on `pylon-types` (leaf value
+#   types) and the Arrow family. The engine crates (`pylon-plan`,
+#   `pylon-runtime`, `pylon-coord`, `pylon-worker`, `pylon-exchange`)
+#   must NEVER appear here. Verified by
+#   `tools/check-spi-boundaries.sh`.
+#
+# R1 will add the actual connector types (Connector, DataSource,
+# DataSink, ConnectorError, ConnectorPage). Until then this crate is
+# empty on purpose — the dependency graph is the only thing R0 locks
+# down, so the boundary axiom is enforceable in CI before any trait
+# is fleshed out.
+[dependencies]
+pylon-types = { path = "../pylon-types" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
