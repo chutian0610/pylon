@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary-checks:
+    name: Boundary checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check SPI boundaries
+        run: bash tools/check-spi-boundaries.sh
+
+      - name: Check trait stability
+        run: bash tools/check-trait-stability.sh
