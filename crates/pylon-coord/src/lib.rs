@@ -13,6 +13,7 @@
 //! come in M2 weeks 1-2.
 
 pub mod query;
+pub mod query_state;
 pub mod stage;
 pub mod task;
 pub mod scheduler;
@@ -20,6 +21,7 @@ pub mod discovery;
 pub mod fragment;
 
 pub use query::{Query, QueryId, QueryState};
+pub use query_state::{QueryStateMachine, StageState, TaskAck};
 pub use stage::{
     Fragment, OpSpec, Stage, StageDag, StageId, Distribution, DEFAULT_PARTITION_COUNT,
 };

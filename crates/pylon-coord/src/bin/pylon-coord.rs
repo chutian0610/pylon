@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const HTTP_PORT: u16 = 8080;
 const GRPC_PORT: u16 = 9090;
@@ -76,6 +76,15 @@ struct CoordState {
     /// M3 B-1: worker discovery (RegisterWorker registrations +
     /// flight_addr store). See `pylon_coord::discovery`.
     discovery: pylon_coord::Discovery,
+    /// M3-tail #1 (RFC 0005 R7): per-(query, stage) ack tracking +
+    /// notifier. The dispatcher's stage barrier awaits
+    /// `wait_for_stage_done` instead of `tokio::time::sleep`.
+    state_machine: Arc<pylon_coord::QueryStateMachine>,
+    /// Reverse index: `task_id → (query_id, stage_id)`. Populated
+    /// when the dispatcher emits a `TaskRequest`; consulted by the
+    /// `OpenSession` inbound handler to translate a `TaskResponse`
+    /// into a `QueryStateMachine::ack_task` call.
+    task_locs: Mutex<HashMap<u64, (pylon_coord::QueryId, pylon_coord::StageId)>>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -89,6 +98,8 @@ async fn main() -> Result<()> {
         worker_seq: AtomicU64::new(0),
         query_seq: AtomicU64::new(0),
         discovery: pylon_coord::Discovery::new(),
+        state_machine: pylon_coord::QueryStateMachine::new(),
+        task_locs: Mutex::new(HashMap::new()),
     });
 
     let grpc = tonic::transport::Server::builder()
@@ -398,24 +409,59 @@ async fn plan_and_dispatch(
         }
     }
 
-    let expected_stage0_acks = 1;
+    let _expected_stage0_acks = 1_usize; // legacy field; QSM owns the count now
     let state_for_send = state.clone();
     let workers_snapshot = workers.clone();
     let stage1_tasks_clone = stage1_tasks.clone();
+    let stage0_task_id_for_register = stage0.id;
+    let qid_u64_for_spawn = qid_u64;
+    let stage0_qid_for_register = qid_u64;
+    let stage0_stage_id = 1u64;
+    let stage0_deadline = std::time::Duration::from_secs(30);
+    let stage1_deadline = std::time::Duration::from_secs(30);
     tokio::spawn(async move {
-        wait_for_stage_done_inner(
-            state.clone(),
-            qid_u64,
-            1u64,
-            expected_stage0_acks,
-        ).await;
+        // RFC 0005 R7 (M3-tail #1): register stage 0 with the
+        // QueryStateMachine and await its TASK_DONE acks instead of
+        // sleeping a heuristic.
+        let stage0_qid = pylon_coord::QueryId(stage0_qid_for_register);
+        let stage0_sid = pylon_coord::StageId(stage0_stage_id);
+        state_for_send.state_machine.register_stage(
+            stage0_qid, stage0_sid,
+            vec![pylon_coord::TaskId(stage0_task_id_for_register)],
+        );
+        state_for_send.task_locs.lock().unwrap().insert(
+            stage0_task_id_for_register,
+            (stage0_qid, stage0_sid),
+        );
+        let stage0_wait = state_for_send
+            .state_machine
+            .wait_for_stage_done(stage0_qid, stage0_sid, stage0_deadline)
+            .await;
+        if let Err(e) = stage0_wait {
+            warn!(
+                query_id = stage0_qid.0, stage_id = stage0_stage_id, error = %e,
+                "stage 0 ack failed; aborting stage 1 dispatch"
+            );
+            let mut qmap = state_for_send.queries.lock().unwrap();
+            if let Some(q) = qmap.get_mut(&stage0_qid) {
+                q.state = pylon_coord::query::QueryState::Failed;
+                q.error = Some(format!("stage 0: {e}"));
+            }
+            return;
+        }
+        info!(query_id = stage0_qid.0, stage_id = stage0_stage_id, "stage 0 acked");
         // After Stage 0: dispatch each stage1 partition task to a
         // worker (round-robin: partition p → worker p % n_workers).
+        // Stage 1 tasks are pre-registered with the QSM so we can
+        // wait_for_stage_done directly after the dispatch loop.
+        let mut dispatched_ids: Vec<u64> = Vec::new();
+        let mut stage1_register_ids: Vec<pylon_coord::TaskId> = Vec::new();
         if stage1_tasks_clone.is_empty() {
-            info!(stage = 1, "no stage1 tasks (non-aggregate query)");
+            info!(stage = 1, query_id = stage0_qid.0, "no stage1 tasks (non-aggregate query)");
         } else {
             let n_workers = workers_snapshot.len().max(1);
-            let mut dispatched_ids: Vec<u64> = Vec::new();
+            let stage1_qid = stage0_qid;
+            let stage1_sid = pylon_coord::StageId(2);
             for (p, partition_ops) in stage1_tasks_clone.iter().enumerate() {
                 let worker_idx = p % n_workers;
                 let worker = match workers_snapshot.get(worker_idx) {
@@ -425,13 +471,13 @@ async fn plan_and_dispatch(
                         continue;
                     }
                 };
-                let stage1_task_id = qid_u64
+                let stage1_task_id = qid_u64_for_spawn
                     .wrapping_mul(1000)
                     .wrapping_add(2)
                     .wrapping_add(p as u64);
                 let task_spec = pylon_proto::pylon::TaskSpec {
                     id: stage1_task_id,
-                    query_id: qid_u64,
+                    query_id: qid_u64_for_spawn,
                     stage_id: 2,
                     partition: p as u32,
                     fragment: Some(pylon_proto::pylon::Fragment {
@@ -450,15 +496,47 @@ async fn plan_and_dispatch(
                     warn!(partition = p, worker = worker_idx, "stage1 send failed");
                     continue;
                 }
-                info!(stage = 1, partition = p, worker = worker_idx, task_id = stage1_task_id, "stage1 dispatched");
+                // Register with QSM + reverse index immediately so
+                // the inbound open_session handler can resolve
+                // TaskResponse.task_id → (qid, sid) and the
+                // follow-up wait sees the full expected set.
+                state_for_send.task_locs.lock().unwrap().insert(
+                    stage1_task_id,
+                    (stage1_qid, stage1_sid),
+                );
+                stage1_register_ids.push(pylon_coord::TaskId(stage1_task_id));
                 dispatched_ids.push(stage1_task_id);
+                info!(stage = 1, partition = p, worker = worker_idx, task_id = stage1_task_id, "stage1 dispatched");
             }
-            // Save the dispatched task IDs for the polling task below
-            // to know which task IDs to drain from the workers'
-            // completed maps.
+            if !stage1_register_ids.is_empty() {
+                state_for_send.state_machine.register_stage(
+                    stage1_qid,
+                    stage1_sid,
+                    stage1_register_ids,
+                );
+                let stage1_wait = state_for_send
+                    .state_machine
+                    .wait_for_stage_done(stage1_qid, stage1_sid, stage1_deadline)
+                    .await;
+                if let Err(e) = stage1_wait {
+                    warn!(
+                        query_id = stage1_qid.0, stage_id = stage1_sid.0, error = %e,
+                        "stage 1 ack failed; result set will be partial"
+                    );
+                    let mut qmap = state_for_send.queries.lock().unwrap();
+                    if let Some(q) = qmap.get_mut(&stage1_qid) {
+                        q.state = pylon_coord::query::QueryState::Failed;
+                        q.error = Some(format!("stage 1: {e}"));
+                    }
+                } else {
+                    info!(query_id = stage1_qid.0, stage_id = stage1_sid.0, "stage 1 acked");
+                }
+            }
+            // Save the dispatched task IDs for the result-drain step
+            // below so we know which completed maps to consult.
             {
                 let mut qmap = state_for_send.queries.lock().unwrap();
-                if let Some(q) = qmap.get_mut(&pylon_coord::QueryId(qid_u64)) {
+                if let Some(q) = qmap.get_mut(&pylon_coord::QueryId(qid_u64_for_spawn)) {
                     q.stage1_task_ids = dispatched_ids.clone();
                 }
             }
@@ -479,7 +557,10 @@ async fn plan_and_dispatch(
             result
         };
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            // RFC 0005 R7: by the time we get here, the dispatcher
+            // above has already awaited stage 0 + stage 1 via the
+            // QueryStateMachine. Workers' `TaskResponse` payloads
+            // have landed in `w.completed`; we just drain them.
             let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
             let mut schema: Option<arrow_schema::SchemaRef> = None;
             let qid_q = pylon_coord::QueryId(qid_inner);
@@ -551,19 +632,6 @@ fn split_dag_for_dispatch(
         tasks.push(pair);
     }
     (stage0_ops, tasks)
-}
-
-/// Wait for stage N to complete (sleep-based heuristic in M3 first cut).
-/// Future: tick on TaskState::TaskDone ACKs from workers.
-async fn wait_for_stage_done_inner(
-    _state: Arc<CoordState>,
-    query_id: u64,
-    stage_id: u64,
-    _expected_count: usize,
-) {
-    // M3 first cut: sleep a fixed duration
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    info!(query_id, stage = stage_id, "stage acked (M3 sleep heuristic)");
 }
 
 /// M3 tail — PR1 (B3): rewrite `ExchangeSinkRpc.target_flight_addrs`
@@ -838,11 +906,53 @@ impl Worker for CoordGrpc {
         self.state.workers.lock().unwrap().insert(worker_id, handle.clone());
         info!(worker_id = worker_id.0, "registered");
 
+        // Capture handles the spawned inbound task needs without
+        // borrowing `&self` (which can't cross the `'static`
+        // async-move boundary).
+        let state = self.state.clone();
         tokio::spawn(async move {
             while let Some(msg) = inbound.next().await {
                 match msg {
                     Ok(resp) => {
                         let tid = resp.task_id;
+                        // M3-tail #1 (RFC 0005 R7): drive the
+                        // coord's QueryStateMachine off the worker's
+                        // existing TaskResponse.state field. No
+                        // proto change; the worker already publishes
+                        // TASK_DONE / TASK_FAILED on every task; we
+                        // just count and wake.
+                        let loc = state.task_locs.lock().unwrap().get(&tid).copied();
+                        match (resp.state, loc) {
+                            (1, Some((qid, sid))) => {
+                                state.state_machine.ack_task(
+                                    qid, sid, pylon_coord::TaskId(tid),
+                                    pylon_coord::query_state::TaskAck::Done,
+                                );
+                                trace!(
+                                    worker = worker_id.0, task_id = tid,
+                                    qid = qid.0, stage_id = sid.0,
+                                    "QSM ack: done"
+                                );
+                            }
+                            (2, Some((qid, sid))) => {
+                                let msg = resp.message.clone();
+                                state.state_machine.ack_task(
+                                    qid, sid, pylon_coord::TaskId(tid),
+                                    pylon_coord::query_state::TaskAck::Failed,
+                                );
+                                warn!(
+                                    worker = worker_id.0, task_id = tid,
+                                    qid = qid.0, stage_id = sid.0, %msg,
+                                    "QSM ack: failed"
+                                );
+                            }
+                            _ => {
+                                // Either state is RUNNING/CANCELLED
+                                // (no ack) or task_id was never
+                                // registered by a dispatch step
+                                // (rare; ignore).
+                            }
+                        }
                         // M3 B-3.5: decode the real Arrow IPC streaming
                         // bytes from the worker. A single response
                         // carries one full IPC stream (schema + N
