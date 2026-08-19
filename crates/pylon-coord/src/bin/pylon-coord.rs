@@ -322,10 +322,11 @@ async fn plan_and_dispatch(
             return Err(anyhow::anyhow!("logical plan: {e:?}"));
         }
     };
+    // `physical_from_logical` now returns `Arc<dyn ExecutionPlan>`
+    // (post-R2.3). The fragmenter consumes that directly — no enum
+    // match, no wrap.
     let physical_plan = match physical_from_logical(logical_plan) {
-        Ok(p) => {
-                    p
-        }
+        Ok(p) => p,
         Err(e) => {
             return Err(anyhow::anyhow!("physical plan: {e:?}"));
         }

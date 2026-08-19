@@ -15,8 +15,7 @@
 
 use crate::stage::{Distribution, Fragment, OpSpec, Stage, StageDag, StageId};
 
-use pylon_plan::physical::physical_expr::PhysicalExpr;
-use pylon_plan::physical::PhysicalPlan;
+use pylon_plan::physical::exec::ExecutionPlan;
 use pylon_types::{PylonError, Result as PylonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,7 +68,7 @@ impl Fragmenter {
     /// authoritative rewrite is universally in place.
     pub fn fragment(
         &self,
-        plan: &PhysicalPlan,
+        plan: &Arc<dyn ExecutionPlan>,
         query_id: u64,
         worker_flight_addrs: &[String],
     ) -> PylonResult<StageDag> {
@@ -82,14 +81,10 @@ impl Fragmenter {
             stage0_id,
             stage1_id,
         };
-        // RFC 0005 R2.2.a: convert the legacy `enum PhysicalPlan`
-        // once at the entry point and walk via `Arc<dyn ExecutionPlan>`
-        // from here on. The legacy enum stays at this layer only
-        // until R2.3 deletes it; everything inside
-        // `visit_v2` is trait-driven.
-        let root: Arc<dyn pylon_plan::physical::exec::ExecutionPlan> =
-            wrap_legacy_plan(plan);
-        let visit = visit_v2(&root, &mut ctx, stage0_id, worker_flight_addrs)?;
+        // R2.3: callers pass `Arc<dyn ExecutionPlan>` directly —
+        // no wrap, no enum match. The dispatcher's authoritative
+        // rewrite (PR1) consumes the trait object directly.
+        let visit = visit_v2(plan, &mut ctx, stage0_id, worker_flight_addrs)?;
 
         // R2.2.b: stage0 carries the canonical plan root so future
         // schedulers (M4 cost-based, hash-affinity) can read
@@ -107,7 +102,7 @@ impl Fragmenter {
                 ops: visit.stage0_ops,
                 distribution: Distribution::Partitioned(n_partitions),
             },
-            plan: Some(root),
+            plan: Some(Arc::clone(plan)),
             partition_count: n_partitions,
             memory_budget_bytes: 256 * 1024 * 1024,
             upstream: Vec::new(),
@@ -149,78 +144,6 @@ struct Visit {
     stage1_ops: Vec<OpSpec>,
 }
 
-
-/// RFC 0005 R2.2.a bridge: convert the pre-R2 `enum PhysicalPlan`
-/// into the canonical `Arc<dyn ExecutionPlan>` shape. M3 fragments
-/// from here. R2.3 deletes the enum and this bridge becomes the
-/// only entry point.
-///
-/// One central enum match (here) so the rest of fragment.rs can
-/// be trait-driven. Conversion is recursive: child plans become
-/// `Arc<dyn>` first via recursive call, then the current node is
-/// built as a struct + wrapped in `Arc::new(...)`.
-fn wrap_legacy_plan(
-    plan: &pylon_plan::physical::PhysicalPlan,
-) -> Arc<dyn pylon_plan::physical::exec::ExecutionPlan> {
-    use pylon_plan::physical::exec::{
-        AggregateExec, ExecutionPlan, FilterExec, ProjectExec, SeqScanExec,
-    };
-    use pylon_plan::physical::expr::{
-        AggregateFunctionExpr as AggregateFunctionExprNew, BinaryOpExpr,
-        ColumnExpr, LiteralExpr, PhysicalExpr as PhysicalExprTrait,
-    };
-
-    fn wrap_expr(e: &pylon_plan::physical::physical_expr::PhysicalExpr) -> Arc<dyn PhysicalExprTrait> {
-        use pylon_plan::physical::physical_expr::PhysicalExpr as PEL;
-        match e {
-            PEL::Column { index, field } => Arc::new(ColumnExpr::new(*index, field.clone())),
-            PEL::Literal { value, data_type } => {
-                Arc::new(LiteralExpr::new(value.clone(), data_type.clone()))
-            }
-            PEL::BinaryOp { left, op, right } => Arc::new(BinaryOpExpr::new(
-                wrap_expr(left.as_ref()),
-                op.clone(),
-                wrap_expr(right.as_ref()),
-            )),
-            PEL::AggregateFunction {
-                func,
-                name,
-                args,
-                data_type,
-                input_data_types,
-            } => Arc::new(AggregateFunctionExprNew::new(
-                func.clone(),
-                name.clone(),
-                args.iter().map(|a| wrap_expr(a)).collect(),
-                data_type.clone(),
-                input_data_types.clone(),
-            )),
-        }
-    }
-
-    match plan {
-        pylon_plan::physical::PhysicalPlan::SeqScan { table, schema } => {
-            Arc::new(SeqScanExec::new(table.clone(), schema.clone()))
-        }
-        pylon_plan::physical::PhysicalPlan::Filter { input, predicate } => {
-            let input = wrap_legacy_plan(input);
-            let predicate = wrap_expr(predicate);
-            let schema = input.schema();
-            Arc::new(FilterExec::new(input, predicate, schema))
-        }
-        pylon_plan::physical::PhysicalPlan::Project { input, projections, schema } => {
-            let input = wrap_legacy_plan(input);
-            let projections = projections.iter().map(|p| wrap_expr(p)).collect();
-            Arc::new(ProjectExec::new(input, projections, schema.clone()))
-        }
-        pylon_plan::physical::PhysicalPlan::Aggregate { input, group_by, aggs, schema } => {
-            let input = wrap_legacy_plan(input);
-            let group_by = group_by.iter().map(|e| wrap_expr(e)).collect();
-            let aggs = aggs.iter().map(|a| wrap_expr(a)).collect();
-            Arc::new(AggregateExec::new(input, group_by, aggs, schema.clone()))
-        }
-    }
-}
 
 /// RFC 0005 R2.2.a: trait-driven walker. Replaces `visit_plan` (the
 /// legacy enum match) for any caller that has already wrapped its
