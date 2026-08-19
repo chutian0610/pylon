@@ -254,15 +254,15 @@ pub async fn run_pipeline_single_thread(
         }
         if !blocked.is_empty() {
             // Wait for any one to resolve. select_all picks the fastest.
-            let selected = futures::future::select_all(blocked).await;
+            let _ = futures::future::select_all(blocked).await;
             debug!(
                 target: "pylon::pipeline",
                 pipeline_id = pipeline_id.0,
                 "a blocked future resolved; retrying ops"
             );
-            // suppress unused warning
-            let _ = selected;
-            progressed = true;
+            // We made progress (an op just became unblocked);
+            // skip the cooperative yield below and let the next
+            // tick drain the now-cascadable batches.
             continue;
         }
 
