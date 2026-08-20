@@ -10,7 +10,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use pylon_types::{PylonError, Result};
+use crate::memory_pool::NoopMemoryPool;
+use pylon_types::{MemoryPool, PylonError, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -105,6 +106,15 @@ enum AggState {
     MaxUtf8(Option<String>),
 }
 
+/// Memory accounting hook (RFC 0007 §3.1 conformance):
+/// `pool.try_grow(N)` is called at `add_input` time for the bytes we
+/// estimate we'll retain; the same `N` is `release`d in `Drop`.
+///
+/// Default construction (`::new`) wires a [`NoopMemoryPool`], so
+/// existing call sites and tests don't have to pass a budget.
+/// Production code (e.g. `pylon-worker`) should call
+/// `HashAggregateOp::with_pool(...)` to thread a real
+/// `PerTaskPool`.
 pub struct HashAggregateOp {
     pub group_by_cols: Vec<String>,
     pub aggregates: Vec<AggSpec>,
@@ -120,6 +130,10 @@ pub struct HashAggregateOp {
     input_types: Option<Vec<Option<DataType>>>,
     pub upstream_done: bool,
     pub emitted: bool,
+    /// Per-task byte budget. Scaled at `add_input`, balanced at `Drop`.
+    pool: Arc<dyn MemoryPool>,
+    /// Bytes currently claimed from `pool`. Released in `Drop`.
+    pool_allocated: usize,
 }
 
 impl HashAggregateOp {
@@ -127,10 +141,29 @@ impl HashAggregateOp {
     /// in the input schema) and a list of `AggSpec`. The output schema
     /// is supplied by the caller (typically derived from the SQL
     /// `PhysicalPlan::Aggregate.schema`).
+    /// Construct an op with a no-op memory pool. Use this when
+    /// you don't care about budget enforcement (most tests, default
+    /// builds). Production code paths should prefer [`Self::with_pool`].
     pub fn new(
         group_by_cols: Vec<String>,
         aggregates: Vec<AggSpec>,
         output_schema: SchemaRef,
+    ) -> Self {
+        Self::with_pool(
+            group_by_cols,
+            aggregates,
+            output_schema,
+            Arc::new(NoopMemoryPool),
+        )
+    }
+
+    /// Construct an op with an explicit per-task memory budget.
+    /// Every row claimed in `add_input` is released in `Drop`.
+    pub fn with_pool(
+        group_by_cols: Vec<String>,
+        aggregates: Vec<AggSpec>,
+        output_schema: SchemaRef,
+        pool: Arc<dyn MemoryPool>,
     ) -> Self {
         Self {
             group_by_cols,
@@ -141,6 +174,8 @@ impl HashAggregateOp {
             input_types: None,
             upstream_done: false,
             emitted: false,
+            pool,
+            pool_allocated: 0,
         }
     }
 
@@ -638,6 +673,16 @@ impl PipelineOp for HashAggregateOp {
     }
 
     async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
+        // RFC 0007 §3.1 conformance: estimate the bytes this batch
+        // will cost us in group_map state and claim them up-front.
+        // ~32 bytes per row is a conservative upper bound for one
+        // group key + per-aggregate scalar state on the M3 cut; the
+        // exact accounting (with spill) lands in M4.S2.
+        if batch.num_rows() > 0 {
+            let bytes_estimate = batch.num_rows().saturating_mul(32);
+            self.pool.try_grow(bytes_estimate)?;
+            self.pool_allocated += bytes_estimate;
+        }
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -736,6 +781,23 @@ impl PipelineOp for HashAggregateOp {
 
     async fn is_finished(&self) -> bool {
         self.upstream_done && self.output_buf.is_empty() && self.emitted
+    }
+}
+
+/// RFC 0007 §3.1 conformance: release every byte claimed in
+/// `add_input`. We claim-and-add to `pool_allocated`; this Drop
+/// impl is the symmetric counter-weight. If you find an op that
+/// `try_grow`s but never `release`s in its drop, this is the bug
+/// pattern to look for.
+impl Drop for HashAggregateOp {
+    fn drop(&mut self) {
+        if self.pool_allocated > 0 {
+            self.pool.release(self.pool_allocated);
+            // reset so a (theoretical) re-use of the same struct
+            // wouldn't double-release — currently nobody re-uses an
+            // op struct post-drop, but it costs nothing to be tidy.
+            self.pool_allocated = 0;
+        }
     }
 }
 

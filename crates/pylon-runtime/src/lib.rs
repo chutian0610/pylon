@@ -9,6 +9,7 @@
 //! See RFC-0002 for the layer model and RFC 0005 § 7.1 R5-pre for the
 //! drop-history of the per-op-tokio-task legacy mode.
 
+pub mod memory_pool;
 pub mod op;
 pub mod pipeline;
 pub mod driver;
@@ -16,6 +17,7 @@ pub mod bridge;
 pub mod error;
 pub mod ops;
 
+pub use memory_pool::{NoopMemoryPool, PerTaskPool};
 pub use op::PipelineOp;
 pub use pipeline::{Pipeline, PipelineId, run_pipeline_single_thread};
 pub use driver::{Driver, DriverId};
