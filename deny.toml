@@ -1,0 +1,51 @@
+# cargo-deny configuration for the `pylon` workspace.
+# See https://embarkstudios.github.io/cargo-deny/
+#
+# Run from repo root:
+#   cargo deny check
+
+[graph]
+# Treat all workspace crates as the same version line.
+all-features = false
+
+[advisories]
+# Default: fail on any RUSTSEC entry with a fix available.
+# Unmaintained-warnings are visible but not failing (default behavior in cargo-deny 0.19+).
+
+[licenses]
+# Apache-2.0 throughout. A handful of transitive deps (e.g. ring) are
+# dual-licensed; we explicitly allow exceptions below.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "OpenSSL",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Each crate's Cargo.toml declares its own version. Multiple-version
+# warnings are nearly always transitive deps; surface as warnings and
+# require someone to consolidate by hand.
+multiple-versions = "warn"
+# Path-deps (pylon-* workspace members) don't pin versions; cargo-deny
+# flags every `{ path = ".." }` as a "wildcard". That is the contract for
+# path-deps in a Cargo workspace, not a real problem. Warn instead of
+# deny so the CI job passes; tighten once workspace consolidation is
+# complete.
+wildcards = "warn"
+
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
