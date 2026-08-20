@@ -18,7 +18,7 @@
 | RFC 0003 Driver 循环 spec | ⏳ |
 | RFC 0004 PipelineOp trait spec | ⏳ |
 | RFC 0005 Scheduler spec | ⏳ |
-| RFC 0006 Exchange 协议 spec | ⏳ |
+| RFC 0006 Exchange 协议 spec | ✅ 合入 RFC 0004 (见 docs/notes/rfc-0006-status.md) |
 
 ---
 
