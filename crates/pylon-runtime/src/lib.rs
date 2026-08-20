@@ -16,8 +16,10 @@ pub mod driver;
 pub mod bridge;
 pub mod error;
 pub mod ops;
+pub mod spill;
 
 pub use memory_pool::{NoopMemoryPool, PerTaskPool};
+pub use spill::{SpillHandle, SpillManager, Spillable};
 pub use op::PipelineOp;
 pub use pipeline::{Pipeline, PipelineId, run_pipeline_single_thread};
 pub use driver::{Driver, DriverId};
