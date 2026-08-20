@@ -28,6 +28,11 @@ fn main() {
             Arc::new(Float64Array::from(amounts)),
         ],
     ).unwrap();
+    // data/ is gitignored, so a fresh checkout (e.g. the GH Actions
+    // runner) will not have the directory. Create it before
+    // File::create; idempotent on dev boxes where data/ already
+    // exists.
+    std::fs::create_dir_all("data").expect("create data/");
     let file = File::create("data/sample.parquet").unwrap();
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();

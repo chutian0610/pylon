@@ -1,0 +1,37 @@
+# Pre-commit hooks for `pylon`. Install with:
+#   brew install pre-commit   # or: pip install pre-commit
+#   pre-commit install
+#
+# These hooks are advisory — they run the same checks the CI does
+# locally before you commit. They are not required by CI; a hook
+# failure here just means CI will (probably) flag the same thing.
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (workspace)
+        entry: cargo clippy --workspace --all-targets --no-deps
+        language: system
+        pass_filenames: false
+        # clippy currently has 22 pre-existing diagnostics on main;
+        # the local hook runs plain clippy (no -D warnings) so it
+        # stays advisory. To enforce, see the autofix PR.
+
+      - id: spi-boundary
+        name: SPI boundary check
+        entry: bash tools/check-spi-boundaries.sh
+        language: system
+        pass_filenames: false
+
+      - id: trait-stability
+        name: Trait stability check
+        entry: bash tools/check-trait-stability.sh
+        language: system
+        pass_filenames: false
