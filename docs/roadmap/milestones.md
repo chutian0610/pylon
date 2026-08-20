@@ -2,22 +2,22 @@
 
 时间单位：1 个月 = 4 周
 
-## 里程碑 0 — Scaffold (2026-08-18 → 2026-08-31)
+## 里程碑 0 — Scaffold (2026-08-18 → 2026-08-31)  *(hygiene pass 2026-08-20 — 见 PR #13)*
 
 **目标**：建立 Rust workspace，所有 ADR 落定。
 
 | 任务 | 状态 |
 |---|---|
-| 创建 workspace `Cargo.toml` | ⏳ |
-| 添加 `pre-commit` (rustfmt, clippy, cargo-deny) | ⏳ |
-| GitHub Actions CI 模版 | ⏳ |
-| 8 个 crate 全部创建空 stub | ⏳ |
+| 创建 workspace `Cargo.toml` | ✅ 完成 |
+| 添加 `pre-commit` (rustfmt, clippy, cargo-deny) | 🟡 进行中 (PR #12 落地: `.pre-commit-config.yaml` + `tools/deny.toml` + `cargo deny check` CI job。**rustfmt** 跟 **clippy -D warnings** 尚未接 — main 上现有 276 文件 cargo fmt 漂移 + 22 clippy errors，留给独立 *mechanical autofix* PR。) |
+| GitHub Actions CI 模版 | ✅ 完成 (PR #12: `.github/workflows/ci.yml` 现在有 3 jobs — `boundary-checks`、`build-test` (cargo build + cargo test)、`deny-check` (cargo deny)。fmt-check / clippy -D warnings jobs 留待 mechanical autofix PR。) |
+| 8 个 crate 全部创建空 stub | ✅ 完成 (11 main crates + 2 tools: pylon-types / -plan / -runtime / -connector-spi / -exchange / -catalog / -iceberg / -proto / -storage / -coord / -worker / tools/gen-sample-data / tools/verify-output。每个 crate 都有自己的 `src/`，远超 stub。) |
 | 调研笔记 `docs/research/findings.md` | ✅ 完成 |
 | RFC 0001 Architecture | ✅ 完成 |
-| RFC 0002 Crate 结构 | ⏳ |
-| RFC 0003 Driver 循环 spec | ⏳ |
-| RFC 0004 PipelineOp trait spec | ⏳ |
-| RFC 0005 Scheduler spec | ⏳ |
+| RFC 0002 Crate 结构 | ✅ 完成 (原 "Crate 结构" intent 已被 `docs/rfcs/0005-pipeline-trait-surface.md` §1 "Module layout (Presto's three-tier pattern)" 接住且细化为 11-crate 实际布局。RFC 0002 文件本身的 "Execution Hierarchy" 内容作为 RFC 0005 §1 的早期讨论保留。) |
+| RFC 0003 Driver 循环 spec | ✅ 完成 (`docs/rfcs/0003-m2-control-data-plane.md` 实际覆盖 M2 control plane (gRPC) + data plane (双向往返 coord)，范围超出原始 "Driver 循环" label。本 doc Status: Draft。) |
+| RFC 0004 PipelineOp trait spec | ✅ 完成 (注意文件是 `0004-m3-flight-shuffle.md`，即 "M3 Arrow Flight Shuffle Protocol"，Status Implemented 2026-08-18。原始 milestone 行预期 "PipelineOp trait spec"，但 trait 实际由 RFC 0005 R2 落地 (`crates/pylon-runtime/src/op.rs` 的 `PipelineOp` trait)。本行 scope superseded — 见 RFC 0005 §4 / §7 R2。) |
+| RFC 0005 Scheduler spec | ✅ 完成 (`docs/rfcs/0005-pipeline-trait-surface.md` Status Draft; scope 实际是 *Pipeline trait surface* 而非仅 "Scheduler"。R0-R9 序列全部 ✅，R6 PR #1+#2+#8 已进 main, R7 经 d610c8e 线性进 main (PR #6 标记), R9 经 cd652e2 线性进 main (PR #7 标记)。) |
 | RFC 0006 Exchange 协议 spec | ✅ 合入 RFC 0004 (见 docs/notes/rfc-0006-status.md) |
 
 ---
