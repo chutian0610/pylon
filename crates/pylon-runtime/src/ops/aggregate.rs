@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use crate::memory_pool::NoopMemoryPool;
 use pylon_types::{MemoryPool, PylonError, Result};
 use std::collections::HashMap;
+use crate::spill::{SpillHandle, SpillManager, Spillable};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -134,6 +136,12 @@ pub struct HashAggregateOp {
     pool: Arc<dyn MemoryPool>,
     /// Bytes currently claimed from `pool`. Released in `Drop`.
     pool_allocated: usize,
+    /// Spill files written but not yet reloaded. Reloaded at
+    /// `no_more_input` time, then unlinked.
+    spill_handles: Vec<SpillHandle>,
+    /// Where to write spill files. `None` => auto-create a tempdir
+    /// on first spill.
+    spill_root: Option<PathBuf>,
 }
 
 impl HashAggregateOp {
@@ -176,7 +184,18 @@ impl HashAggregateOp {
             emitted: false,
             pool,
             pool_allocated: 0,
+            spill_handles: Vec::new(),
+            spill_root: None,
         }
+    }
+
+    /// Builder for callers that also want to control where spill
+    /// files land (e.g. a worker that points all spills at the
+    /// task-local scratch dir). When `root` is `None`, a tempdir
+    /// is created lazily on the first spill.
+    pub fn with_spill_root(mut self, root: PathBuf) -> Self {
+        self.spill_root = Some(root);
+        self
     }
 
     /// Resolve each aggregate's input column type from the input
@@ -673,18 +692,39 @@ impl PipelineOp for HashAggregateOp {
     }
 
     async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         // RFC 0007 §3.1 conformance: estimate the bytes this batch
         // will cost us in group_map state and claim them up-front.
         // ~32 bytes per row is a conservative upper bound for one
-        // group key + per-aggregate scalar state on the M3 cut; the
-        // exact accounting (with spill) lands in M4.S2.
-        if batch.num_rows() > 0 {
-            let bytes_estimate = batch.num_rows().saturating_mul(32);
-            self.pool.try_grow(bytes_estimate)?;
-            self.pool_allocated += bytes_estimate;
-        }
-        if batch.num_rows() == 0 {
-            return Ok(());
+        // group key + per-aggregate scalar state on the M3 cut.
+        let bytes_estimate = batch.num_rows().saturating_mul(32);
+        match self.pool.try_grow(bytes_estimate) {
+            Ok(()) => self.pool_allocated += bytes_estimate,
+            Err(_) => {
+                // Spill current state to free budget, then retry.
+                // If even an empty state can't fit the batch, the
+                // pool is so tight that the caller is the wrong
+                // size; we error out.
+                if !self.state.is_empty() {
+                    let mgr = self.spill_manager_for_cleanup()?;
+                    self.spill(&mgr).await?;
+                    self.pool.try_grow(bytes_estimate).map_err(|_| {
+                        PylonError::Internal(format!(
+                            "HashAggregateOp: pool budget exhausted                              after spill (batch={} rows needs {} bytes)",
+                            batch.num_rows(),
+                            bytes_estimate
+                        ))
+                    })?;
+                    self.pool_allocated += bytes_estimate;
+                } else {
+                    return Err(PylonError::Internal(format!(
+                        "HashAggregateOp: pool budget too small for                          even an empty state to ingest batch of {} rows",
+                        batch.num_rows()
+                    )));
+                }
+            }
         }
         if self.emitted {
             return Err(PylonError::InvalidPlan(
@@ -767,6 +807,16 @@ impl PipelineOp for HashAggregateOp {
 
     async fn no_more_input(&mut self) -> Result<()> {
         if !self.emitted {
+            // RFC 0007 §4.1: before emitting, reload every pending
+            // spill handle so the in-memory bucket map is complete.
+            // (resume() unlinks the file on success.)
+            if !self.spill_handles.is_empty() {
+                let mgr = self.spill_manager_for_cleanup()?;
+                let handles = std::mem::take(&mut self.spill_handles);
+                for h in handles {
+                    self.resume(&mgr, h).await?;
+                }
+            }
             let final_batch = self.build_output()?;
             debug!(
                 groups = final_batch.num_rows(),
@@ -799,6 +849,426 @@ impl Drop for HashAggregateOp {
             self.pool_allocated = 0;
         }
     }
+}
+
+// --- Spillable + helpers (RFC 0007 §3.2 + §4.1) ---
+
+impl HashAggregateOp {
+    /// Get-or-create a `SpillManager` rooted at `self.spill_root`
+    /// (or a fresh tempdir on first call). Used by both the
+    /// `Spillable` impl and the cleanup path in `Drop`.
+    fn spill_manager_for_cleanup(&self) -> std::io::Result<SpillManager> {
+        match &self.spill_root {
+            Some(p) => SpillManager::new(p.clone()),
+            None => {
+                // Best-effort auto-tempdir. The first call's
+                // tempdir name is sticky for the lifetime of the
+                // op; subsequent spills go to the same dir.
+                let tmp = std::env::temp_dir().join(format!(
+                    "pylon-spill-pid{}-h{}",
+                    std::process::id(),
+                    // self.spill_handles is the next seq, so
+                    // different ops get different paths.
+                    self.spill_handles.len()
+                ));
+                SpillManager::new(tmp)
+            }
+        }
+    }
+}
+
+// Helpers for Spillable. The two methods are verbose but
+// follow the column-by-column pattern of `build_output`. A future
+// refactor can extract a generic "write state -> RecordBatch" /
+// "read RecordBatch -> state" pair, but for S2 the verbatim
+// approach keeps the diff readable.
+impl HashAggregateOp {
+    /// Materialize the in-memory state as one Arrow `RecordBatch`
+    /// matching `schema` (caller-built). Stable ordering by sorted
+    /// group key, same as `build_output`.
+    fn build_spill_batch(&self, schema: SchemaRef) -> Result<RecordBatch> {
+        if self.state.is_empty() {
+            let empty_cols: Vec<Arc<dyn Array>> = schema
+                .fields()
+                .iter()
+                .map(|f| arrow_array::new_empty_array(f.data_type()))
+                .collect();
+            return RecordBatch::try_new(schema, empty_cols).map_err(Into::into);
+        }
+        let mut groups: Vec<&Vec<GroupKey>> = self.state.keys().collect();
+        groups.sort_by(|a, b| {
+            for (x, y) in a.iter().zip(b.iter()) {
+                match x.cmp(y) {
+                    std::cmp::Ordering::Equal => continue,
+                    non_eq => return non_eq,
+                }
+            }
+            a.len().cmp(&b.len())
+        });
+        let n_groups = groups.len();
+
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(
+            self.group_by_cols.len() + self.aggregates.len(),
+        );
+
+        // group_by columns
+        for g_idx in 0..self.group_by_cols.len() {
+            match &groups[0][g_idx] {
+                GroupKey::Int64(_) => {
+                    let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        if let GroupKey::Int64(v) = &k[g_idx] {
+                            buf.push(Some(*v));
+                        }
+                    }
+                    columns.push(Arc::new(Int64Array::from(buf)));
+                }
+                GroupKey::Float64Bits(_) => {
+                    let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        if let GroupKey::Float64Bits(b) = &k[g_idx] {
+                            buf.push(Some(f64::from_bits(*b)));
+                        }
+                    }
+                    columns.push(Arc::new(Float64Array::from(buf)));
+                }
+                GroupKey::Utf8(_) => {
+                    let mut buf: Vec<Option<String>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        if let GroupKey::Utf8(s) = &k[g_idx] {
+                            buf.push(Some(s.clone()));
+                        }
+                    }
+                    columns.push(Arc::new(StringArray::from(buf)));
+                }
+            }
+        }
+
+        // aggregate columns.
+        let input_types = self
+            .input_types
+            .as_ref()
+            .expect("build_spill_batch called before input_types resolved");
+        for (agg_idx, agg) in self.aggregates.iter().enumerate() {
+            let col = match agg.func.as_str() {
+                "count" => {
+                    let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                    for k in &groups {
+                        if let AggState::Count(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                            buf.push(Some(*v));
+                        }
+                    }
+                    Arc::new(Int64Array::from(buf)) as Arc<dyn Array>
+                }
+                "sum" => match input_types[agg_idx].as_ref().expect("sum") {
+                    DataType::Int64 => {
+                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::SumI64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(Some(*v));
+                            }
+                        }
+                        Arc::new(Int64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    DataType::Float64 => {
+                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::SumF64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(Some(*v));
+                            }
+                        }
+                        Arc::new(Float64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    _ => unreachable!("SUM unsupported type already validated"),
+                },
+                "min" => match input_types[agg_idx].as_ref().expect("min") {
+                    DataType::Int64 => {
+                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::MinI64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(*v);
+                            }
+                        }
+                        Arc::new(Int64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    DataType::Float64 => {
+                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::MinF64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(*v);
+                            }
+                        }
+                        Arc::new(Float64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    _ => unreachable!(),
+                },
+                "max" => match input_types[agg_idx].as_ref().expect("max") {
+                    DataType::Int64 => {
+                        let mut buf: Vec<Option<i64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::MaxI64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(*v);
+                            }
+                        }
+                        Arc::new(Int64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    DataType::Float64 => {
+                        let mut buf: Vec<Option<f64>> = Vec::with_capacity(n_groups);
+                        for k in &groups {
+                            if let AggState::MaxF64(v) = &self.state.get(*k).unwrap()[agg_idx] {
+                                buf.push(*v);
+                            }
+                        }
+                        Arc::new(Float64Array::from(buf)) as Arc<dyn Array>
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!("unknown agg func in spill"),
+            };
+            columns.push(col);
+        }
+
+        RecordBatch::try_new(schema, columns).map_err(Into::into)
+    }
+
+    /// Fold rows from a spill batch back into `self.state`. The
+    /// incoming batch layout is identical to what
+    /// `build_spill_batch` produced: group_by cols first, then agg
+    /// result cols in the same order as `self.aggregates`.
+    fn fold_spill_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(());
+        }
+        let input_types = self
+            .input_types
+            .as_ref()
+            .expect("fold_spill_batch called before input_types resolved");
+
+        for row_idx in 0..n {
+            // Reconstruct group key.
+            let mut key = Vec::with_capacity(self.group_by_cols.len());
+            for g_idx in 0..self.group_by_cols.len() {
+                let col = batch.column(g_idx);
+                let k = match col.data_type() {
+                    DataType::Int64 => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        if arr.is_null(row_idx) {
+                            return Err(PylonError::Internal("spill: null group_by Int64".into()));
+                        }
+                        GroupKey::Int64(arr.value(row_idx))
+                    }
+                    DataType::Float64 => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        if arr.is_null(row_idx) {
+                            return Err(PylonError::Internal("spill: null group_by Float64".into()));
+                        }
+                        GroupKey::Float64Bits(arr.value(row_idx).to_bits())
+                    }
+                    DataType::Utf8 => {
+                        let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        if arr.is_null(row_idx) {
+                            return Err(PylonError::Internal("spill: null group_by Utf8".into()));
+                        }
+                        GroupKey::Utf8(arr.value(row_idx).to_string())
+                    }
+                    other => {
+                        return Err(PylonError::Internal(format!(
+                            "spill fold: unsupported group_by type {other:?}"
+                        )))
+                    }
+                };
+                key.push(k);
+            }
+
+            // Get-or-create entry. Use `entry().or_insert_with()` to
+            // seed the agg accumulators on first sight of this key.
+            let entry = self.state.entry(key).or_insert_with(|| {
+                // Inline a minimal initial-states builder (avoids
+                // needing to pass &self through to a method).
+                let mut v = Vec::with_capacity(self.aggregates.len());
+                for (agg, t) in self.aggregates.iter().zip(input_types.iter()) {
+                    v.push(match agg.func.as_str() {
+                        "count" => AggState::Count(0),
+                        "sum" => match t.as_ref().expect("sum") {
+                            DataType::Int64 => AggState::SumI64(0),
+                            DataType::Float64 => AggState::SumF64(0.0),
+                            _ => unreachable!(),
+                        },
+                        "min" => match t.as_ref().expect("min") {
+                            DataType::Int64 => AggState::MinI64(None),
+                            DataType::Float64 => AggState::MinF64(None),
+                            _ => unreachable!(),
+                        },
+                        "max" => match t.as_ref().expect("max") {
+                            DataType::Int64 => AggState::MaxI64(None),
+                            DataType::Float64 => AggState::MaxF64(None),
+                            _ => unreachable!(),
+                        },
+                        _ => unreachable!(),
+                    });
+                }
+                v
+            });
+
+            for (agg_idx, agg) in self.aggregates.iter().enumerate() {
+                let col_idx = self.group_by_cols.len() + agg_idx;
+                let col = batch.column(col_idx);
+                match (agg.func.as_str(), &mut entry[agg_idx]) {
+                    ("count", AggState::Count(v)) => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        if !arr.is_null(row_idx) {
+                            *v += arr.value(row_idx);
+                        }
+                    }
+                    ("sum", AggState::SumI64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        if !arr.is_null(row_idx) {
+                            *v += arr.value(row_idx);
+                        }
+                    }
+                    ("sum", AggState::SumF64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        if !arr.is_null(row_idx) {
+                            *v += arr.value(row_idx);
+                        }
+                    }
+                    ("min", AggState::MinI64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        *v = match *v {
+                            None => cur,
+                            Some(old) => match cur {
+                                None => Some(old),
+                                Some(new) => Some(old.min(new)),
+                            },
+                        };
+                    }
+                    ("min", AggState::MinF64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        *v = match *v {
+                            None => cur,
+                            Some(old) => match cur {
+                                None => Some(old),
+                                Some(new) => Some(old.min(new)),
+                            },
+                        };
+                    }
+                    ("max", AggState::MaxI64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        *v = match *v {
+                            None => cur,
+                            Some(old) => match cur {
+                                None => Some(old),
+                                Some(new) => Some(old.max(new)),
+                            },
+                        };
+                    }
+                    ("max", AggState::MaxF64(v)) => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        *v = match *v {
+                            None => cur,
+                            Some(old) => match cur {
+                                None => Some(old),
+                                Some(new) => Some(old.max(new)),
+                            },
+                        };
+                    }
+                    _ => {
+                        return Err(PylonError::Internal(format!(
+                            "spill fold: unhandled agg {} variant",
+                            agg.func
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Spillable for HashAggregateOp {
+    async fn spill(&mut self, manager: &SpillManager) -> Result<SpillHandle> {
+        if self.state.is_empty() {
+            return Err(PylonError::InvalidPlan(
+                "HashAggregateOp::spill called with empty bucket_map".into(),
+            ));
+        }
+        let schema = build_spill_schema(self);
+        let batch = self.build_spill_batch(schema.clone())?;
+        let handle = manager.spill(schema, std::slice::from_ref(&batch))?;
+
+        // Free in-memory state; keep pool accounting consistent.
+        self.state.clear();
+        self.pool.release(self.pool_allocated);
+        self.pool_allocated = 0;
+
+        self.spill_handles.push(handle.clone());
+        Ok(handle)
+    }
+
+    async fn resume(
+        &mut self,
+        manager: &SpillManager,
+        handle: SpillHandle,
+    ) -> Result<()> {
+        let batches = manager.read(&handle)?;
+        for b in batches {
+            self.fold_spill_batch(&b)?;
+        }
+        manager.delete(&handle)?;
+        Ok(())
+    }
+}
+
+/// Inferred spill-file schema: one column per group_by col
+/// (typed by the keys seen in the in-memory state) followed by
+/// one column per aggregate output (typed by the resolved
+/// `input_types`).
+fn build_spill_schema(op: &HashAggregateOp) -> SchemaRef {
+    let mut fields: Vec<Field> =
+        Vec::with_capacity(op.group_by_cols.len() + op.aggregates.len());
+    if let Some(first_key) = op.state.keys().next() {
+        for (i, _col) in op.group_by_cols.iter().enumerate() {
+            let dt = match &first_key[i] {
+                GroupKey::Int64(_) => DataType::Int64,
+                GroupKey::Float64Bits(_) => DataType::Float64,
+                GroupKey::Utf8(_) => DataType::Utf8,
+            };
+            fields.push(Field::new(format!("k{i}"), dt, false));
+        }
+    } else {
+        for (i, _col) in op.group_by_cols.iter().enumerate() {
+            fields.push(Field::new(format!("k{i}"), DataType::Null, true));
+        }
+    }
+    let input_types = op
+        .input_types
+        .as_ref()
+        .expect("build_spill_schema called before input_types resolved");
+    for (agg_idx, agg) in op.aggregates.iter().enumerate() {
+        let dt = match agg.func.as_str() {
+            "count" => DataType::Int64,
+            "sum" => match input_types[agg_idx]
+                .as_ref()
+                .expect("sum needs arg col")
+            {
+                DataType::Int64 => DataType::Int64,
+                DataType::Float64 => DataType::Float64,
+                _ => unreachable!(),
+            },
+            "min" | "max" => input_types[agg_idx]
+                .as_ref()
+                .expect("min/max needs arg col")
+                .clone(),
+            _ => unreachable!(),
+        };
+        fields.push(Field::new(&agg.out_name, dt, true));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 /// Helper for tests / wiring: build an `output_schema` from a list of
