@@ -8,6 +8,13 @@
 //!
 //! Supported aggregates: `COUNT(*)`, `SUM(<col>)`, `MIN(<col>)`, `MAX(<col>)`.
 //! Anything more complex returns an error.
+//!
+//! `CatalogStub` (this module, dev-only `#[doc(hidden)]`):
+//! a thin in-memory stub used by unit tests and the bin harness.
+//! Production code paths go through a real `Connector`-backed
+//! `SchemaProvider`; the engine-internal `Catalog` trait that
+//! would subsume `CatalogStub` is intentionally deferred — see
+//! `docs/design/trait-stability.md` §3.3 for the open thread.
 
 use crate::catalog::SchemaProvider;
 use crate::logical::{is_aggregate_expr, Expr as LExpr, LogicalPlan};
@@ -30,12 +37,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
+/// **Dev-only test fixture.** Used by unit tests and the
+/// coord bin harness. Production should not construct this
+/// directly — route through a real `Connector`-backed
+/// `SchemaProvider`. The engine-internal `Catalog` trait is
+/// deferred; see `docs/design/trait-stability.md` §3.3.
+#[doc(hidden)]
 pub struct CatalogStub {
     schemas: HashMap<String, SchemaRef>,
     /// Logical table name → physical Parquet path (for M1; M3 swaps to Iceberg)
     paths: HashMap<String, String>,
 }
 
+#[doc(hidden)]
 impl CatalogStub {
     pub fn with_builtin() -> Self {
         let mut s = Self::new();
@@ -76,6 +90,7 @@ impl CatalogStub {
     }
 }
 
+#[doc(hidden)]
 impl SchemaProvider for CatalogStub {
     fn get_schema(&self, table: &str) -> Result<SchemaRef, PylonError> {
         CatalogStub::get_schema(self, table)

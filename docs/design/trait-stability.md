@@ -155,7 +155,7 @@ Until R1 lands, this crate is empty (R0 axiom; see
 | `FragmenterRule` | trait (R3) | `pub` because the engine registers rules; not a plugin surface. |
 | `BoundaryStrategy`, `BoundaryEmit` | enum / struct (R3) | Engine-internal vocabulary; not connector-facing. |
 | `AggregateFragmenterRule` | struct (R3) | First built-in rule. Future M4 rules are also engine-internal. |
-| `CatalogStub` | struct (`translate.rs`) | **TODO (R6):** move behind the engine-internal `Catalog` trait, retire `CatalogStub` from public re-exports. |
+| `CatalogStub` | struct (`translate.rs`) | marked `#[doc(hidden)]` (R6.5 follow-up): dev-only test fixture; the engine-internal `Catalog` trait extraction is deferred and intentionally out of scope until M5. |
 
 ### 3.4 Internal — `pylon-runtime`, `pylon-coord`, `pylon-worker`, `pylon-exchange`, `pylon-proto`
 
