@@ -50,6 +50,15 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --all-targets
 
+      - name: Generate sample parquet fixture
+        # data/sample.parquet is .gitignored (see .gitignore line 7-8:
+        # "/data/" and "**/*.parquet"); the run-test target reads it
+        # via CARGO_MANIFEST_DIR-anchored sample_path(). tools/
+        # gen-sample-data writes a deterministic 100k-row parquet
+        # under data/; running it once before cargo test ensures
+        # the file exists on the runner.
+        run: cargo run --quiet -p gen-sample-data
+
       - name: Test workspace
         run: cargo test --workspace
 
