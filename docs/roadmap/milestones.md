@@ -22,17 +22,17 @@
 
 ---
 
-## 里程碑 1 — Single-worker Pipeline (9 月)
+## 里程碑 1 — Single-worker Pipeline (9 月)  *(hygiene pass 2026-08-20 — 见 PR #14)*
 
 **目标**：单进程内跑通 pipeline runtime + 3 个算子 + 简单 SQL。
 
 定义完成（DoD）：
-- [ ] `pylon-plan` 能 parse: `SELECT col_a FROM t WHERE col_b > 0`
-- [ ] `pylon-runtime` 实现 PipelineOp trait + Driver loop + Task lifecycle
-- [ ] 实现 `SeqScanOp(Parquet)` + `FilterOp` + `ProjectOp`
-- [ ] 单 task、3 op、跑通 100K 行的 Parquet 表，输出 Parquet
-- [ ] 单元测试覆盖率 ≥70% 在 ops/ 下
-- [ ] 一个 micro-benchmark 比对 Polars / DataFusion 同输入
+- [x] `pylon-plan` 能 parse: `SELECT col_a FROM t WHERE col_b > 0` ✅ (evidence: `crates/pylon-plan/src/translate.rs:100` `parse_sql` 用 sqlparser-rs + `GenericDialect`; 同 parser chain 在 `aggregate_e2e_test` 的 3 个 e2e 测试里跑过 100k 行 SQL→plan→execute 端到端)
+- [x] `pylon-runtime` 实现 PipelineOp trait + Driver loop + Task lifecycle ✅ (evidence: `PipelineOp` trait 在 `crates/pylon-runtime/src/op.rs:20`; `Driver` 在 `crates/pylon-runtime/src/driver.rs:37`; `Pipeline` 在 `crates/pylon-runtime/src/pipeline.rs:32`。Task lifecycle 由 `crates/pylon-worker/src/main.rs` 经 tonic `OpenSession` bidi 串接 coord + worker —— R7 carry-over via PR #6 已 audit 验证。)
+- [x] 实现 `SeqScanOp(Parquet)` + `FilterOp` + `ProjectOp` ✅ (evidence: 3 ops 全部存在，在 `crates/pylon-runtime/src/ops/` 下作为 `impl PipelineOp for ...` 落地。实际还多出 4 个 ops：`aggregate`、`arrow_compute`、`exchange`、`partition_filter`)
+- [x]* 单 task、3 op、跑通 100K 行的 Parquet 表，输出 Parquet 🟡 partial — (evidence:) **2-op pipeline (SeqScan→HashAggregate) on 100k parquet 验证过**: `crates/pylon-runtime/tests/aggregate_e2e_test.rs` 的 3 个 e2e 测试 (`e2e_count_star_only_global_aggregate`, `e2e_scan_aggregate_single_stage`, `e2e_aggregate_emits_exactly_one_batch`) 全部 pass。**3-op pipeline (Filter+Project+SeqScan) 没有 dedicated e2e 测试**。**"输出 Parquet" 部分未实装**：`tools/verify-output` 是 read-only Parquet inspector；当前 ops tree 末尾没有 write-to-parquet sink。这个 gap 留给 RFC 0007 M4 范围内的 Spillable + FTE 子系统恢复时机一起补；当前需求下生成 parquet 也是 R6 之后的 Iceberg 路径。
+- [ ] 单元测试覆盖率 ≥70% 在 ops/ 下 ❌ (evidence: `cargo-llvm-cov` / `cargo-tarpaulin` 均未配置 — `grep` `Cargo.toml` + `.github/workflows/ci.yml` 无命中；CI workflow 只有 boundary + build-test + deny-check。**issue**: 这是个独立 PR 的范围 (`coverage tooling + first report`) — 加 cargo-llvm-cov 依赖、写 make target、把 coverage 数字更新进本行)
+- [ ] 一个 micro-benchmark 比对 Polars / DataFusion 同输入 ❌ (evidence: 没有 `benches/` 目录 — `find` 无命中；pylon 没有现成 baseline runner。 给定 RFC 0007 §4 plan 优先级，独立 PR 处理: 加 `benches/aggregate_baseline.rs` 复刻 100k 行 aggregate，对 polars / datafusion 跑同一 aggregate；写结果数字进本行)
 
 | 任务 | 估计天数 |
 |---|---|
@@ -50,18 +50,18 @@
 
 ---
 
-## 里程碑 2 — Multi-worker + Exchange (10 月)
+## 里程碑 2 — Multi-worker + Exchange (10 月)  *(hygiene pass 2026-08-20 — 见 PR #14)*
 
 **目标**：多进程 coordinator/worker，二 stage query（partitioned + broadcast exchange）。
 
 定义完成（DoD）：
-- [ ] `pylon-coord` binary：HTTP API 接收 SQL、解析→plan→fragment→schedule
-- [ ] `pylon-worker` binary：接受 task、驱动 driver loop、向 coord 心跳
-- [ ] `pylon-exchange`：Arrow Flight 服务端/客户端双向
-- [ ] 实现 partitioned HashPartitionExchange（N→N）
-- [ ] 实现 Broadcast exchange（1→N）
-- [ ] 跑两 stage `SELECT ... FROM t1 JOIN t2 ON ...`，部署 1 coord + 2 worker
-- [ ] TPC-H Q1 / Q3 在 SF10 上能跑
+- [x] `pylon-coord` binary：HTTP API 接收 SQL、解析→plan→fragment→schedule ✅ (evidence: `crates/pylon-coord/src/bin/pylon-coord.rs:4` `use axum::{...}`、`Json` + `Router` 全套；`axum::serve(listener, app)` 起 server；`Json(req): Json<SubmitQuery>` 处理 POST，回 `Json(QuerySubmitted)`；`plan_and_dispatch` 进 SQL→plan→fragment→schedule path)
+- [x]* `pylon-worker` binary：接受 task、驱动 driver loop、向 coord 心跳 🟡 partial — (evidence: 接受 task via tonic gRPC `OpenSession` ✅ (R7 + PR #6 audit)；driver loop 在 `crates/pylon-runtime/src/driver.rs` ✅。**"向 coord 心跳"未实现** — M3 RFC 0004 §4 选择**不**采周期性 heartbeat，而是用一次性 `RegisterWorker` + 长连接 `OpenSession` 流代替 (见 `m3-status.md` "Out-of-scope (deferred)" 列表 — heartbeat 在那儿也是 deferred 项)。M2 DoD 把 "心跳" 写进来了，但 M3 的 M3 实现选择了语义等价的 "持久 stream" 代替。*this is a different decision, not a defect* — DoD 行文字需调整: "向 coord 注册并保持长连接"。
+- [x] `pylon-exchange`：Arrow Flight 服务端/客户端双向 ✅ (evidence: RFC 0004 全 M3 实现，Status Implemented 2026-08-18。`crates/pylon-exchange/src/flight_rpc.rs` 实现 `arrow_flight::flight_service_server::FlightService` (服务端)；`crates/pylon-runtime/src/ops/exchange.rs::ExchangeSinkRpc` 用 tonic Flight `DoExchange` (客户端)；M3 sign-off packet B-2 验证)
+- [x] 实现 partitioned HashPartitionExchange（N→N） ✅ (evidence: `crates/pylon-coord/src/fragment.rs` 中 `cfg.default_partition_count` + `with_default_partition_count()`；fragment.rs 切分点在遇 `PhysicalPlan::Aggregate { group_by }` 时插入 ExchangeSink(op N 个) + per-partition task pairs (ExchangeSource + Aggregate)；2-worker E2E `tools/e2e/two_worker_smoke.sh` 跑过 100k 行 `SELECT name, COUNT(*) GROUP BY name` 端到端)
+- [ ] 实现 Broadcast exchange（1→N） ❌ (evidence: `crates/pylon-runtime/src/ops/exchange.rs` + `fragment.rs` 没有任何 Broadcast 实现；`m3-status.md` "Out-of-scope (deferred)" 列了 broadcast 与 HashJoin/Window 等一起为后续 milestone 推后)
+- [ ] 跑两 stage `SELECT ... FROM t1 JOIN t2 ON ...`，部署 1 coord + 2 worker ❌ (evidence: 没有 `HashJoin` op — `m3-status.md` 列出 "HashJoin / Distinct / Window fragmenter rules (fragmenter 框架通用，只有 Aggregate 规则实装)"。`crates/pylon-coord/src/fragment.rs:9` 注释明文 "Adding a new boundary op (M4 HashJoin / Distinct / Window) is now..." —— 表明 HashJoin 是 M4 才该 push 的。需要 RFC 0007 §5 S2-S8 落地。)
+- [ ] TPC-H Q1 / Q3 在 SF10 上能跑 ❌ (evidence: `m3-status.md` "Out-of-scope (deferred)" 显式列 "Lakekeeper / Iceberg / TPC-H SF100 (推到 M3.5+)"。SF10 小但也需要完整 catalog/Iceberg infrastructure 才跑得起来 — M3.5+ 范围。同时未现成 TPC-H 数据生成或 query 模板)
 
 | 任务 | 估计天数 |
 |---|---|
