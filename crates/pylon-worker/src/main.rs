@@ -3,18 +3,12 @@
 use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use futures::StreamExt;
-use tonic::Request;
-use pylon_proto::pylon::{
-    RegisterWorkerRequest, TaskRequest, TaskResponse, TaskState,
-};
+use pylon_exchange::{FlightServerImpl, PylonFlightClient, PylonFlightService};
+use pylon_proto::pylon::{RegisterWorkerRequest, TaskRequest, TaskResponse, TaskState};
 use pylon_proto::worker_client::WorkerClient;
-use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightClient, PylonFlightService};
-use pylon_runtime::ops::{
-    AggSpec, ExchangeSourceOp, FilterOp, HashAggregateOp, PartitionFilterOp,
-    ProjectOp, SeqScanOp,
-};
 use pylon_runtime::{Driver, Pipeline, PipelineOp};
 use std::sync::Arc;
+use tonic::Request;
 use tracing::{info, warn};
 
 mod op_registry;
@@ -82,7 +76,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    run(flight_service, bound_flight_addr.to_string(), grpc_local_addr).await
+    run(
+        flight_service,
+        bound_flight_addr.to_string(),
+        grpc_local_addr,
+    )
+    .await
 }
 
 async fn run(
@@ -188,13 +187,16 @@ async fn run(
     Ok(())
 }
 
-async fn run_task(req: TaskRequest, flight_service: Arc<PylonFlightService>) -> Result<Vec<arrow_array::RecordBatch>> {
+async fn run_task(
+    req: TaskRequest,
+    flight_service: Arc<PylonFlightService>,
+) -> Result<Vec<arrow_array::RecordBatch>> {
     let spec = req.spec.context("task spec missing")?;
     let fragment = spec.fragment.as_ref().context("fragment missing")?;
 
     let ops = build_ops(fragment, flight_service.clone())?;
     let pipeline = Pipeline::new(ops);
-    let driver = Driver::new(pipeline);  // default mode = SingleThreadLoop
+    let driver = Driver::new(pipeline); // default mode = SingleThreadLoop
 
     let mut output = driver.run(None).await?;
     let mut collected = Vec::new();
@@ -210,7 +212,11 @@ fn build_ops(
 ) -> Result<Vec<Box<dyn PipelineOp>>> {
     let mut ops: Vec<Box<dyn PipelineOp>> = Vec::new();
     for op_spec in &fragment.ops {
-        ops.push(build_op(&op_spec.name, &op_spec.config, flight_service.clone())?);
+        ops.push(build_op(
+            &op_spec.name,
+            &op_spec.config,
+            flight_service.clone(),
+        )?);
     }
     Ok(ops)
 }
@@ -250,11 +256,9 @@ fn encode_batch_ipc(batch: &arrow_array::RecordBatch) -> Result<Vec<u8>> {
                 .build()
                 .map_err(|e| anyhow::anyhow!("encode_batch_ipc runtime: {e}"))?;
             runtime.block_on(async move {
-                let client = PylonFlightClient::connect(
-                    "in-process://worker".into(),
-                    "task-batch".into(),
-                )
-                .await?;
+                let client =
+                    PylonFlightClient::connect("in-process://worker".into(), "task-batch".into())
+                        .await?;
                 client.send(batch.clone()).await?;
                 client.close().await?;
                 Ok::<Vec<u8>, anyhow::Error>(client.take_bytes().await)

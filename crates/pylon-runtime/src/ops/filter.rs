@@ -49,9 +49,7 @@ impl FilterOp {
             DataType::Int64 => {
                 let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
                 let lit_n: i64 = lit.parse().map_err(|_| {
-                    pylon_types::PylonError::InvalidPlan(format!(
-                        "filter literal not i64: {lit}"
-                    ))
+                    pylon_types::PylonError::InvalidPlan(format!("filter literal not i64: {lit}"))
                 })?;
                 arr.iter()
                     .map(|v| v.map(|x| self.cmp_i64(x, lit_n)).unwrap_or(false))
@@ -60,9 +58,7 @@ impl FilterOp {
             DataType::Float64 => {
                 let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
                 let lit_n: f64 = lit.parse().map_err(|_| {
-                    pylon_types::PylonError::InvalidPlan(format!(
-                        "filter literal not f64: {lit}"
-                    ))
+                    pylon_types::PylonError::InvalidPlan(format!("filter literal not f64: {lit}"))
                 })?;
                 arr.iter()
                     .map(|v| v.map(|x| self.cmp_f64(x, lit_n)).unwrap_or(false))
@@ -78,7 +74,7 @@ impl FilterOp {
                 return Err(pylon_types::PylonError::InvalidPlan(format!(
                     "filter on type {:?} not supported in M1",
                     col.data_type()
-                )))
+                )));
             }
         };
 

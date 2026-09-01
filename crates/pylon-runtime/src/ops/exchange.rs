@@ -35,11 +35,7 @@ use std::sync::Arc;
 /// Pure (sync) per-row partition computation. Returns
 /// `partition_index[row]` for each row. FNV-1a mix consistent
 /// with `ExchangeSink` (A2).
-fn compute_partitions(
-    batch: &RecordBatch,
-    indices: &[usize],
-    n_partitions: usize,
-) -> Vec<usize> {
+fn compute_partitions(batch: &RecordBatch, indices: &[usize], n_partitions: usize) -> Vec<usize> {
     let n_rows = batch.num_rows();
     let mut out = Vec::with_capacity(n_rows);
     for row in 0..n_rows {
@@ -63,23 +59,43 @@ fn fold_array_into_hash(arr: &dyn Array, row: usize, h: &mut u64) {
     }
     match arr.data_type() {
         DataType::Int64 => {
-            let v = arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row);
+            let v = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row);
             *h = fold_u64(*h, v as u64);
         }
         DataType::Float64 => {
-            let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+            let v = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
             *h = fold_u64(*h, v.to_bits());
         }
         DataType::UInt32 => {
-            let v = arr.as_any().downcast_ref::<UInt32Array>().unwrap().value(row) as u64;
+            let v = arr
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row) as u64;
             *h = fold_u64(*h, v);
         }
         DataType::UInt64 => {
-            let v = arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row);
+            let v = arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row);
             *h = fold_u64(*h, v);
         }
         DataType::Utf8 => {
-            let v = arr.as_any().downcast_ref::<StringArray>().unwrap().value(row);
+            let v = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row);
             for &b in v.as_bytes() {
                 *h ^= b as u64;
                 *h = h.wrapping_mul(0x100000001b3);
@@ -129,7 +145,7 @@ impl ExchangeSourceOp {
             input_buf: Vec::new(),
             upstream_done: false,
             empty_polls: 0,
-            producer_done_threshold: 5,  // M3 heuristic
+            producer_done_threshold: 5, // M3 heuristic
         }
     }
 }
@@ -180,7 +196,6 @@ impl PipelineOp for ExchangeSourceOp {
         self.upstream_done && self.input_buf.is_empty() && pending == 0
     }
 }
-
 
 // ============================================================================
 // ExchangeSinkRpc — the single producer op, post-M3-tail unification
@@ -303,7 +318,6 @@ impl ExchangeSinkRpc {
             .collect::<std::result::Result<_, _>>()?;
         RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
     }
-
 }
 
 #[async_trait]
@@ -330,8 +344,7 @@ impl PipelineOp for ExchangeSinkRpc {
 
         // Compute per-row partition index (sync helper, no async
         // borrows).
-        let per_row_partition: Vec<usize> =
-            compute_partitions(&batch, &indices, n_partitions);
+        let per_row_partition: Vec<usize> = compute_partitions(&batch, &indices, n_partitions);
 
         // Bucket rows by partition.
         let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_partitions];
@@ -355,9 +368,11 @@ impl PipelineOp for ExchangeSinkRpc {
             {
                 let mut writer = StreamWriter::try_new(&mut buf, part_batch.schema().as_ref())
                     .map_err(|e| PylonError::Internal(format!("ipc writer: {e}")))?;
-                writer.write(&part_batch)
+                writer
+                    .write(&part_batch)
                     .map_err(|e| PylonError::Internal(format!("ipc write: {e}")))?;
-                writer.finish()
+                writer
+                    .finish()
                     .map_err(|e| PylonError::Internal(format!("ipc finish: {e}")))?;
             }
             let desc_msg = arrow_flight::FlightData {

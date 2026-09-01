@@ -7,12 +7,12 @@
 
 use crate::bridge::StateBridge;
 use crate::op::PipelineOp;
-use pylon_types::Result as PylonResult;
 use pylon_types::RecordBatch;
-use std::sync::atomic::{AtomicU64, Ordering};
+use pylon_types::Result as PylonResult;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
 
@@ -90,7 +90,7 @@ pub async fn run_pipeline_single_thread(
     let is_source_stage = external_input.is_none();
     let mut external_input = external_input;
 
-    let Pipeline { ops, state_bridges: _, .. } = pipeline;
+    let Pipeline { ops, .. } = pipeline;
 
     // Per-op bookkeeping. Lives only inside this function (single-thread,
     // so no Mutex needed; we mutate freely).
@@ -148,8 +148,7 @@ pub async fn run_pipeline_single_thread(
             for i in 0..n_ops.saturating_sub(1) {
                 let drain = op_states[i].output_buf.len();
                 if drain > 0 {
-                    let drained: Vec<RecordBatch> =
-                        op_states[i].output_buf.drain(..).collect();
+                    let drained: Vec<RecordBatch> = op_states[i].output_buf.drain(..).collect();
                     op_states[i + 1].input_buf.extend(drained);
                     progressed = true;
                 }
@@ -247,9 +246,8 @@ pub async fn run_pipeline_single_thread(
             if op_states[i].finished {
                 continue;
             }
-            match op.is_blocked().await? {
-                Some(fut) => blocked.push(fut),
-                None => {}
+            if let Some(fut) = op.is_blocked().await? {
+                blocked.push(fut);
             }
         }
         if !blocked.is_empty() {

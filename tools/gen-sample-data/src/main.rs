@@ -27,7 +27,8 @@ fn main() {
             Arc::new(StringArray::from(names)),
             Arc::new(Float64Array::from(amounts)),
         ],
-    ).unwrap();
+    )
+    .unwrap();
     // data/ is gitignored, so a fresh checkout (e.g. the GH Actions
     // runner) will not have the directory. Create it before
     // File::create; idempotent on dev boxes where data/ already

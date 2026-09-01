@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pylon_runtime::ops::{AggSpec, HashAggregateOp, SeqScanOp};
 use pylon_runtime::{Driver, Pipeline, PipelineOp};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn sample_path() -> PathBuf {
     // Tests run from the crate root (cargo test changes cwd to the
@@ -67,16 +67,18 @@ fn expected_aggregates() -> Vec<(String, i64, f64)> {
             .unwrap();
         for row in 0..batch.num_rows() {
             let r = names.value(row).to_string();
-            let a = if amounts.is_null(row) { 0.0 } else { amounts.value(row) };
+            let a = if amounts.is_null(row) {
+                0.0
+            } else {
+                amounts.value(row)
+            };
             let entry = acc.entry(r).or_insert((0, 0.0));
             entry.0 += 1;
             entry.1 += a;
         }
     }
 
-    acc.into_iter()
-        .map(|(k, (c, s))| (k, c, s))
-        .collect()
+    acc.into_iter().map(|(k, (c, s))| (k, c, s)).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,22 +135,14 @@ async fn e2e_scan_aggregate_single_stage() {
 
     // 4. Compare row-by-row to expected.
     let expected = expected_aggregates();
-    assert_eq!(
-        out.num_rows(),
-        expected.len(),
-        "one row per distinct name"
-    );
+    assert_eq!(out.num_rows(), expected.len(), "one row per distinct name");
 
     let name_col = out
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    let count_col = out
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let count_col = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
     let sum_col = out
         .column(2)
         .as_any()

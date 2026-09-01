@@ -5,8 +5,8 @@ use std::sync::Arc;
 use arrow_array::Array;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use pylon_runtime::ops::{build_aggregate_output_schema, AggSpec, HashAggregateOp};
 use pylon_runtime::PipelineOp;
+use pylon_runtime::ops::{AggSpec, HashAggregateOp, build_aggregate_output_schema};
 
 fn schema_i64_str_f64() -> Arc<Schema> {
     // amount is nullable so the count-nulls test can insert nulls.
@@ -22,7 +22,11 @@ fn make_input_batch() -> RecordBatch {
     let ids = Int64Array::from(vec![1, 2, 3, 4, 5, 6]);
     let regions = StringArray::from(vec!["a", "b", "a", "b", "a", "c"]);
     let amounts = Float64Array::from(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
-    RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)],
+    )
+    .unwrap()
 }
 
 fn agg(name: &str, func: &str, arg: Option<&str>) -> AggSpec {
@@ -34,21 +38,66 @@ fn agg(name: &str, func: &str, arg: Option<&str>) -> AggSpec {
 }
 
 fn groups_of(batch: &RecordBatch, col: &str) -> Vec<String> {
-    let idx = batch.schema().fields().iter().position(|f| f.name() == col).unwrap();
-    let arr = batch.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
-    (0..batch.num_rows()).map(|i| arr.value(i).to_string()).collect()
+    let idx = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == col)
+        .unwrap();
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|i| arr.value(i).to_string())
+        .collect()
 }
 
 fn i64_col(batch: &RecordBatch, col: &str) -> Vec<Option<i64>> {
-    let idx = batch.schema().fields().iter().position(|f| f.name() == col).unwrap();
-    let arr = batch.column(idx).as_any().downcast_ref::<Int64Array>().unwrap();
-    (0..batch.num_rows()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect()
+    let idx = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == col)
+        .unwrap();
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
+        .collect()
 }
 
 fn f64_col(batch: &RecordBatch, col: &str) -> Vec<Option<f64>> {
-    let idx = batch.schema().fields().iter().position(|f| f.name() == col).unwrap();
-    let arr = batch.column(idx).as_any().downcast_ref::<Float64Array>().unwrap();
-    (0..batch.num_rows()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect()
+    let idx = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == col)
+        .unwrap();
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|i| {
+            if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            }
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -108,7 +157,11 @@ async fn count_column_ignores_nulls() {
         Some(80.0),
         None, // null
     ]);
-    let b2 = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)]).unwrap();
+    let b2 = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)],
+    )
+    .unwrap();
     op.add_input(b2).await.unwrap();
     op.no_more_input().await.unwrap();
     let out = op.get_output().await.unwrap().unwrap();
@@ -206,7 +259,10 @@ async fn multiple_aggregates_in_one_op() {
     let out = op.get_output().await.unwrap().unwrap();
     assert_eq!(out.num_rows(), 3);
     assert_eq!(i64_col(&out, "cnt"), vec![Some(3), Some(2), Some(1)]);
-    assert_eq!(f64_col(&out, "total"), vec![Some(90.0), Some(60.0), Some(60.0)]);
+    assert_eq!(
+        f64_col(&out, "total"),
+        vec![Some(90.0), Some(60.0), Some(60.0)]
+    );
     assert_eq!(i64_col(&out, "lo"), vec![Some(1), Some(2), Some(6)]);
     assert_eq!(i64_col(&out, "hi"), vec![Some(5), Some(4), Some(6)]);
 }
@@ -214,10 +270,8 @@ async fn multiple_aggregates_in_one_op() {
 #[tokio::test]
 async fn global_aggregate_with_no_group_by() {
     // No group_by cols; one aggregate (SUM). Single output row.
-    let output_schema = build_aggregate_output_schema(
-        vec![],
-        vec![Field::new("total", DataType::Float64, true)],
-    );
+    let output_schema =
+        build_aggregate_output_schema(vec![], vec![Field::new("total", DataType::Float64, true)]);
     let mut op = HashAggregateOp::new(
         vec![],
         vec![agg("total", "sum", Some("amount"))],
@@ -314,13 +368,21 @@ async fn multiple_batches_combine_correctly() {
     let ids = Int64Array::from(vec![1, 2]);
     let regions = StringArray::from(vec!["a", "b"]);
     let amounts = Float64Array::from(vec![100.0, 200.0]);
-    let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)]).unwrap();
+    let b1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)],
+    )
+    .unwrap();
     op.add_input(b1).await.unwrap();
     // Second batch: same "a" + new "c".
     let ids = Int64Array::from(vec![3, 4]);
     let regions = StringArray::from(vec!["a", "c"]);
     let amounts = Float64Array::from(vec![5.0, 50.0]);
-    let b2 = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)]).unwrap();
+    let b2 = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(regions), Arc::new(amounts)],
+    )
+    .unwrap();
     op.add_input(b2).await.unwrap();
     op.no_more_input().await.unwrap();
     let out = op.get_output().await.unwrap().unwrap();

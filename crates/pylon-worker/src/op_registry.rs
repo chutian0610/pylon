@@ -13,14 +13,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use pylon_exchange::PylonFlightService;
 use pylon_runtime::PipelineOp;
 
-pub type OpFactory =
-    dyn Fn(&HashMap<String, String>, Arc<PylonFlightService>) -> Result<Box<dyn PipelineOp>>
-        + Send
-        + Sync;
+pub type OpFactory = dyn Fn(&HashMap<String, String>, Arc<PylonFlightService>) -> Result<Box<dyn PipelineOp>>
+    + Send
+    + Sync;
 
 pub struct OpRegistry {
     factories: HashMap<&'static str, Box<OpFactory>>,
@@ -78,12 +77,14 @@ pub fn registry() -> &'static OpRegistry {
 
 fn build_default_registry() -> OpRegistry {
     use pylon_runtime::ops::{
-        ExchangeSinkRpc, ExchangeSourceOp, FilterOp, HashAggregateOp, PartitionFilterOp,
-        ProjectOp, SeqScanOp,
+        ExchangeSinkRpc, ExchangeSourceOp, FilterOp, HashAggregateOp, PartitionFilterOp, ProjectOp,
+        SeqScanOp,
     };
 
     let get = |cfg: &HashMap<String, String>, k: &str| -> Result<String> {
-        cfg.get(k).cloned().ok_or_else(|| anyhow!("missing config key {k}"))
+        cfg.get(k)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing config key {k}"))
     };
 
     OpRegistry::new()
@@ -140,7 +141,7 @@ fn build_default_registry() -> OpRegistry {
                 .collect();
             let targets: Vec<pylon_runtime::ops::RpcTarget> = flight_addrs
                 .into_iter()
-                .zip(descs.into_iter())
+                .zip(descs)
                 .map(|(flight_addr, descriptor)| pylon_runtime::ops::RpcTarget {
                     flight_addr,
                     descriptor,
@@ -170,7 +171,10 @@ fn parse_agg_specs(specs: &str) -> Result<Vec<pylon_runtime::ops::AggSpec>> {
     use pylon_runtime::ops::AggSpec;
     let mut out = Vec::new();
     for spec in specs.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if let Some(inner) = spec.strip_prefix("count(").and_then(|s| s.strip_suffix(")")) {
+        if let Some(inner) = spec
+            .strip_prefix("count(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
             if !inner.is_empty() {
                 anyhow::bail!("count() takes no arguments; got count({inner})");
             }
@@ -229,7 +233,10 @@ mod tests {
             "Aggregate",
         ];
         assert_eq!(
-            r.factories.keys().copied().collect::<std::collections::BTreeSet<_>>(),
+            r.factories
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
             names.into_iter().collect::<std::collections::BTreeSet<_>>(),
         );
     }

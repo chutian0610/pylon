@@ -11,14 +11,9 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use pylon_plan::physical::exec::{
-    AggregateExec, ExecutionPlan, FilterExec, ProjectExec, SeqScanExec,
-};
-use pylon_plan::physical::expr::{
-    AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr,
-    PhysicalExpr,
-};
-use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
+use pylon_plan::physical::exec::{AggregateExec, ExecutionPlan, ProjectExec, SeqScanExec};
+use pylon_plan::physical::expr::{AggregateFunctionExpr, ColumnExpr, PhysicalExpr};
+use pylon_plan::translate::{CatalogStub, logical_from_sql, physical_from_logical};
 
 fn catalog() -> CatalogStub {
     let mut c = CatalogStub::new();
@@ -94,7 +89,10 @@ fn count_with_column_preserves_arg() {
     assert_eq!(func.name, "count_amount", "default field name = func_col");
     assert_eq!(func.args.len(), 1);
     assert_eq!(
-        func.args[0].as_any().downcast_ref::<ColumnExpr>().map(|c| c.field.name().to_string()),
+        func.args[0]
+            .as_any()
+            .downcast_ref::<ColumnExpr>()
+            .map(|c| c.field.name().to_string()),
         Some("amount".to_string())
     );
     assert_eq!(func.input_data_types, vec![DataType::Float64]);
@@ -115,9 +113,8 @@ fn sum_uses_input_type_for_result() {
 
 #[test]
 fn min_max_return_input_type() {
-    let plan = sql_to_physical(
-        "SELECT region, MIN(id) AS lo, MAX(id) AS hi FROM orders GROUP BY region",
-    );
+    let plan =
+        sql_to_physical("SELECT region, MIN(id) AS lo, MAX(id) AS hi FROM orders GROUP BY region");
     let agg = downcast_op::<AggregateExec>(&plan);
     assert_eq!(agg.aggs.len(), 2);
     let f1 = downcast_expr::<AggregateFunctionExpr>(&agg.aggs[0]);
@@ -155,7 +152,6 @@ fn no_alias_uses_agg_name_col_naming() {
 }
 
 #[test]
-#[test]
 fn no_group_by_columns_rejected_in_m3_first_cut() {
     // M3 first cut's logical planner accepts a global aggregate (no
     // GROUP BY); the fragmenter emits an `AggregateExec` with the
@@ -165,7 +161,7 @@ fn no_group_by_columns_rejected_in_m3_first_cut() {
     let plan = sql_to_physical("SELECT COUNT(*) FROM orders");
     assert_eq!(plan.name(), "Aggregate");
     let agg = downcast_op::<AggregateExec>(&plan);
-    assert!(agg.aggs.len() >= 1);
+    assert!(!agg.aggs.is_empty());
     assert_eq!(agg.group_by.len(), 0, "no GROUP BY cols");
 }
 
@@ -182,11 +178,8 @@ fn group_by_all_is_rejected_in_m3_first_cut() {
 #[test]
 fn select_star_with_group_by_is_rejected_in_m3_first_cut() {
     // SELECT * with GROUP BY is rejected at the LOGICAL layer.
-    let result = logical_from_sql(
-        "SELECT *, COUNT(*) FROM orders GROUP BY region",
-        &catalog(),
-    );
-    let err = result.err().expect("expected error for SELECT * with GROUP BY");
+    let result = logical_from_sql("SELECT *, COUNT(*) FROM orders GROUP BY region", &catalog());
+    let err = result.expect_err("expected error for SELECT * with GROUP BY");
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("select *")
@@ -204,7 +197,7 @@ fn aggregate_in_group_by_is_rejected_in_m3_first_cut() {
         "SELECT region, COUNT(*) FROM orders GROUP BY region, COUNT(amount)",
         &catalog(),
     );
-    let err = result.err().expect("expected error for aggregate in GROUP BY");
+    let err = result.expect_err("expected error for aggregate in GROUP BY");
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("group by")
@@ -222,9 +215,7 @@ fn non_grouped_column_in_projection_is_rejected_in_m3_first_cut() {
         "SELECT region, amount, COUNT(*) FROM orders GROUP BY region",
         &catalog(),
     );
-    let err = result
-        .err()
-        .expect("expected error when non-grouped col in projection");
+    let err = result.expect_err("expected error when non-grouped col in projection");
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("group by")

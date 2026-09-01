@@ -17,12 +17,10 @@
 //! `docs/design/trait-stability.md` §3.3 for the open thread.
 
 use crate::catalog::SchemaProvider;
-use crate::logical::{is_aggregate_expr, Expr as LExpr, LogicalPlan};
+use crate::logical::{Expr as LExpr, LogicalPlan, is_aggregate_expr};
+use crate::physical::exec::{AggregateExec, ExecutionPlan, FilterExec, ProjectExec, SeqScanExec};
 use crate::physical::expr::{
     AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr,
-};
-use crate::physical::exec::{
-    AggregateExec, ExecutionPlan, FilterExec, ProjectExec, SeqScanExec,
 };
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -59,7 +57,8 @@ impl CatalogStub {
             Field::new("amount", DataType::Float64, false),
         ]));
         s.schemas.insert("sample".into(), schema);
-        s.paths.insert("sample".into(), "../data/sample.parquet".into());
+        s.paths
+            .insert("sample".into(), "../data/sample.parquet".into());
         s
     }
 
@@ -87,6 +86,12 @@ impl CatalogStub {
             .get(table)
             .map(|s| s.as_str())
             .ok_or_else(|| PylonError::InvalidPlan(format!("table not found: {table}")))
+    }
+}
+
+impl Default for CatalogStub {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -144,7 +149,7 @@ pub fn logical_from_sql(
     let schema = catalog.get_schema(&base_table)?;
     let mut input = LogicalPlan::Scan {
         table: base_table,
-        schema: schema.clone(),
+        schema,
     };
 
     // WHERE
@@ -163,7 +168,7 @@ pub fn logical_from_sql(
         GroupByExpr::All(_) => {
             return Err(PylonError::InvalidPlan(
                 "GROUP BY ALL not supported in M3 first cut".into(),
-            ))
+            ));
         }
     };
 
@@ -291,13 +296,10 @@ pub fn logical_from_sql(
     // output schema carries the user-supplied name.
     let projs: Vec<LExpr> = projs
         .into_iter()
-        .zip(aliases.into_iter())
-        .map(|(p, alias)| {
-            if alias.is_some() {
-                rename_expr(&p, &alias.unwrap())
-            } else {
-                p
-            }
+        .zip(aliases)
+        .map(|(p, alias)| match alias {
+            Some(a) => rename_expr(&p, &a),
+            None => p,
         })
         .collect();
     Ok(LogicalPlan::Project {
@@ -306,9 +308,7 @@ pub fn logical_from_sql(
     })
 }
 
-pub fn physical_from_logical(
-    logical: LogicalPlan,
-) -> Result<Arc<dyn ExecutionPlan>, PylonError> {
+pub fn physical_from_logical(logical: LogicalPlan) -> Result<Arc<dyn ExecutionPlan>, PylonError> {
     match logical {
         LogicalPlan::Scan { table, schema } => {
             Ok(Arc::new(SeqScanExec::new(table, schema)) as Arc<dyn ExecutionPlan>)
@@ -317,17 +317,16 @@ pub fn physical_from_logical(
             let input = physical_from_logical(*input)?;
             let predicate = physical_from_logical_expr(&predicate);
             let schema = input.schema();
-            Ok(Arc::new(
-                FilterExec::new(input, predicate, schema)
-            ) as Arc<dyn ExecutionPlan>)
+            Ok(Arc::new(FilterExec::new(input, predicate, schema)) as Arc<dyn ExecutionPlan>)
         }
         LogicalPlan::Project { input, projections } => {
             let projected_schema = compute_projected_schema(&projections, &input_schema(&input))?;
             let input = physical_from_logical(*input)?;
             let projections = projections.iter().map(physical_from_logical_expr).collect();
-            Ok(Arc::new(
-                ProjectExec::new(input, projections, projected_schema)
-            ) as Arc<dyn ExecutionPlan>)
+            Ok(
+                Arc::new(ProjectExec::new(input, projections, projected_schema))
+                    as Arc<dyn ExecutionPlan>,
+            )
         }
         LogicalPlan::Aggregate {
             input,
@@ -338,9 +337,8 @@ pub fn physical_from_logical(
             let input = physical_from_logical(*input)?;
             let group_by = group_by.iter().map(physical_from_logical_expr).collect();
             let aggs = aggs.iter().map(physical_from_logical_expr).collect();
-            Ok(Arc::new(
-                AggregateExec::new(input, group_by, aggs, schema)
-            ) as Arc<dyn ExecutionPlan>)
+            Ok(Arc::new(AggregateExec::new(input, group_by, aggs, schema))
+                as Arc<dyn ExecutionPlan>)
         }
     }
 }
@@ -356,7 +354,7 @@ fn compute_projected_schema(
                 let actual = input_schema
                     .field_with_name(f.name())
                     .ok()
-                    .or_else(|| Some(f))
+                    .or(Some(f))
                     .cloned()
                     .ok_or_else(|| {
                         PylonError::InvalidPlan(format!(
@@ -404,14 +402,16 @@ fn build_aggregate_schema(
             other => {
                 return Err(PylonError::InvalidPlan(format!(
                     "group by expression must be a column reference in M3 first cut: {other:?}"
-                )))
+                )));
             }
         };
         fields.push(f);
     }
     for (a, alias) in aggs.iter().zip(agg_aliases.iter()) {
         let field = match a {
-            LExpr::AggregateFunction { name, data_type, .. } => {
+            LExpr::AggregateFunction {
+                name, data_type, ..
+            } => {
                 // `name` carries the default `agg_name` / `agg_col` from
                 // `translate_aggregate_function`. The user alias wins if
                 // supplied.
@@ -421,7 +421,7 @@ fn build_aggregate_schema(
             _ => {
                 return Err(PylonError::InvalidPlan(format!(
                     "aggregate expression expected, got: {a:?}"
-                )))
+                )));
             }
         };
         fields.push(field);
@@ -434,25 +434,31 @@ fn build_aggregate_schema(
 /// in the schema only and not on the LExpr itself.
 fn apply_agg_aliases(aggs: Vec<LExpr>, aliases: Vec<Option<String>>) -> Vec<LExpr> {
     aggs.into_iter()
-        .zip(aliases.into_iter())
+        .zip(aliases)
         .map(|(a, alias)| match a {
-            LExpr::AggregateFunction { func, name, args, data_type, input_data_types } => {
-                LExpr::AggregateFunction {
-                    func,
-                    name: alias.unwrap_or(name),
-                    args,
-                    data_type,
-                    input_data_types,
-                }
-            }
+            LExpr::AggregateFunction {
+                func,
+                name,
+                args,
+                data_type,
+                input_data_types,
+            } => LExpr::AggregateFunction {
+                func,
+                name: alias.unwrap_or(name),
+                args,
+                data_type,
+                input_data_types,
+            },
             other => other,
         })
         .collect()
 }
 
 fn group_by_contains(group_by: &[LExpr], target: &LExpr) -> bool {
-    group_by.iter().any(|g| matches!((g, target),
-        (LExpr::Column(a), LExpr::Column(b)) if a.name() == b.name()))
+    group_by.iter().any(|g| {
+        matches!((g, target),
+        (LExpr::Column(a), LExpr::Column(b)) if a.name() == b.name())
+    })
 }
 
 fn rename_expr(e: &LExpr, _alias: &str) -> LExpr {
@@ -461,8 +467,16 @@ fn rename_expr(e: &LExpr, _alias: &str) -> LExpr {
     // uses column names from the input. To make aliases effective in
     // GROUP BY, we attach the alias as the renamed field.
     match e {
-        LExpr::Column(f) => LExpr::Column(Field::new(_alias, f.data_type().clone(), f.is_nullable())),
-        LExpr::AggregateFunction { func, name: _, args, data_type, input_data_types } => {
+        LExpr::Column(f) => {
+            LExpr::Column(Field::new(_alias, f.data_type().clone(), f.is_nullable()))
+        }
+        LExpr::AggregateFunction {
+            func,
+            name: _,
+            args,
+            data_type,
+            input_data_types,
+        } => {
             // Aggregate function alias overrides the output field name.
             LExpr::AggregateFunction {
                 func: func.clone(),
@@ -507,7 +521,7 @@ fn translate_expr(e: &AstExpr, schema: &SchemaRef) -> Result<LExpr, PylonError> 
                 _ => {
                     return Err(PylonError::InvalidPlan(format!(
                         "operator {op:?} not supported in M1"
-                    )))
+                    )));
                 }
             };
             LExpr::BinaryOp {
@@ -534,10 +548,7 @@ fn translate_expr(e: &AstExpr, schema: &SchemaRef) -> Result<LExpr, PylonError> 
 
 /// Translate `COUNT(*)`, `SUM(col)`, `MIN(col)`, `MAX(col)` (and
 /// any-DISTINCT variants) to `Expr::AggregateFunction`.
-fn translate_aggregate_function(
-    f: &Function,
-    schema: &SchemaRef,
-) -> Result<LExpr, PylonError> {
+fn translate_aggregate_function(f: &Function, schema: &SchemaRef) -> Result<LExpr, PylonError> {
     let name = f
         .name
         .0
@@ -570,21 +581,23 @@ fn translate_aggregate_function(
 
     let args_list = match &f.args {
         FunctionArguments::List(list) => &list.args,
-        FunctionArguments::None => return Err(PylonError::InvalidPlan(
-            "aggregate function called without arguments".into(),
-        )),
+        FunctionArguments::None => {
+            return Err(PylonError::InvalidPlan(
+                "aggregate function called without arguments".into(),
+            ));
+        }
         FunctionArguments::Subquery(_) => {
             return Err(PylonError::InvalidPlan(
                 "subquery arguments to aggregates not supported in M3 first cut".into(),
-            ))
-        }
-    };
-    if let FunctionArguments::List(list) = &f.args {
-        if list.duplicate_treatment.is_some() {
-            return Err(PylonError::InvalidPlan(
-                "DISTINCT inside aggregate not supported in M3 first cut".into(),
             ));
         }
+    };
+    if let FunctionArguments::List(list) = &f.args
+        && list.duplicate_treatment.is_some()
+    {
+        return Err(PylonError::InvalidPlan(
+            "DISTINCT inside aggregate not supported in M3 first cut".into(),
+        ));
     }
 
     let (args_lexpr, input_types) = match name.as_str() {
@@ -606,7 +619,7 @@ fn translate_aggregate_function(
                         _ => {
                             return Err(PylonError::InvalidPlan(
                                 "COUNT argument must be a column or *".into(),
-                            ))
+                            ));
                         }
                     };
                     (Some(le), dt)
@@ -614,10 +627,13 @@ fn translate_aggregate_function(
                 _ => {
                     return Err(PylonError::InvalidPlan(
                         "unsupported COUNT argument shape".into(),
-                    ))
+                    ));
                 }
             };
-            (le.map(|x| vec![x]).unwrap_or_default(), dt.map(|x| vec![x]).unwrap_or_default())
+            (
+                le.map(|x| vec![x]).unwrap_or_default(),
+                dt.map(|x| vec![x]).unwrap_or_default(),
+            )
         }
         "sum" | "min" | "max" => {
             if args_list.len() != 1 {
@@ -632,12 +648,12 @@ fn translate_aggregate_function(
                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
                     return Err(PylonError::InvalidPlan(format!(
                         "{name}(*) is not valid; supply a column"
-                    )))
+                    )));
                 }
                 _ => {
                     return Err(PylonError::InvalidPlan(format!(
                         "unsupported {name} argument shape"
-                    )))
+                    )));
                 }
             };
             let dt = match &le {
@@ -645,7 +661,7 @@ fn translate_aggregate_function(
                 _ => {
                     return Err(PylonError::InvalidPlan(format!(
                         "{name} argument must be a column"
-                    )))
+                    )));
                 }
             };
             if !is_numeric_or_orderable(&dt) {
@@ -658,7 +674,7 @@ fn translate_aggregate_function(
         other => {
             return Err(PylonError::InvalidPlan(format!(
                 "aggregate function {other} not supported in M3 first cut"
-            )))
+            )));
         }
     };
 
@@ -675,7 +691,7 @@ fn translate_aggregate_function(
             other => {
                 return Err(PylonError::InvalidPlan(format!(
                     "SUM does not support type {other:?} in M3 first cut"
-                )))
+                )));
             }
         },
         "min" | "max" => input_types[0].clone(),
@@ -720,34 +736,32 @@ fn is_numeric_or_orderable(dt: &DataType) -> bool {
 
 fn physical_from_logical_expr(e: &LExpr) -> Arc<dyn PhysicalExpr> {
     match e {
-        LExpr::Column(field) => Arc::new(ColumnExpr::new(0, field.clone())) as Arc<dyn PhysicalExpr>,
-        LExpr::Literal(s) => Arc::new(LiteralExpr::new(s.clone(), DataType::Utf8)) as Arc<dyn PhysicalExpr>,
-        LExpr::BinaryOp { left, op, right } => Arc::new(
-            BinaryOpExpr::new(
-                physical_from_logical_expr(left),
-                op.clone(),
-                physical_from_logical_expr(right),
-            )
-        ) as Arc<dyn PhysicalExpr>,
-        LExpr::Wildcard => Arc::new(ColumnExpr::new(
-            0,
-            Field::new("_", DataType::Null, true),
+        LExpr::Column(field) => {
+            Arc::new(ColumnExpr::new(0, field.clone())) as Arc<dyn PhysicalExpr>
+        }
+        LExpr::Literal(s) => {
+            Arc::new(LiteralExpr::new(s.clone(), DataType::Utf8)) as Arc<dyn PhysicalExpr>
+        }
+        LExpr::BinaryOp { left, op, right } => Arc::new(BinaryOpExpr::new(
+            physical_from_logical_expr(left),
+            op.clone(),
+            physical_from_logical_expr(right),
         )) as Arc<dyn PhysicalExpr>,
+        LExpr::Wildcard => Arc::new(ColumnExpr::new(0, Field::new("_", DataType::Null, true)))
+            as Arc<dyn PhysicalExpr>,
         LExpr::AggregateFunction {
             func,
             name,
             args,
             data_type,
             input_data_types,
-        } => Arc::new(
-            AggregateFunctionExpr::new(
-                func.clone(),
-                name.clone(),
-                args.iter().map(physical_from_logical_expr).collect(),
-                data_type.clone(),
-                input_data_types.clone(),
-            )
-        ) as Arc<dyn PhysicalExpr>,
+        } => Arc::new(AggregateFunctionExpr::new(
+            func.clone(),
+            name.clone(),
+            args.iter().map(physical_from_logical_expr).collect(),
+            data_type.clone(),
+            input_data_types.clone(),
+        )) as Arc<dyn PhysicalExpr>,
     }
 }
 

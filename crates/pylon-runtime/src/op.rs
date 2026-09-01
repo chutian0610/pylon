@@ -13,8 +13,8 @@
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use pylon_types::Result;
 use pylon_types::RecordBatch;
+use pylon_types::Result;
 
 #[async_trait]
 pub trait PipelineOp: Send + Sync {

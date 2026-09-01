@@ -20,9 +20,9 @@ repos:
         entry: cargo clippy --workspace --all-targets --no-deps
         language: system
         pass_filenames: false
-        # clippy currently has 22 pre-existing diagnostics on main;
-        # the local hook runs plain clippy (no -D warnings) so it
-        # stays advisory. To enforce, see the autofix PR.
+        # Clippy is now enforced in CI with -D warnings; the local
+        # hook runs without -D warnings so it stays advisory during
+        # development.
 
       - id: spi-boundary
         name: SPI boundary check

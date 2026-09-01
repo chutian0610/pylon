@@ -3,7 +3,7 @@
 
 use arrow_schema::{DataType, Field, Schema};
 use pylon_plan::logical::{Expr as LExpr, LogicalPlan};
-use pylon_plan::translate::{logical_from_sql, CatalogStub};
+use pylon_plan::translate::{CatalogStub, logical_from_sql};
 use std::sync::Arc;
 
 fn catalog() -> CatalogStub {
@@ -34,9 +34,11 @@ fn no_group_by_returns_project_node() {
 
 #[test]
 fn simple_count_star_groups() {
-    let plan =
-        logical_from_sql("SELECT region, COUNT(*) FROM orders GROUP BY region", &catalog())
-            .unwrap();
+    let plan = logical_from_sql(
+        "SELECT region, COUNT(*) FROM orders GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let agg = match plan {
         LogicalPlan::Aggregate { group_by, aggs, .. } => {
             assert_eq!(group_by.len(), 1, "one group_by col");
@@ -51,7 +53,12 @@ fn simple_count_star_groups() {
         other => panic!("expected Column for group_by, got {other:?}"),
     }
     match &aggs[0] {
-        LExpr::AggregateFunction { name, args, data_type, .. } => {
+        LExpr::AggregateFunction {
+            name,
+            args,
+            data_type,
+            ..
+        } => {
             assert_eq!(name, "count");
             assert!(args.is_empty(), "COUNT(*) has no args");
             assert_eq!(*data_type, DataType::Int64);
@@ -62,14 +69,22 @@ fn simple_count_star_groups() {
 
 #[test]
 fn count_with_column_keeps_arg_type() {
-    let plan =
-        logical_from_sql("SELECT region, COUNT(amount) FROM orders GROUP BY region", &catalog())
-            .unwrap();
+    let plan = logical_from_sql(
+        "SELECT region, COUNT(amount) FROM orders GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let LogicalPlan::Aggregate { aggs, schema, .. } = plan else {
         panic!("expected Aggregate");
     };
     match &aggs[0] {
-        LExpr::AggregateFunction { func, name, args, input_data_types, .. } => {
+        LExpr::AggregateFunction {
+            func,
+            name,
+            args,
+            input_data_types,
+            ..
+        } => {
             assert_eq!(func, "count", "function name");
             assert_eq!(name, "count_amount", "default field name");
             assert_eq!(args.len(), 1, "COUNT(amount) has 1 arg");
@@ -99,21 +114,33 @@ fn sum_min_max_with_aliases() {
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     assert_eq!(
         names,
-        vec!["region".to_string(), "total".to_string(), "lo".to_string(), "hi".to_string()],
+        vec![
+            "region".to_string(),
+            "total".to_string(),
+            "lo".to_string(),
+            "hi".to_string()
+        ],
         "aliased names take precedence over agg_name_col defaults"
     );
     let types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
     assert_eq!(
         types,
-        vec![&DataType::Utf8, &DataType::Float64, &DataType::Int64, &DataType::Int64]
+        vec![
+            &DataType::Utf8,
+            &DataType::Float64,
+            &DataType::Int64,
+            &DataType::Int64
+        ]
     );
 }
 
 #[test]
 fn no_alias_uses_agg_name_col_naming() {
-    let plan =
-        logical_from_sql("SELECT region, SUM(amount) FROM orders GROUP BY region", &catalog())
-            .unwrap();
+    let plan = logical_from_sql(
+        "SELECT region, SUM(amount) FROM orders GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let LogicalPlan::Aggregate { schema, .. } = plan else {
         panic!("expected Aggregate");
     };
@@ -122,9 +149,11 @@ fn no_alias_uses_agg_name_col_naming() {
 
 #[test]
 fn count_star_uses_count_naming() {
-    let plan =
-        logical_from_sql("SELECT region, COUNT(*) FROM orders GROUP BY region", &catalog())
-            .unwrap();
+    let plan = logical_from_sql(
+        "SELECT region, COUNT(*) FROM orders GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let LogicalPlan::Aggregate { schema, .. } = plan else {
         panic!("expected Aggregate");
     };
@@ -233,28 +262,27 @@ fn sum_on_unsupported_type_is_rejected() {
     )
     .unwrap_err();
     assert!(
-        err.to_string().to_lowercase().contains("sum does not support"),
+        err.to_string()
+            .to_lowercase()
+            .contains("sum does not support"),
         "SUM on Utf8 should be rejected, got: {err}"
     );
 }
 
 #[test]
 fn aggregate_in_group_by_is_rejected() {
-    let err = logical_from_sql(
-        "SELECT COUNT(*) FROM orders GROUP BY COUNT(*)",
-        &catalog(),
-    )
-    .unwrap_err();
+    let err =
+        logical_from_sql("SELECT COUNT(*) FROM orders GROUP BY COUNT(*)", &catalog()).unwrap_err();
     assert!(
-        err.to_string().contains("aggregate functions are not allowed in GROUP BY"),
+        err.to_string()
+            .contains("aggregate functions are not allowed in GROUP BY"),
         "got: {err}"
     );
 }
 
 #[test]
 fn select_star_with_group_by_is_rejected() {
-    let err =
-        logical_from_sql("SELECT * FROM orders GROUP BY region", &catalog()).unwrap_err();
+    let err = logical_from_sql("SELECT * FROM orders GROUP BY region", &catalog()).unwrap_err();
     assert!(
         err.to_string().contains("incompatible with GROUP BY"),
         "got: {err}"

@@ -10,9 +10,9 @@
 //! `run_per_op_task_legacy` + `run_legacy_op`) was removed in
 //! R5-pre: it was dead code in any test that the repo runs today.
 
-use crate::pipeline::{run_pipeline_single_thread, Pipeline};
-use pylon_types::Result as PylonResult;
+use crate::pipeline::{Pipeline, run_pipeline_single_thread};
 use pylon_types::RecordBatch;
+use pylon_types::Result as PylonResult;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::info;

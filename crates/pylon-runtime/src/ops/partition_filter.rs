@@ -21,17 +21,17 @@ pub struct PartitionFilterOp {
 
 impl PartitionFilterOp {
     pub fn new(col_name: String, literal: &str) -> Result<Self> {
-        let (p_str, n_str) = literal
-            .split_once('|')
-            .ok_or_else(|| pylon_types::PylonError::InvalidPlan(
-                format!("PartitionFilter literal must be 'p|n', got: {literal}")
-            ))?;
-        let partition: i64 = p_str.parse().map_err(|e: std::num::ParseIntError|
+        let (p_str, n_str) = literal.split_once('|').ok_or_else(|| {
+            pylon_types::PylonError::InvalidPlan(format!(
+                "PartitionFilter literal must be 'p|n', got: {literal}"
+            ))
+        })?;
+        let partition: i64 = p_str.parse().map_err(|e: std::num::ParseIntError| {
             pylon_types::PylonError::InvalidPlan(format!("partition not int: {e}"))
-        )?;
-        let modulus: i64 = n_str.parse().map_err(|e: std::num::ParseIntError|
+        })?;
+        let modulus: i64 = n_str.parse().map_err(|e: std::num::ParseIntError| {
             pylon_types::PylonError::InvalidPlan(format!("modulus not int: {e}"))
-        )?;
+        })?;
         Ok(Self {
             col_name,
             partition,
@@ -49,17 +49,28 @@ impl PipelineOp for PartitionFilterOp {
     }
 
     async fn add_input(&mut self, batch: RecordBatch) -> Result<()> {
-        if batch.num_rows() == 0 { return Ok(()); }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         // Find the column index
-        let idx = batch.schema().fields().iter().position(|f| f.name() == &self.col_name)
-            .ok_or_else(|| pylon_types::PylonError::InvalidPlan(
-                format!("PartitionFilter: column {} not found", self.col_name)
-            ))?;
+        let idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == &self.col_name)
+            .ok_or_else(|| {
+                pylon_types::PylonError::InvalidPlan(format!(
+                    "PartitionFilter: column {} not found",
+                    self.col_name
+                ))
+            })?;
         let col = batch.column(idx);
-        let arr = col.as_any().downcast_ref::<Int64Array>()
-            .ok_or_else(|| pylon_types::PylonError::InvalidPlan(
-                format!("PartitionFilter: column {} not int64", self.col_name)
-            ))?;
+        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            pylon_types::PylonError::InvalidPlan(format!(
+                "PartitionFilter: column {} not int64",
+                self.col_name
+            ))
+        })?;
         let mask: Vec<bool> = (0..batch.num_rows())
             .map(|r| arr.value(r) % self.modulus == self.partition)
             .collect();

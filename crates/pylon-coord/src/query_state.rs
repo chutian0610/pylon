@@ -90,12 +90,7 @@ impl QueryStateMachine {
 
     /// Register a freshly-dispatched stage. Wakes any later
     /// `wait_for_stage_done` as soon as the last task acks.
-    pub fn register_stage(
-        &self,
-        query_id: QueryId,
-        stage_id: StageId,
-        task_ids: Vec<TaskId>,
-    ) {
+    pub fn register_stage(&self, query_id: QueryId, stage_id: StageId, task_ids: Vec<TaskId>) {
         let (notifier, was_empty) = {
             let mut g = self.inner.lock().unwrap();
             let entry = g.expected.entry((query_id, stage_id)).or_default();
@@ -104,7 +99,10 @@ impl QueryStateMachine {
                 entry.insert(tid);
             }
             g.acked.entry((query_id, stage_id)).or_default();
-            let state = g.state.entry((query_id, stage_id)).or_insert(StageState::Pending);
+            let state = g
+                .state
+                .entry((query_id, stage_id))
+                .or_insert(StageState::Pending);
             if !matches!(state, StageState::Pending) {
                 // Already-running stage (rare — re-registration); preserve.
             }
@@ -129,13 +127,7 @@ impl QueryStateMachine {
     /// (or `TASK_FAILED`) is seen. Wakes any
     /// `wait_for_stage_done` future if this ack completed the
     /// stage.
-    pub fn ack_task(
-        &self,
-        query_id: QueryId,
-        stage_id: StageId,
-        task_id: TaskId,
-        ack: TaskAck,
-    ) {
+    pub fn ack_task(&self, query_id: QueryId, stage_id: StageId, task_id: TaskId, ack: TaskAck) {
         let notifier = {
             let mut g = self.inner.lock().unwrap();
             g.acked
@@ -149,9 +141,7 @@ impl QueryStateMachine {
             if let Some(s) = new_state {
                 g.state.insert((query_id, stage_id), s);
             }
-            g.notifiers
-                .get(&(query_id, stage_id))
-                .cloned()
+            g.notifiers.get(&(query_id, stage_id)).cloned()
         };
         if let Some(n) = notifier {
             n.notify_waiters();
@@ -160,11 +150,7 @@ impl QueryStateMachine {
 
     /// Read-only view of the current state of one stage.
     /// `None` = unknown (no `register_stage` was called yet).
-    pub fn stage_state(
-        &self,
-        query_id: QueryId,
-        stage_id: StageId,
-    ) -> Option<StageState> {
+    pub fn stage_state(&self, query_id: QueryId, stage_id: StageId) -> Option<StageState> {
         let g = self.inner.lock().unwrap();
         g.state.get(&(query_id, stage_id)).copied()
     }
@@ -210,9 +196,7 @@ impl QueryStateMachine {
             if failures > 0 {
                 return Err(PylonError::Internal(format!(
                     "stage ({}, {}) had {} failed task(s)",
-                    query_id.0,
-                    stage_id.0,
-                    failures
+                    query_id.0, stage_id.0, failures
                 )));
             }
             // Done if every expected task has acked.
@@ -231,11 +215,7 @@ impl QueryStateMachine {
             if elapsed >= deadline {
                 return Err(PylonError::Internal(format!(
                     "stage ({}, {}) timed out after {:?} ({}/{} acked)",
-                    query_id.0,
-                    stage_id.0,
-                    deadline,
-                    acked_count,
-                    expected_count
+                    query_id.0, stage_id.0, deadline, acked_count, expected_count
                 )));
             }
             let remaining = deadline.saturating_sub(elapsed);

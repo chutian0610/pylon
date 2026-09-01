@@ -4,8 +4,8 @@
 //! in batch_size chunks.
 
 use crate::op::PipelineOp;
-use async_trait::async_trait;
 use arrow_array::RecordBatch;
+use async_trait::async_trait;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pylon_types::{PylonError, Result};
 use std::fs::File;
@@ -46,19 +46,21 @@ impl PipelineOp for SeqScanOp {
     async fn get_output(&mut self) -> Result<Option<RecordBatch>> {
         if self.batches.is_empty() {
             let file = File::open(&self.path)?;
-            let builder =
-                ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                    PylonError::Parquet(format!("build reader: {e}"))
-                })?;
-            let reader = builder.with_batch_size(self.batch_size).build().map_err(|e| {
-                PylonError::Parquet(format!("with batch size: {e}"))
-            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| PylonError::Parquet(format!("build reader: {e}")))?;
+            let reader = builder
+                .with_batch_size(self.batch_size)
+                .build()
+                .map_err(|e| PylonError::Parquet(format!("with batch size: {e}")))?;
             for batch in reader {
-                self.batches.push(batch.map_err(|e| {
-                    PylonError::Parquet(format!("read batch: {e}"))
-                })?);
+                self.batches
+                    .push(batch.map_err(|e| PylonError::Parquet(format!("read batch: {e}")))?);
             }
-            debug!("SeqScan: loaded {} batches from {}", self.batches.len(), self.path);
+            debug!(
+                "SeqScan: loaded {} batches from {}",
+                self.batches.len(),
+                self.path
+            );
         }
         if let Some(b) = self.batches.get(self.next).cloned() {
             self.next += 1;

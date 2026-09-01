@@ -11,9 +11,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
-use pylon_plan::physical::exec::{
-    AggregateExec, ExecutionPlan, FilterExec, SeqScanExec,
-};
+use pylon_plan::physical::exec::{AggregateExec, ExecutionPlan, FilterExec, SeqScanExec};
 use pylon_plan::physical::expr::{
     AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr,
 };
@@ -41,11 +39,7 @@ fn filter_scan() -> Arc<dyn ExecutionPlan> {
     let id_col: Arc<dyn PhysicalExpr> =
         Arc::new(ColumnExpr::new(0, input.schema().field(0).clone()));
     let five: Arc<dyn PhysicalExpr> = Arc::new(LiteralExpr::new("5", DataType::Utf8));
-    let pred: Arc<dyn PhysicalExpr> = Arc::new(BinaryOpExpr::new(
-        id_col,
-        ">".to_string(),
-        five,
-    ));
+    let pred: Arc<dyn PhysicalExpr> = Arc::new(BinaryOpExpr::new(id_col, ">".to_string(), five));
     let schema = input.schema();
     Arc::new(FilterExec::new(input, pred, schema))
 }
@@ -109,7 +103,10 @@ fn plan_with_aggregate_cuts_boundary_at_aggregate() {
         default_partition_count: 4,
     });
     let dag = f.fragment(&plan, 99, &["test_addr".to_string()]).unwrap();
-    assert_eq!(op_names(&dag, 0), vec!["SeqScan", "Filter", "ExchangeSinkRpc"]);
+    assert_eq!(
+        op_names(&dag, 0),
+        vec!["SeqScan", "Filter", "ExchangeSinkRpc"]
+    );
     let s1_names = op_names(&dag, 1);
     assert_eq!(s1_names.len(), 8, "4 sources + 4 aggregates");
     assert_eq!(&s1_names[..4], &["ExchangeSource"; 4]);
@@ -165,8 +162,14 @@ fn aggregate_op_spec_carries_partition_keys_and_agg_specs() {
         .iter()
         .find(|o| o.name == "Aggregate")
         .expect("Aggregate op present");
-    assert_eq!(agg.config.get("group_by_cols").map(|s| s.as_str()), Some("name"));
-    assert_eq!(agg.config.get("agg_specs").map(|s| s.as_str()), Some("count()"));
+    assert_eq!(
+        agg.config.get("group_by_cols").map(|s| s.as_str()),
+        Some("name")
+    );
+    assert_eq!(
+        agg.config.get("agg_specs").map(|s| s.as_str()),
+        Some("count()")
+    );
 }
 
 #[test]

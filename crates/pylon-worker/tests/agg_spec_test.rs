@@ -12,7 +12,10 @@ use pylon_runtime::ops::AggSpec;
 fn parse_agg_specs(specs: &str) -> Vec<AggSpec> {
     let mut out = Vec::new();
     for spec in specs.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if let Some(inner) = spec.strip_prefix("count(").and_then(|s| s.strip_suffix(")")) {
+        if let Some(inner) = spec
+            .strip_prefix("count(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
             if !inner.is_empty() {
                 panic!("count() takes no arguments; got count({inner})");
             }

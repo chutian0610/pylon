@@ -17,9 +17,9 @@ fn main() {
         if samples.len() < 3 && b.num_rows() > 0 {
             let cols = b.columns();
             for r in 0..b.num_rows().min(3) {
-                let row: Vec<String> = (0..cols.len()).map(|c| {
-                    arrow_value_to_string(&cols[c], r)
-                }).collect();
+                let row: Vec<String> = (0..cols.len())
+                    .map(|c| arrow_value_to_string(&cols[c], r))
+                    .collect();
                 samples.push(row);
             }
         }
@@ -41,10 +41,30 @@ fn arrow_value_to_string(col: &std::sync::Arc<dyn arrow_array::Array>, r: usize)
         return "NULL".to_string();
     }
     match col.data_type() {
-        DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().unwrap().value(r).to_string(),
-        DataType::Float64 => col.as_any().downcast_ref::<Float64Array>().unwrap().value(r).to_string(),
-        DataType::Utf8 => col.as_any().downcast_ref::<StringArray>().unwrap().value(r).to_string(),
-        DataType::Boolean => col.as_any().downcast_ref::<BooleanArray>().unwrap().value(r).to_string(),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(r)
+            .to_string(),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(r)
+            .to_string(),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(r)
+            .to_string(),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(r)
+            .to_string(),
         dt => format!("<{dt:?}>"),
     }
 }

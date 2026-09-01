@@ -12,22 +12,20 @@
 //! scheduler logic. The gRPC / HTTP transport and `pylon-coord` binary
 //! come in M2 weeks 1-2.
 
-pub mod query;
-pub mod query_state;
-pub mod stage;
-pub mod task;
-pub mod scheduler;
 pub mod discovery;
 pub mod fragment;
+pub mod query;
+pub mod query_state;
+pub mod scheduler;
+pub mod stage;
+pub mod task;
 
-pub use query::{Query, QueryId, QueryState};
-pub use query_state::{QueryStateMachine, StageState, TaskAck};
-pub use stage::{
-    Fragment, OpSpec, Stage, StageDag, StageId, Distribution, DEFAULT_PARTITION_COUNT,
-};
-pub use task::{ExchangeKind, ExchangeSpec, Partition, TaskId, TaskSpec};
-pub use scheduler::{
-    CapacityScheduler, Scheduler, WorkerAddr, WorkerCapacity, WorkerId,
-};
 pub use discovery::{Discovery, RegisteredWorker};
 pub use fragment::{Fragmenter, FragmenterConfig};
+pub use query::{Query, QueryId, QueryState};
+pub use query_state::{QueryStateMachine, StageState, TaskAck};
+pub use scheduler::{CapacityScheduler, Scheduler, WorkerAddr, WorkerCapacity, WorkerId};
+pub use stage::{
+    DEFAULT_PARTITION_COUNT, Distribution, Fragment, OpSpec, Stage, StageDag, StageId,
+};
+pub use task::{ExchangeKind, ExchangeSpec, Partition, TaskId, TaskSpec};

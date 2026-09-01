@@ -17,7 +17,11 @@ fn schema_a() -> SchemaRef {
 }
 
 fn schema_b() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "other",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 fn batch_a(rows: i64) -> RecordBatch {

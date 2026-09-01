@@ -11,8 +11,8 @@ use std::time::Duration;
 use arrow_array::{Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use pylon_exchange::FlightDescriptor;
-use pylon_runtime::ops::{ExchangeSinkRpc, ExchangeSourceOp, RpcTarget};
 use pylon_runtime::PipelineOp;
+use pylon_runtime::ops::{ExchangeSinkRpc, ExchangeSourceOp, RpcTarget};
 
 fn sample_batch(rows: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -20,9 +20,7 @@ fn sample_batch(rows: i64) -> RecordBatch {
         Field::new("amount", DataType::Float64, true),
     ]));
     let ids = Int64Array::from((0..rows).collect::<Vec<_>>());
-    let amounts = Float64Array::from(
-        (0..rows).map(|i| i as f64 * 2.5).collect::<Vec<_>>()
-    );
+    let amounts = Float64Array::from((0..rows).map(|i| i as f64 * 2.5).collect::<Vec<_>>());
     RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(amounts)]).unwrap()
 }
 
@@ -77,14 +75,8 @@ async fn exchange_isolates_descriptors() {
     };
     // n_partitions = 1 each: every row hashes to partition 0, so
     // each sink routes the whole batch to its single target.
-    let mut sink_a = ExchangeSinkRpc::new_partitioned(
-        vec![target_a],
-        vec!["id".into()],
-    );
-    let mut sink_b = ExchangeSinkRpc::new_partitioned(
-        vec![target_b],
-        vec!["id".into()],
-    );
+    let mut sink_a = ExchangeSinkRpc::new_partitioned(vec![target_a], vec!["id".into()]);
+    let mut sink_b = ExchangeSinkRpc::new_partitioned(vec![target_b], vec!["id".into()]);
     sink_a.add_input(sample_batch(10)).await.unwrap();
     sink_b.add_input(sample_batch(20)).await.unwrap();
     sink_a.no_more_input().await.unwrap();

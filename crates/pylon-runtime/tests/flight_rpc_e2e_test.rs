@@ -27,9 +27,7 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use pylon_exchange::{FlightDescriptor, FlightServerImpl, PylonFlightService};
-use pylon_runtime::ops::{
-    AggSpec, ExchangeSinkRpc, ExchangeSourceOp, HashAggregateOp, RpcTarget,
-};
+use pylon_runtime::ops::{AggSpec, ExchangeSinkRpc, ExchangeSourceOp, HashAggregateOp, RpcTarget};
 use pylon_runtime::{Driver, Pipeline, PipelineOp};
 use std::io::Cursor;
 use tokio::net::TcpListener;
@@ -50,17 +48,23 @@ fn sample_schema() -> SchemaRef {
 fn mk_batch(n: usize) -> RecordBatch {
     let schema = sample_schema();
     let ids = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-    let names = StringArray::from(
-        (0..n).map(|i| format!("name_{i:05}")).collect::<Vec<_>>(),
-    );
+    let names = StringArray::from((0..n).map(|i| format!("name_{i:05}")).collect::<Vec<_>>());
     let amounts = Float64Array::from((0..n).map(|i| i as f64).collect::<Vec<_>>());
-    RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names), Arc::new(amounts)]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(names), Arc::new(amounts)],
+    )
+    .unwrap()
 }
 
 /// Start one in-process Arrow Flight server. Returns
 /// `(bound_addr, service_arc)`. The server is dropped (and the
 /// listener closed) when the returned `JoinHandle` is aborted.
-async fn start_flight_server() -> (SocketAddr, Arc<PylonFlightService>, tokio::task::JoinHandle<()>) {
+async fn start_flight_server() -> (
+    SocketAddr,
+    Arc<PylonFlightService>,
+    tokio::task::JoinHandle<()>,
+) {
     let service = Arc::new(PylonFlightService::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind flight");
     let addr = listener.local_addr().expect("local_addr");
@@ -140,12 +144,9 @@ async fn two_in_process_flight_servers_exchange_real_dopexchange() {
     // ---- Act: drive each server's pipeline [ExchangeSource ->
     // HashAggregate] via the real Driver. We collect the final
     // batches and union them.
-    let descs_a: Vec<String> = (0..4).filter(|p| p % 2 == 0).map(|p| descriptor_for(p)).collect();
-    let descs_b: Vec<String> = (0..4).filter(|p| p % 2 == 1).map(|p| descriptor_for(p)).collect();
-    async fn run_agg(
-        service: Arc<PylonFlightService>,
-        descs: Vec<String>,
-    ) -> Vec<RecordBatch> {
+    let descs_a: Vec<String> = (0..4).filter(|p| p % 2 == 0).map(descriptor_for).collect();
+    let descs_b: Vec<String> = (0..4).filter(|p| p % 2 == 1).map(descriptor_for).collect();
+    async fn run_agg(service: Arc<PylonFlightService>, descs: Vec<String>) -> Vec<RecordBatch> {
         let mut out = Vec::new();
         for d in descs {
             let source = Box::new(ExchangeSourceOp::new(
@@ -196,7 +197,8 @@ async fn two_in_process_flight_servers_exchange_real_dopexchange() {
         "all 1024 distinct names should be aggregated exactly once across both servers"
     );
     assert_eq!(
-        name_count.len() as i64, n_rows as i64,
+        name_count.len() as i64,
+        n_rows as i64,
         "all 1024 distinct names should appear in the aggregate result"
     );
     // Every name should have count = 1 (each name appears once in
