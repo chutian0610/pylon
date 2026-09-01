@@ -19,7 +19,7 @@ use pylon_connector_spi::{ConnectorPage, ConnectorResult, DataSink, DataSource, 
 
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use once_cell::sync::Lazy;
 use pylon_types::{ConnectorError, ConnectorErrorCode, PylonError, Result};
 
