@@ -148,7 +148,7 @@ pub async fn run_pipeline_single_thread(
             for i in 0..n_ops.saturating_sub(1) {
                 let drain = op_states[i].output_buf.len();
                 if drain > 0 {
-                    let drained: Vec<RecordBatch> = op_states[i].output_buf.drain(..).collect();
+                    let drained: Vec<RecordBatch> = std::mem::take(&mut op_states[i].output_buf);
                     op_states[i + 1].input_buf.extend(drained);
                     progressed = true;
                 }
