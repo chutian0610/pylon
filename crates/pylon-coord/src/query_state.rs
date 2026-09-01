@@ -94,6 +94,15 @@ pub struct QueryStateMachine {
 }
 
 impl QueryStateMachine {
+    /// Poisoning-tolerant lock: if any thread panicked while holding
+    /// the mutex, the guarded state may be mid-mutation but the coord
+    /// stays up (C5.6). A poisoned panic here should be extremely
+    /// rare; a hard `.unwrap()` would take every later request down
+    /// with it.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Build a fresh state machine, wrapped in `Arc` so it can
     /// be cloned into both the dispatcher and the open_session
     /// handler tasks.
@@ -105,7 +114,7 @@ impl QueryStateMachine {
     /// `wait_for_stage_done` as soon as the last task acks.
     pub fn register_stage(&self, query_id: QueryId, stage_id: StageId, task_ids: Vec<TaskId>) {
         let (notifier, was_empty) = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.lock_inner();
             let entry = g.expected.entry((query_id, stage_id)).or_default();
             let was_empty = entry.is_empty() && task_ids.is_empty();
             for tid in task_ids {
@@ -144,7 +153,7 @@ impl QueryStateMachine {
     /// stalled handle for the task.
     pub fn ack_task(&self, query_id: QueryId, stage_id: StageId, task_id: TaskId, ack: TaskAck) {
         let notifier = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.lock_inner();
             match &ack {
                 TaskAck::Stalled { spill_handle } => {
                     *g.attempts.entry((query_id, stage_id)).or_insert(0) += 1;
@@ -180,14 +189,14 @@ impl QueryStateMachine {
     /// Read-only view of the current state of one stage.
     /// `None` = unknown (no `register_stage` was called yet).
     pub fn stage_state(&self, query_id: QueryId, stage_id: StageId) -> Option<StageState> {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock_inner();
         g.state.get(&(query_id, stage_id)).copied()
     }
 
     /// Returns how many times tasks in this stage have acked
     /// `Stalled` (i.e. the coord-side retry counter).
     pub fn attempt_count(&self, query_id: QueryId, stage_id: StageId) -> u32 {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock_inner();
         g.attempts.get(&(query_id, stage_id)).copied().unwrap_or(0)
     }
 
@@ -199,7 +208,7 @@ impl QueryStateMachine {
         stage_id: StageId,
         task_id: TaskId,
     ) -> Option<SpillHandle> {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock_inner();
         g.stalled
             .get(&(query_id, stage_id))
             .and_then(|m| m.get(&task_id))
@@ -212,7 +221,7 @@ impl QueryStateMachine {
         query_id: QueryId,
         stage_id: StageId,
     ) -> Vec<(TaskId, SpillHandle)> {
-        let g = self.inner.lock().unwrap();
+        let g = self.lock_inner();
         g.stalled
             .get(&(query_id, stage_id))
             .map(|m| m.iter().map(|(t, h)| (*t, h.clone())).collect())
@@ -228,7 +237,7 @@ impl QueryStateMachine {
         stage_id: StageId,
         task_id: TaskId,
     ) -> Option<SpillHandle> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_inner();
         g.stalled
             .get_mut(&(query_id, stage_id))
             .and_then(|m| m.remove(&task_id))
@@ -244,11 +253,36 @@ impl QueryStateMachine {
         task_id: TaskId,
         handle: SpillHandle,
     ) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_inner();
         g.stalled
             .entry((query_id, stage_id))
             .or_default()
             .insert(task_id, handle);
+    }
+
+    /// Drops every per-(stage, task) entry for `query_id`. The coord
+    /// calls this once the query reaches a terminal state so a
+    /// long-lived process does not accumulate stale bookkeeping
+    /// (C5.6). Returns the number of stage entries removed.
+    pub fn remove_query(&self, query_id: QueryId) -> usize {
+        let mut g = self.lock_inner();
+        let mut removed = 0;
+        let keys: Vec<(QueryId, StageId)> = g
+            .expected
+            .keys()
+            .filter(|(q, _)| *q == query_id)
+            .copied()
+            .collect();
+        for key in keys {
+            g.expected.remove(&key);
+            g.acked.remove(&key);
+            g.state.remove(&key);
+            g.attempts.remove(&key);
+            g.stalled.remove(&key);
+            g.notifiers.remove(&key);
+            removed += 1;
+        }
+        removed
     }
 
     /// Await stage-done (or timeout). Returns `Ok(())` once every
@@ -266,7 +300,7 @@ impl QueryStateMachine {
         deadline: Duration,
     ) -> Result<(), PylonError> {
         let notifier = {
-            let g = self.inner.lock().unwrap();
+            let g = self.lock_inner();
             g.notifiers
                 .get(&(query_id, stage_id))
                 .cloned()
@@ -276,7 +310,7 @@ impl QueryStateMachine {
         loop {
             // Re-check state under lock.
             let (expected_count, acked_count, failures, _stalled_count, _current) = {
-                let g = self.inner.lock().unwrap();
+                let g = self.lock_inner();
                 let expected = g.expected.get(&(query_id, stage_id));
                 let acked = g.acked.get(&(query_id, stage_id));
                 (
@@ -572,6 +606,51 @@ mod tests {
         let again = qsm.stalled_handle(q(1), s(1), t(1));
         assert!(again.is_some(), "handle restored");
         assert_eq!(again.unwrap().path, PathBuf::from("/tmp/spill-take.arrow"));
+    }
+
+    #[test]
+    fn remove_query_drops_all_stage_bookkeeping() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1), t(2)]);
+        qsm.register_stage(q(1), s(2), vec![t(3)]);
+        qsm.ack_task(q(1), s(1), t(1), TaskAck::Done);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(2),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/spill-rm.arrow"),
+            },
+        );
+        assert_eq!(qsm.attempt_count(q(1), s(1)), 1);
+
+        // A different query's stage must survive the cleanup.
+        qsm.register_stage(q(2), s(1), vec![t(9)]);
+
+        let removed = qsm.remove_query(q(1));
+        assert_eq!(removed, 2, "both stages of q1 dropped");
+        assert_eq!(qsm.stage_state(q(1), s(1)), None);
+        assert_eq!(qsm.stage_state(q(1), s(2)), None);
+        assert_eq!(qsm.attempt_count(q(1), s(1)), 0);
+        assert!(qsm.stalled_handle(q(1), s(1), t(2)).is_none());
+        assert_eq!(qsm.stage_state(q(2), s(1)), Some(StageState::Pending));
+    }
+
+    /// C5.6: a panic that poisons the inner mutex must not wedge
+    /// every later request behind `.unwrap()`.
+    #[test]
+    fn poisoned_mutex_still_locks() {
+        let qsm = QueryStateMachine::new();
+        let clone = qsm.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = clone.lock_inner();
+            panic!("deliberate poison");
+        }));
+        assert!(result.is_err(), "inner panic expected");
+        // The mutex is now poisoned; lock_inner recovers instead of
+        // panicking and the state machine remains usable.
+        qsm.register_stage(q(3), s(1), vec![t(1)]);
+        assert_eq!(qsm.stage_state(q(3), s(1)), Some(StageState::Pending));
     }
 
     #[tokio::test(flavor = "current_thread")]

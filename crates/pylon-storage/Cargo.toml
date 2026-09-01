@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 object_store = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

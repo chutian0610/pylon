@@ -87,6 +87,14 @@ struct CoordState {
     task_specs: Mutex<HashMap<u64, pylon_proto::pylon::TaskSpec>>,
 }
 
+/// Poisoning-tolerant mutex lock (C5.6). The coord is a
+/// long-lived service: a panic that poisons a `CoordState` mutex
+/// must degrade that query's state consistency, not wedge every
+/// future request behind an `.unwrap()`.
+fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
@@ -174,7 +182,7 @@ async fn submit_query(
         },
         Err(e) => {
             warn!(query_id = %qid_str, "plan_dispatch failed: {e:?}");
-            let mut qmap = state.queries.lock().unwrap();
+            let mut qmap = lock_ok(&state.queries);
             if let Some(q) = qmap.get_mut(&qid) {
                 q.state = QueryState::Failed;
                 q.error = Some(format!("{e:?}"));
@@ -212,7 +220,7 @@ async fn get_query(
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
     let qid = QueryId(qid_num);
-    let status_opt = state.queries.lock().unwrap().get(&qid).cloned();
+    let status_opt = lock_ok(&state.queries).get(&qid).cloned();
 
     if let Some(s) = status_opt {
         let total: usize = s.rows.iter().map(|b| b.num_rows()).sum();
@@ -265,7 +273,7 @@ fn format_row(b: &arrow_array::RecordBatch, r: usize) -> String {
 }
 
 async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse {
-    let workers = state.workers.lock().unwrap();
+    let workers = lock_ok(&state.workers);
     let list: Vec<_> = workers
         .iter()
         .map(|(id, h)| {
@@ -308,7 +316,7 @@ async fn retry_watcher(
             let Some(handle) = state.state_machine.clear_stalled(qid, sid, tid) else {
                 continue;
             };
-            let spec = state.task_specs.lock().unwrap().get(&tid.0).cloned();
+            let spec = lock_ok(&state.task_specs).get(&tid.0).cloned();
             let Some(mut spec) = spec else {
                 continue;
             };
@@ -323,7 +331,7 @@ async fn retry_watcher(
                 }
             }
             let workers: Vec<Arc<WorkerHandle>> =
-                state.workers.lock().unwrap().values().cloned().collect();
+                lock_ok(&state.workers).values().cloned().collect();
             let Some(worker) = workers.get(tid.0 as usize % workers.len().max(1)).cloned() else {
                 // No worker available; put the handle back for the
                 // next pass.
@@ -390,7 +398,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
     };
 
     // 2. Get registered workers
-    let workers: Vec<Arc<WorkerHandle>> = state.workers.lock().unwrap().values().cloned().collect();
+    let workers: Vec<Arc<WorkerHandle>> = lock_ok(&state.workers).values().cloned().collect();
     if workers.is_empty() {
         anyhow::bail!("no workers registered");
     }
@@ -521,7 +529,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             .insert(stage0.id, stage0.clone());
         // Save stage0 task ID for the polling task to drain.
         {
-            let mut qmap = state.queries.lock().unwrap();
+            let mut qmap = lock_ok(&state.queries);
             info!(stage = 0, qid = ?qid, qmap_len = qmap.len(), keys = ?qmap.keys().collect::<Vec<_>>(), "save stage0_task_id");
             if let Some(q) = qmap.get_mut(&qid) {
                 q.stage0_task_id = Some(stage0.id);
@@ -579,11 +587,14 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                 query_id = stage0_qid.0, stage_id = stage0_stage_id, error = %e,
                 "stage 0 ack failed; aborting stage 1 dispatch"
             );
-            let mut qmap = state_for_send.queries.lock().unwrap();
+            let mut qmap = lock_ok(&state_for_send.queries);
             if let Some(q) = qmap.get_mut(&stage0_qid) {
                 q.state = pylon_coord::query::QueryState::Failed;
                 q.error = Some(format!("stage 0: {e}"));
             }
+            // C5.6: terminal query — drop QSM bookkeeping so a
+            // long-lived coord does not accumulate stale maps.
+            state_for_send.state_machine.remove_query(stage0_qid);
             return;
         }
         info!(
@@ -695,11 +706,13 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                         query_id = stage1_qid.0, stage_id = stage1_sid.0, error = %e,
                         "stage 1 ack failed; result set will be partial"
                     );
-                    let mut qmap = state_for_send.queries.lock().unwrap();
+                    let mut qmap = lock_ok(&state_for_send.queries);
                     if let Some(q) = qmap.get_mut(&stage1_qid) {
                         q.state = pylon_coord::query::QueryState::Failed;
                         q.error = Some(format!("stage 1: {e}"));
                     }
+                    // C5.6: terminal query — drop QSM bookkeeping.
+                    state_for_send.state_machine.remove_query(stage1_qid);
                 } else {
                     info!(
                         query_id = stage1_qid.0,
@@ -711,7 +724,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             // Save the dispatched task IDs for the result-drain step
             // below so we know which completed maps to consult.
             {
-                let mut qmap = state_for_send.queries.lock().unwrap();
+                let mut qmap = lock_ok(&state_for_send.queries);
                 if let Some(q) = qmap.get_mut(&pylon_coord::QueryId(qid_u64_for_spawn)) {
                     q.stage1_task_ids = dispatched_ids.clone();
                 }
@@ -724,7 +737,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
         let state_inner = state_for_send.clone();
         // Read the dispatched task IDs we saved earlier.
         let (stage0_task_id, stage1_task_ids): (Option<u64>, Vec<u64>) = {
-            let qmap = state_inner.queries.lock().unwrap();
+            let qmap = lock_ok(&state_inner.queries);
             let result = qmap
                 .get(&pylon_coord::QueryId(qid_inner))
                 .map(|q| (q.stage0_task_id, q.stage1_task_ids.clone()))
@@ -747,10 +760,10 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             }
             task_ids.extend(stage1_task_ids.iter().copied());
             {
-                let workers_lock = state_inner.workers.lock().unwrap();
+                let workers_lock = lock_ok(&state_inner.workers);
                 let mut seen = 0usize;
                 for w in workers_lock.values() {
-                    let comp = w.completed.lock().unwrap();
+                    let comp = lock_ok(&w.completed);
                     for tid in &task_ids {
                         if let Some(batches) = comp.get(tid) {
                             for b in batches {
@@ -769,12 +782,14 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     "aggregated task results"
                 );
             }
-            let mut qmap = state_inner.queries.lock().unwrap();
+            let mut qmap = lock_ok(&state_inner.queries);
             if let Some(s) = qmap.get_mut(&qid_q) {
                 s.rows = all_batches;
                 s.schema = schema;
                 s.state = pylon_coord::query::QueryState::Done;
             }
+            // C5.6: terminal query — drop QSM bookkeeping.
+            state_inner.state_machine.remove_query(qid_q);
         });
     });
 
@@ -988,7 +1003,7 @@ impl Worker for CoordGrpc {
             completed: completed.clone(),
             flight_addr,
         });
-        self.state.workers.lock().unwrap().insert(worker_id, handle);
+        lock_ok(&self.state.workers).insert(worker_id, handle);
         info!(worker_id = worker_id.0, "registered");
 
         // Capture handles the spawned inbound task needs without
@@ -1006,7 +1021,7 @@ impl Worker for CoordGrpc {
                         // proto change; the worker already publishes
                         // TASK_DONE / TASK_FAILED on every task; we
                         // just count and wake.
-                        let loc = state.task_locs.lock().unwrap().get(&tid).copied();
+                        let loc = lock_ok(&state.task_locs).get(&tid).copied();
                         match (resp.state, loc) {
                             (1, Some((qid, sid))) => {
                                 state.state_machine.ack_task(
