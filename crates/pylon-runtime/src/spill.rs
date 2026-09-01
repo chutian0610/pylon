@@ -108,11 +108,9 @@ impl SpillManager {
         schema: SchemaRef,
     ) -> Result<Box<dyn DataSink>> {
         if let Some(store) = s3 {
-            Ok(Box::new(S3DataSink::new(
-                store.clone(),
-                path.to_string_lossy(),
-                schema,
-            )))
+            let sink = S3DataSink::new(store.clone(), path.to_string_lossy(), schema)
+                .map_err(pylon_types::PylonError::from)?;
+            Ok(Box::new(sink))
         } else {
             create_spill_sink(path, schema).map_err(pylon_types::PylonError::from)
         }
