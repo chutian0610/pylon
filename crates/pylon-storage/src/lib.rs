@@ -8,6 +8,8 @@
 //! C4 (M4.S4) swaps the backing store for `object_store`-based
 //! `s3://` without touching the `DataSink` / `DataSource` surface.
 
+pub mod s3;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};

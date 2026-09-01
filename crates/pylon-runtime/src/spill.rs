@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use pylon_connector_spi::ConnectorPage;
+use pylon_connector_spi::{ConnectorPage, DataSink, DataSource};
+use pylon_storage::s3::{S3DataSink, S3DataSource, S3SpillStore};
 use pylon_storage::{create_spill_sink, create_spill_source, delete_spill};
 use pylon_types::Result;
 use tracing::debug;
@@ -57,25 +58,43 @@ pub trait Spillable {
     async fn resume(&mut self, manager: &SpillManager, handle: SpillHandle) -> Result<()>;
 }
 
-/// File-system-backed spill manager. Single-process, single-host for
-/// S2; the S3+ connector-backed `DataSink`-based path will subsume
-/// this for distributed spill.
+/// Spill manager with pluggable storage backend. `SpillManager::new`
+/// uses the local file system; `SpillManager::with_s3` routes spill
+/// bytes to an S3-compatible object store (RFC 0007 §5 M4.S4).
 #[derive(Debug)]
 pub struct SpillManager {
     root: PathBuf,
     next_seq: AtomicUsize,
+    s3: Option<S3SpillStore>,
 }
 
 impl SpillManager {
-    /// Construct a manager that writes spill files under `root`.
-    /// The directory is created if it doesn't exist.
+    /// Construct a local-FS manager that writes spill files under
+    /// `root`. The directory is created if it doesn't exist.
     pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             next_seq: AtomicUsize::new(0),
+            s3: None,
         })
+    }
+
+    /// Construct an S3-backed manager. `root` is the object-key
+    /// prefix (e.g. `pylon-spill/q42/stage0/task0`); spill files land
+    /// at `${root}/spill-<seq>.arrow` inside the bucket.
+    pub fn with_s3(root: impl Into<PathBuf>, store: S3SpillStore) -> Self {
+        Self {
+            root: root.into(),
+            next_seq: AtomicUsize::new(0),
+            s3: Some(store),
+        }
+    }
+
+    /// Returns `true` if this manager writes to S3.
+    pub fn is_s3(&self) -> bool {
+        self.s3.is_some()
     }
 
     /// Returns the directory under which spill files live.
@@ -92,13 +111,26 @@ impl SpillManager {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let path = self.root.join(format!("spill-{seq}.arrow"));
 
-        let mut sink = create_spill_sink(&path, schema).map_err(pylon_types::PylonError::from)?;
-        for b in batches {
-            sink.append(ConnectorPage::new(b.clone()))
-                .map_err(pylon_types::PylonError::from)?;
-        }
-        let stats = sink.finish().map_err(pylon_types::PylonError::from)?;
-        let bytes = stats.bytes();
+        let bytes = if let Some(store) = &self.s3 {
+            let mut sink = S3DataSink::new(store.clone(), path.to_string_lossy(), schema);
+            for b in batches {
+                sink.append(ConnectorPage::new(b.clone()))
+                    .map_err(pylon_types::PylonError::from)?;
+            }
+            sink.finish()
+                .map_err(pylon_types::PylonError::from)?
+                .bytes()
+        } else {
+            let mut sink =
+                create_spill_sink(&path, schema).map_err(pylon_types::PylonError::from)?;
+            for b in batches {
+                sink.append(ConnectorPage::new(b.clone()))
+                    .map_err(pylon_types::PylonError::from)?;
+            }
+            sink.finish()
+                .map_err(pylon_types::PylonError::from)?
+                .bytes()
+        };
         debug!(?path, seq, bytes, "spilled");
         Ok(SpillHandle { path, bytes, seq })
     }
@@ -106,11 +138,19 @@ impl SpillManager {
     /// Read back batches from a spill file through the connector
     /// `DataSource` (RFC 0007 §2 rule [b]).
     pub fn read(&self, handle: &SpillHandle) -> Result<Vec<RecordBatch>> {
-        let mut source =
-            create_spill_source(&handle.path).map_err(pylon_types::PylonError::from)?;
         let mut batches: Vec<RecordBatch> = Vec::new();
-        while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
-            batches.push(page.into_batch());
+        if let Some(store) = &self.s3 {
+            let mut source = S3DataSource::new(store.clone(), handle.path.to_string_lossy())
+                .map_err(pylon_types::PylonError::from)?;
+            while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
+                batches.push(page.into_batch());
+            }
+        } else {
+            let mut source =
+                create_spill_source(&handle.path).map_err(pylon_types::PylonError::from)?;
+            while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
+                batches.push(page.into_batch());
+            }
         }
         debug!(?handle.path, count = batches.len(), "spill resumed");
         Ok(batches)
@@ -118,7 +158,13 @@ impl SpillManager {
 
     /// Unlink a spill file. Idempotent: missing file is not an error.
     pub fn delete(&self, handle: &SpillHandle) -> Result<()> {
-        delete_spill(&handle.path)
+        if let Some(store) = &self.s3 {
+            store
+                .delete(&handle.path.to_string_lossy())
+                .map_err(pylon_types::PylonError::from)
+        } else {
+            delete_spill(&handle.path)
+        }
     }
 }
 
