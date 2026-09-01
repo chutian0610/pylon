@@ -44,6 +44,10 @@ message TaskResponse {
   bytes batch = 4;
 
   string message = 5;  // for FAILED: error msg
+
+  // For STALLED: storage key of the spill file the coord should
+  // pass to the retried attempt (RFC 0007 §3.5). Empty otherwise.
+  string spill_handle = 6;
 }
 
 enum TaskState {
@@ -51,6 +55,7 @@ enum TaskState {
   TASK_DONE = 1;
   TASK_FAILED = 2;
   TASK_CANCELLED = 3;
+  TASK_STALLED = 4;
 }
 
 // ---- Shared message types ----

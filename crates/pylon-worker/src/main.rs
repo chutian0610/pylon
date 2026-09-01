@@ -150,6 +150,7 @@ async fn run(
                         rows_emitted: batch.num_rows() as u64,
                         batch: bytes,
                         message: String::new(),
+                        spill_handle: String::new(),
                     };
                     if out_tx.send(resp).await.is_err() {
                         warn!("coord stream closed mid-batch");
@@ -164,6 +165,7 @@ async fn run(
                     rows_emitted: emitted,
                     batch: Vec::new(),
                     message: String::new(),
+                    spill_handle: String::new(),
                 };
                 if out_tx.send(done_resp).await.is_err() {
                     return Ok(());
@@ -177,6 +179,7 @@ async fn run(
                     rows_emitted: 0,
                     batch: Vec::new(),
                     message: format!("{e:?}"),
+                    spill_handle: String::new(),
                 };
                 let _ = out_tx.send(fail).await;
                 warn!(task_id, "task failed: {e:?}");

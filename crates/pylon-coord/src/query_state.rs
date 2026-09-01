@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::query::QueryId;
 use crate::stage::StageId;
 use crate::task::TaskId;
+use pylon_runtime::spill::SpillHandle;
 use pylon_types::PylonError;
 use tokio::sync::Notify;
 
@@ -42,10 +43,16 @@ pub enum StageState {
 /// Acknowledgement from a worker for one task. Pushed into the
 /// per-(query, stage) ack set from `OpenSession`'s inbound
 /// `TaskResponse` stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Stalled` (RFC 0007 §3.5) means the task hit a recoverable spill
+/// boundary: the coord records the spill handle and re-dispatches.
+/// It is neither Done nor Failed — the stage keeps waiting for the
+/// retried attempt's terminal ack.
+#[derive(Debug, Clone)]
 pub enum TaskAck {
     Done,
     Failed,
+    Stalled { spill_handle: SpillHandle },
 }
 
 #[derive(Default)]
@@ -56,6 +63,12 @@ struct Inner {
     acked: HashMap<(QueryId, StageId), HashMap<TaskId, TaskAck>>,
     /// Per-stage: most-recent computed `StageState`.
     state: HashMap<(QueryId, StageId), StageState>,
+    /// Per-(query, stage): retry counter. Incremented each time any
+    /// task in the stage acks `Stalled` (RFC 0007 §3.5).
+    attempts: HashMap<(QueryId, StageId), u32>,
+    /// Per-(query, stage, task): most recent spill handle from a
+    /// `Stalled` ack. Cleared when the retry acks terminal state.
+    stalled: HashMap<(QueryId, StageId), HashMap<TaskId, SpillHandle>>,
     /// Per-stage: one `Notify` so `wait_for_stage_done` can park
     /// until an ack arrives (or the deadline fires).
     notifiers: HashMap<(QueryId, StageId), Arc<Notify>>,
@@ -124,12 +137,28 @@ impl QueryStateMachine {
 
     /// Mark a task acked. Called from the coord's `OpenSession`
     /// handler when an inbound `TaskResponse.state == TASK_DONE`
-    /// (or `TASK_FAILED`) is seen. Wakes any
-    /// `wait_for_stage_done` future if this ack completed the
-    /// stage.
+    /// (or `TASK_FAILED` / `TASK_STALLED`) is seen. A `Stalled`
+    /// ack bumps the stage attempt counter, records the spill
+    /// handle, and wakes waiters; the stage itself keeps waiting
+    /// for the retried attempt. Terminal acks clear any prior
+    /// stalled handle for the task.
     pub fn ack_task(&self, query_id: QueryId, stage_id: StageId, task_id: TaskId, ack: TaskAck) {
         let notifier = {
             let mut g = self.inner.lock().unwrap();
+            match &ack {
+                TaskAck::Stalled { spill_handle } => {
+                    *g.attempts.entry((query_id, stage_id)).or_insert(0) += 1;
+                    g.stalled
+                        .entry((query_id, stage_id))
+                        .or_default()
+                        .insert(task_id, spill_handle.clone());
+                }
+                TaskAck::Done | TaskAck::Failed => {
+                    if let Some(stage_stalled) = g.stalled.get_mut(&(query_id, stage_id)) {
+                        stage_stalled.remove(&task_id);
+                    }
+                }
+            }
             g.acked
                 .entry((query_id, stage_id))
                 .or_default()
@@ -153,6 +182,41 @@ impl QueryStateMachine {
     pub fn stage_state(&self, query_id: QueryId, stage_id: StageId) -> Option<StageState> {
         let g = self.inner.lock().unwrap();
         g.state.get(&(query_id, stage_id)).copied()
+    }
+
+    /// Returns how many times tasks in this stage have acked
+    /// `Stalled` (i.e. the coord-side retry counter).
+    pub fn attempt_count(&self, query_id: QueryId, stage_id: StageId) -> u32 {
+        let g = self.inner.lock().unwrap();
+        g.attempts.get(&(query_id, stage_id)).copied().unwrap_or(0)
+    }
+
+    /// Returns the most recent spill handle for a stalled task, if
+    /// one is pending retry.
+    pub fn stalled_handle(
+        &self,
+        query_id: QueryId,
+        stage_id: StageId,
+        task_id: TaskId,
+    ) -> Option<SpillHandle> {
+        let g = self.inner.lock().unwrap();
+        g.stalled
+            .get(&(query_id, stage_id))
+            .and_then(|m| m.get(&task_id))
+            .cloned()
+    }
+
+    /// Returns all pending (task, handle) pairs for a stage.
+    pub fn stalled_handles(
+        &self,
+        query_id: QueryId,
+        stage_id: StageId,
+    ) -> Vec<(TaskId, SpillHandle)> {
+        let g = self.inner.lock().unwrap();
+        g.stalled
+            .get(&(query_id, stage_id))
+            .map(|m| m.iter().map(|(t, h)| (*t, h.clone())).collect())
+            .unwrap_or_default()
     }
 
     /// Await stage-done (or timeout). Returns `Ok(())` once every
@@ -179,7 +243,7 @@ impl QueryStateMachine {
         let start = Instant::now();
         loop {
             // Re-check state under lock.
-            let (expected_count, acked_count, failures, _current) = {
+            let (expected_count, acked_count, failures, _stalled_count, _current) = {
                 let g = self.inner.lock().unwrap();
                 let expected = g.expected.get(&(query_id, stage_id));
                 let acked = g.acked.get(&(query_id, stage_id));
@@ -188,6 +252,13 @@ impl QueryStateMachine {
                     acked.map(|m| m.len()).unwrap_or(0),
                     acked
                         .map(|m| m.values().filter(|a| matches!(a, TaskAck::Failed)).count())
+                        .unwrap_or(0),
+                    acked
+                        .map(|m| {
+                            m.values()
+                                .filter(|a| matches!(a, TaskAck::Stalled { .. }))
+                                .count()
+                        })
                         .unwrap_or(0),
                     g.state.get(&(query_id, stage_id)).copied(),
                 )
@@ -241,7 +312,12 @@ fn compute_state(
             if failures > 0 {
                 return Some(StageState::Failed);
             }
-            let all_done = e.iter().all(|tid| a.contains_key(tid));
+            // Only terminal `Done` acks count toward completion; a
+            // `Stalled` ack means the task is pending retry (the
+            // retried attempt will overwrite this entry later).
+            let all_done = e
+                .iter()
+                .all(|tid| matches!(a.get(tid), Some(TaskAck::Done)));
             if all_done {
                 Some(StageState::Done)
             } else if !a.is_empty() {
@@ -257,6 +333,7 @@ fn compute_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn q(n: u64) -> QueryId {
         QueryId(n)
@@ -365,6 +442,102 @@ mod tests {
         qsm.ack_task(q(2), s(1), t(300), TaskAck::Done);
         assert_eq!(qsm.stage_state(q(2), s(1)), Some(StageState::Done));
         assert_eq!(qsm.stage_state(q(1), s(2)), Some(StageState::Pending));
+    }
+
+    fn handle(path: &str) -> SpillHandle {
+        SpillHandle {
+            path: PathBuf::from(path),
+            bytes: 42,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn stalled_ack_records_handle_and_bumps_attempt() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1)]);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(1),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/spill-0.arrow"),
+            },
+        );
+        assert_eq!(qsm.attempt_count(q(1), s(1)), 1);
+        let got = qsm.stalled_handle(q(1), s(1), t(1));
+        assert!(got.is_some(), "expected stalled handle");
+        let got = got.unwrap();
+        assert_eq!(got.path, PathBuf::from("/tmp/spill-0.arrow"));
+        assert_eq!(got.bytes, 42);
+        // Stalled is neither Done nor Failed: stage stays Running.
+        assert_eq!(qsm.stage_state(q(1), s(1)), Some(StageState::Running));
+    }
+
+    #[test]
+    fn retry_terminal_ack_clears_stalled_handle() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1)]);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(1),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/spill-0.arrow"),
+            },
+        );
+        // Retried attempt acks Done.
+        qsm.ack_task(q(1), s(1), t(1), TaskAck::Done);
+        assert_eq!(
+            qsm.attempt_count(q(1), s(1)),
+            1,
+            "attempt counter preserved"
+        );
+        assert!(qsm.stalled_handle(q(1), s(1), t(1)).is_none());
+        assert_eq!(qsm.stage_state(q(1), s(1)), Some(StageState::Done));
+    }
+
+    #[test]
+    fn stalled_does_not_mark_stage_done() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1), t(2)]);
+        qsm.ack_task(q(1), s(1), t(1), TaskAck::Done);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(2),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/spill-1.arrow"),
+            },
+        );
+        // Every task has *an* ack, but t(2)'s is Stalled — the stage
+        // must not report Done until the retry lands.
+        assert_eq!(qsm.stage_state(q(1), s(1)), Some(StageState::Running));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_resolves_after_stalled_then_done() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1)]);
+        let qsm2 = qsm.clone();
+        tokio::spawn(async move {
+            qsm2.ack_task(
+                q(1),
+                s(1),
+                t(1),
+                TaskAck::Stalled {
+                    spill_handle: handle("/tmp/spill-retry.arrow"),
+                },
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Retried attempt succeeds.
+            qsm2.ack_task(q(1), s(1), t(1), TaskAck::Done);
+        });
+        let res = qsm
+            .wait_for_stage_done(q(1), s(1), Duration::from_secs(5))
+            .await;
+        assert!(res.is_ok(), "expected Ok after stall+retry, got {:?}", res);
+        assert_eq!(qsm.attempt_count(q(1), s(1)), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

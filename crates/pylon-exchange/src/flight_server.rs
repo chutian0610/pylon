@@ -51,4 +51,16 @@ impl PylonFlightService {
         let streams = self.streams.lock().await;
         streams.get(&descriptor.0).map(|q| q.len()).unwrap_or(0)
     }
+
+    /// Total rows across all batches currently queued for
+    /// `descriptor`. Deterministic drain barrier: once this reaches
+    /// the producer's total output rows, every upstream batch has
+    /// landed and downstream stages can start safely.
+    pub async fn pending_rows(&self, descriptor: &FlightDescriptor) -> usize {
+        let streams = self.streams.lock().await;
+        streams
+            .get(&descriptor.0)
+            .map(|q| q.iter().map(|b| b.num_rows()).sum())
+            .unwrap_or(0)
+    }
 }
