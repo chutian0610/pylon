@@ -228,6 +228,8 @@ pub trait DataSource: Send {
     /// Implementations back-pressure via the memory pool: when
     /// `pool.try_grow(target)` returns Err, return pending and the
     /// driver will re-poll after downstream drains.
+    /// (M4.S1 note: `MemoryPool` also exposes `release(bytes)` as
+    /// an explicit additive method; see RFC 0007 §3.1.)
     fn next(&mut self) -> ConnectorResult<Option<ConnectorPage>>;
     fn estimated_row_size(&self) -> usize;
     fn completed_bytes(&self) -> u64 { 0 }

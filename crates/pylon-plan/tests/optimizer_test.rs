@@ -11,10 +11,9 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use pylon_plan::logical::LogicalPlan;
 use pylon_plan::optimizer::LogicalOptimizer;
 use pylon_plan::physical::exec::ExecutionPlan;
-use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
+use pylon_plan::translate::{CatalogStub, logical_from_sql, physical_from_logical};
 
 fn catalog() -> CatalogStub {
     let mut c = CatalogStub::new();
@@ -39,9 +38,11 @@ fn optimizer_pushes_filter_through_unused_projection_columns() {
 
 #[test]
 fn optimizer_runs_idempotently_on_a_simple_aggregate_query() {
-    let logical =
-        logical_from_sql("SELECT region, COUNT(*) FROM orders GROUP BY region", &catalog())
-            .unwrap();
+    let logical = logical_from_sql(
+        "SELECT region, COUNT(*) FROM orders GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let optimizer = LogicalOptimizer::with_default_rules();
     let (plan1, ctx1) = optimizer.optimize(logical).unwrap();
     // Running the optimizer twice is a no-op the second time.
@@ -69,9 +70,11 @@ fn optimizer_preserves_schema_after_rewrite() {
     // post-aggregate shape after optimization. PredicatePushdown
     // through Aggregate (when pred uses group_by col) should
     // not corrupt the Aggregate's schema field.
-    let logical =
-        logical_from_sql("SELECT region, COUNT(*) FROM orders WHERE region = 'us' GROUP BY region", &catalog())
-            .unwrap();
+    let logical = logical_from_sql(
+        "SELECT region, COUNT(*) FROM orders WHERE region = 'us' GROUP BY region",
+        &catalog(),
+    )
+    .unwrap();
     let optimizer = LogicalOptimizer::with_default_rules();
     let (optimized, _) = optimizer.optimize(logical).unwrap();
     // The optimized plan still lowers cleanly.
@@ -81,14 +84,17 @@ fn optimizer_preserves_schema_after_rewrite() {
     // a count column.
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert!(names.contains(&"region"));
-    assert!(names.iter().any(|n| n.contains("count") || n.contains("COUNT") || n == &"count"),
-        "expected a count column in {names:?}");
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("count") || n.contains("COUNT") || n == &"count"),
+        "expected a count column in {names:?}"
+    );
 }
 
 #[test]
 fn optimizer_with_empty_rule_list_returns_input_unchanged() {
-    let logical =
-        logical_from_sql("SELECT id FROM orders WHERE id > 5", &catalog()).unwrap();
+    let logical = logical_from_sql("SELECT id FROM orders WHERE id > 5", &catalog()).unwrap();
     let optimizer = LogicalOptimizer::new(vec![]);
     let (out, ctx) = optimizer.optimize(logical.clone()).unwrap();
     assert_eq!(out, logical);

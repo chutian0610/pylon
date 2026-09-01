@@ -2,20 +2,18 @@
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use futures::StreamExt;
-use pylon_coord::query::{QueryId, QueryState};
 use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
+use pylon_coord::query::{QueryId, QueryState};
 use pylon_coord::scheduler::WorkerId;
-use pylon_plan::translate::{logical_from_sql, physical_from_logical, CatalogStub};
-use pylon_proto::pylon::{
-    TaskRequest, TaskResponse,
-};
+use pylon_plan::translate::{CatalogStub, logical_from_sql, physical_from_logical};
+use pylon_proto::pylon::{TaskRequest, TaskResponse};
 use pylon_proto::worker_server::{Worker, WorkerServer};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as AstExpr, Statement, Value};
@@ -29,8 +27,6 @@ use tracing::{debug, info, trace, warn};
 
 const HTTP_PORT: u16 = 8080;
 const GRPC_PORT: u16 = 9090;
-const DEFAULT_PARTITION_COUNT: usize = 4;
-
 struct QueryStatus {
     state: QueryState,
     rows: Vec<arrow_array::RecordBatch>,
@@ -103,8 +99,14 @@ async fn main() -> Result<()> {
     });
 
     let grpc = tonic::transport::Server::builder()
-        .add_service(WorkerServer::new(CoordGrpc { state: state.clone() }))
-        .serve(format!("0.0.0.0:{GRPC_PORT}").parse().context("grpc addr")?);
+        .add_service(WorkerServer::new(CoordGrpc {
+            state: state.clone(),
+        }))
+        .serve(
+            format!("0.0.0.0:{GRPC_PORT}")
+                .parse()
+                .context("grpc addr")?,
+        );
 
     let app = Router::new()
         .route("/v1/query", post(submit_query))
@@ -144,19 +146,27 @@ async fn submit_query(
 
     // M3 B-3.5: insert the entry BEFORE plan_and_dispatch so the
     // polling task spawned inside it can read stage0_task_id.
-    state.queries.lock().unwrap().entry(qid).or_insert(QueryStatus {
-        state: QueryState::Running,
-        rows: vec![],
-        schema: None,
-        error: None,
-        stage0_task_id: None,
-        stage1_task_ids: vec![],
-    });
+    state
+        .queries
+        .lock()
+        .unwrap()
+        .entry(qid)
+        .or_insert(QueryStatus {
+            state: QueryState::Running,
+            rows: vec![],
+            schema: None,
+            error: None,
+            stage0_task_id: None,
+            stage1_task_ids: vec![],
+        });
     let result = plan_and_dispatch(state.clone(), qid, &req.sql).await;
 
     let success = result.is_ok();
     let body = match result {
-        Ok(_) => QuerySubmitted { query_id: qid_str.clone(), state: "running".into() },
+        Ok(_) => QuerySubmitted {
+            query_id: qid_str.clone(),
+            state: "running".into(),
+        },
         Err(e) => {
             warn!(query_id = %qid_str, "plan_dispatch failed: {e:?}");
             let mut qmap = state.queries.lock().unwrap();
@@ -164,11 +174,18 @@ async fn submit_query(
                 q.state = QueryState::Failed;
                 q.error = Some(format!("{e:?}"));
             }
-            QuerySubmitted { query_id: qid_str.clone(), state: "failed".into() }
+            QuerySubmitted {
+                query_id: qid_str.clone(),
+                state: "failed".into(),
+            }
         }
     };
 
-    let code = if success { StatusCode::ACCEPTED } else { StatusCode::INTERNAL_SERVER_ERROR };
+    let code = if success {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
     Ok((code, Json(body)))
 }
 
@@ -185,23 +202,38 @@ async fn get_query(
     State(state): State<Arc<CoordState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let qid_num = id.strip_prefix("q-").and_then(|s| u64::from_str_radix(s, 16).ok()).unwrap_or(0);
+    let qid_num = id
+        .strip_prefix("q-")
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
     let qid = QueryId(qid_num);
     let status_opt = state.queries.lock().unwrap().get(&qid).cloned();
 
     if let Some(s) = status_opt {
         let total: usize = s.rows.iter().map(|b| b.num_rows()).sum();
-        let preview: Vec<_> = s.rows.iter().take(8).flat_map(|b| (0..b.num_rows())
-            .map(move |r| format_row(b, r))).collect();
-        (StatusCode::OK, Json(serde_json::json!({
-            "query_id": id,
-            "state": format!("{:?}", s.state).to_lowercase(),
-            "rows_total": total,
-            "rows_preview": preview,
-            "error": s.error,
-        }))).into_response()
+        let preview: Vec<_> = s
+            .rows
+            .iter()
+            .take(8)
+            .flat_map(|b| (0..b.num_rows()).map(move |r| format_row(b, r)))
+            .collect();
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "query_id": id,
+                "state": format!("{:?}", s.state).to_lowercase(),
+                "rows_total": total,
+                "rows_preview": preview,
+                "error": s.error,
+            })),
+        )
+            .into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response()
     }
 }
 
@@ -211,11 +243,17 @@ fn format_row(b: &arrow_array::RecordBatch, r: usize) -> String {
     for c in 0..b.num_columns() {
         let col = b.column(c);
         let key = b.schema().field(c).name().clone();
-        let val = if col.is_null(r) { "NULL".to_string() }
-        else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() { a.value(r).to_string() }
-        else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() { a.value(r).to_string() }
-        else if let Some(a) = col.as_any().downcast_ref::<StringArray>() { a.value(r).to_string() }
-        else { "<?>".to_string() };
+        let val = if col.is_null(r) {
+            "NULL".to_string()
+        } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            a.value(r).to_string()
+        } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+            a.value(r).to_string()
+        } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            a.value(r).to_string()
+        } else {
+            "<?>".to_string()
+        };
         parts.push(format!("{key}={val}"));
     }
     parts.join(", ")
@@ -223,21 +261,20 @@ fn format_row(b: &arrow_array::RecordBatch, r: usize) -> String {
 
 async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse {
     let workers = state.workers.lock().unwrap();
-    let list: Vec<_> = workers.iter().map(|(id, h)| {
-        serde_json::json!({
-            "id": id.0,
-            "tx_capacity": h.tx.capacity(),
-            "flight_addr": h.flight_addr,
+    let list: Vec<_> = workers
+        .iter()
+        .map(|(id, h)| {
+            serde_json::json!({
+                "id": id.0,
+                "tx_capacity": h.tx.capacity(),
+                "flight_addr": h.flight_addr,
+            })
         })
-    }).collect();
+        .collect();
     (StatusCode::OK, Json(serde_json::json!({"workers": list}))).into_response()
 }
 
-async fn plan_and_dispatch(
-    state: Arc<CoordState>,
-    qid: QueryId,
-    sql: &str,
-) -> Result<()> {
+async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> Result<()> {
     // 1. Parse SQL to PhysicalPlan
     let stmt = parse_sql(sql).context("sql parse")?;
     let query = match stmt {
@@ -249,22 +286,17 @@ async fn plan_and_dispatch(
         _ => anyhow::bail!("only SELECT body"),
     };
 
-    let table = body.from.first()
+    let table = body
+        .from
+        .first()
         .map(|t| t.relation.to_string())
         .unwrap_or_else(|| "sample".into());
 
     let mut columns: Vec<String> = Vec::new();
     for item in &body.projection {
         if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
-            match e {
-                AstExpr::Identifier(ident) => {
-                    columns.push(ident.value.clone());
-                }
-                // Skip aggregate functions / wildcards in the
-                // projection — pylon-plan's logical_from_sql
-                // handles those. We just want to know which input
-                // columns are needed.
-                _ => {}
+            if let AstExpr::Identifier(ident) = e {
+                columns.push(ident.value.clone());
             }
         } else if let sqlparser::ast::SelectItem::Wildcard(_) = item {
             // SELECT * — include all columns
@@ -332,14 +364,20 @@ async fn plan_and_dispatch(
         }
     };
     // Use 2 partitions for M3 first cut cross-worker demo.
-    let fragmenter = Fragmenter::new(FragmenterConfig { default_partition_count: 2, ..Default::default() });
+    let fragmenter = Fragmenter::new(FragmenterConfig {
+        default_partition_count: 2,
+    });
     let dag = match fragmenter.fragment(&physical_plan, qid_u64, &worker_flight_addrs) {
         Ok(d) => d,
         Err(e) => {
             return Err(anyhow::anyhow!("fragment: {e:?}"));
         }
     };
-    info!(query_id = qid_u64, stages = dag.stages.len(), "fragmented plan");
+    info!(
+        query_id = qid_u64,
+        stages = dag.stages.len(),
+        "fragmented plan"
+    );
     let (stage0_ops, stage1_tasks) = split_dag_for_dispatch(&dag);
 
     // M3 tail — PR1 (B3): the dispatcher is the authoritative
@@ -376,7 +414,7 @@ async fn plan_and_dispatch(
         id: qid_u64.wrapping_mul(1000).wrapping_add(1),
         query_id: qid_u64,
         stage_id: 1,
-        partition: 0,                    // Single task per worker; concurrency on workers side
+        partition: 0, // Single task per worker; concurrency on workers side
         fragment: Some(pylon_proto::pylon::Fragment {
             ops: stage0_ops.clone(),
             distribution: pylon_proto::pylon::Distribution::DistribSingle as i32,
@@ -392,10 +430,11 @@ async fn plan_and_dispatch(
     //    driven by stage0's ExchangeSinkRpc targeting each worker's
     //    flight_addr).
     if let Some(w) = workers.first() {
-        w.tx
-            .send(TaskRequest { spec: Some(stage0.clone()) })
-            .await
-            .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
+        w.tx.send(TaskRequest {
+            spec: Some(stage0.clone()),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
         info!(stage = 0, worker = 0, "stage0 dispatched");
         // Save stage0 task ID for the polling task to drain.
         {
@@ -427,13 +466,15 @@ async fn plan_and_dispatch(
         let stage0_qid = pylon_coord::QueryId(stage0_qid_for_register);
         let stage0_sid = pylon_coord::StageId(stage0_stage_id);
         state_for_send.state_machine.register_stage(
-            stage0_qid, stage0_sid,
+            stage0_qid,
+            stage0_sid,
             vec![pylon_coord::TaskId(stage0_task_id_for_register)],
         );
-        state_for_send.task_locs.lock().unwrap().insert(
-            stage0_task_id_for_register,
-            (stage0_qid, stage0_sid),
-        );
+        state_for_send
+            .task_locs
+            .lock()
+            .unwrap()
+            .insert(stage0_task_id_for_register, (stage0_qid, stage0_sid));
         let stage0_wait = state_for_send
             .state_machine
             .wait_for_stage_done(stage0_qid, stage0_sid, stage0_deadline)
@@ -450,7 +491,11 @@ async fn plan_and_dispatch(
             }
             return;
         }
-        info!(query_id = stage0_qid.0, stage_id = stage0_stage_id, "stage 0 acked");
+        info!(
+            query_id = stage0_qid.0,
+            stage_id = stage0_stage_id,
+            "stage 0 acked"
+        );
         // After Stage 0: dispatch each stage1 partition task to a
         // worker (round-robin: partition p → worker p % n_workers).
         // Stage 1 tasks are pre-registered with the QSM so we can
@@ -458,7 +503,11 @@ async fn plan_and_dispatch(
         let mut dispatched_ids: Vec<u64> = Vec::new();
         let mut stage1_register_ids: Vec<pylon_coord::TaskId> = Vec::new();
         if stage1_tasks_clone.is_empty() {
-            info!(stage = 1, query_id = stage0_qid.0, "no stage1 tasks (non-aggregate query)");
+            info!(
+                stage = 1,
+                query_id = stage0_qid.0,
+                "no stage1 tasks (non-aggregate query)"
+            );
         } else {
             let n_workers = workers_snapshot.len().max(1);
             let stage1_qid = stage0_qid;
@@ -489,8 +538,11 @@ async fn plan_and_dispatch(
                     sinks: vec![],
                     memory_budget_bytes: 256 * 1024 * 1024,
                 };
-                if worker.tx
-                    .send(TaskRequest { spec: Some(task_spec.clone()) })
+                if worker
+                    .tx
+                    .send(TaskRequest {
+                        spec: Some(task_spec.clone()),
+                    })
                     .await
                     .is_err()
                 {
@@ -501,13 +553,20 @@ async fn plan_and_dispatch(
                 // the inbound open_session handler can resolve
                 // TaskResponse.task_id → (qid, sid) and the
                 // follow-up wait sees the full expected set.
-                state_for_send.task_locs.lock().unwrap().insert(
-                    stage1_task_id,
-                    (stage1_qid, stage1_sid),
-                );
+                state_for_send
+                    .task_locs
+                    .lock()
+                    .unwrap()
+                    .insert(stage1_task_id, (stage1_qid, stage1_sid));
                 stage1_register_ids.push(pylon_coord::TaskId(stage1_task_id));
                 dispatched_ids.push(stage1_task_id);
-                info!(stage = 1, partition = p, worker = worker_idx, task_id = stage1_task_id, "stage1 dispatched");
+                info!(
+                    stage = 1,
+                    partition = p,
+                    worker = worker_idx,
+                    task_id = stage1_task_id,
+                    "stage1 dispatched"
+                );
             }
             if !stage1_register_ids.is_empty() {
                 state_for_send.state_machine.register_stage(
@@ -530,7 +589,11 @@ async fn plan_and_dispatch(
                         q.error = Some(format!("stage 1: {e}"));
                     }
                 } else {
-                    info!(query_id = stage1_qid.0, stage_id = stage1_sid.0, "stage 1 acked");
+                    info!(
+                        query_id = stage1_qid.0,
+                        stage_id = stage1_sid.0,
+                        "stage 1 acked"
+                    );
                 }
             }
             // Save the dispatched task IDs for the result-drain step
@@ -567,7 +630,9 @@ async fn plan_and_dispatch(
             let qid_q = pylon_coord::QueryId(qid_inner);
             // Collect all task IDs to drain (stage0 + stage1).
             let mut task_ids: Vec<u64> = Vec::new();
-            if let Some(t) = stage0_task_id { task_ids.push(t); }
+            if let Some(t) = stage0_task_id {
+                task_ids.push(t);
+            }
             task_ids.extend(stage1_task_ids.iter().copied());
             {
                 let workers_lock = state_inner.workers.lock().unwrap();
@@ -604,7 +669,6 @@ async fn plan_and_dispatch(
     Ok(())
 }
 
-
 /// stage1 task op lists). M3 B-3.5: stage0 is always 1 task (the
 /// Fragmenter emits a single stage0 task with N
 /// ExchangeSink[Rpc] targets). Stage 1 has N partitioned tasks;
@@ -612,7 +676,10 @@ async fn plan_and_dispatch(
 /// as a flat `stage1_ops` list with the [source, agg] pair layout).
 fn split_dag_for_dispatch(
     dag: &pylon_coord::StageDag,
-) -> (Vec<pylon_proto::pylon::OpSpec>, Vec<Vec<pylon_proto::pylon::OpSpec>>) {
+) -> (
+    Vec<pylon_proto::pylon::OpSpec>,
+    Vec<Vec<pylon_proto::pylon::OpSpec>>,
+) {
     let to_proto = |op: &pylon_coord::stage::OpSpec| pylon_proto::pylon::OpSpec {
         name: op.name.clone(),
         config: op.config.clone(),
@@ -675,8 +742,7 @@ fn rewrite_exchange_targets_in_place(
         // that contract — an empty list still produces a
         // syntactically valid semicolon-joined string for the
         // length-mismatch check downstream.
-        std::iter::repeat(String::new())
-            .take(n_partitions)
+        std::iter::repeat_n(String::new(), n_partitions)
             .collect::<Vec<_>>()
             .join(";")
     } else {
@@ -694,6 +760,274 @@ fn rewrite_exchange_targets_in_place(
         }
     }
     count
+}
+
+fn parse_sql(sql: &str) -> Result<Statement> {
+    Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|e| anyhow::anyhow!("sql parse: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty sql"))
+}
+
+fn translate_filter_ast(e: &AstExpr) -> Result<(String, String, String)> {
+    match e {
+        AstExpr::BinaryOp { left, op, right } => {
+            let col = match left.as_ref() {
+                AstExpr::Identifier(ident) => ident.value.clone(),
+                _ => anyhow::bail!("only simple col = literal filter"),
+            };
+            let op_s = match op {
+                BinaryOperator::Gt => ">",
+                BinaryOperator::Lt => "<",
+                BinaryOperator::GtEq => ">=",
+                BinaryOperator::LtEq => "<=",
+                BinaryOperator::Eq => "=",
+                BinaryOperator::NotEq => "<>",
+                _ => anyhow::bail!("op {op:?} not in M2"),
+            };
+            let lit = match right.as_ref() {
+                AstExpr::Value(v) => match &v.value {
+                    Value::Number(n, _) => n.clone(),
+                    Value::SingleQuotedString(s) => s.clone(),
+                    _ => format!("{v:?}"),
+                },
+                _ => anyhow::bail!("right of filter must be literal"),
+            };
+            Ok((col, op_s.to_string(), lit))
+        }
+        _ => anyhow::bail!("only binary op filter supported"),
+    }
+}
+
+pub struct CoordGrpc {
+    state: Arc<CoordState>,
+}
+
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+
+#[tonic::async_trait]
+impl Worker for CoordGrpc {
+    type OpenSessionStream = SessionOutStream;
+
+    async fn register_worker(
+        &self,
+        request: tonic::Request<pylon_proto::pylon::RegisterWorkerRequest>,
+    ) -> Result<tonic::Response<pylon_proto::pylon::RegisterWorkerResponse>, tonic::Status> {
+        let req = request.into_inner();
+        if req.flight_addr.is_empty() {
+            return Err(tonic::Status::invalid_argument("flight_addr is required"));
+        }
+        let worker_id = self
+            .state
+            .worker_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reg = self
+            .state
+            .discovery
+            .register(worker_id, req.flight_addr, req.grpc_addr);
+        info!(
+            worker_id = reg.worker_id,
+            flight_addr = %reg.flight_addr,
+            "worker registered via RegisterWorker"
+        );
+        Ok(tonic::Response::new(
+            pylon_proto::pylon::RegisterWorkerResponse {
+                worker_id: reg.worker_id,
+            },
+        ))
+    }
+
+    async fn open_session(
+        &self,
+        request: Request<Streaming<TaskResponse>>,
+    ) -> Result<Response<Self::OpenSessionStream>, Status> {
+        let peer = request.remote_addr();
+        // M3 B-1: if the worker passed x-pylon-worker-id (returned by
+        // RegisterWorker), pair the session with the prior
+        // registration and use that worker_id. Otherwise fall back
+        // to the M2 auto-assign path (no flight_addr).
+        let header_worker_id: Option<u64> = request
+            .metadata()
+            .get("x-pylon-worker-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        let pre_registered = header_worker_id.and_then(|id| self.state.discovery.lookup(id));
+
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel::<TaskRequest>(16);
+
+        let (worker_id, flight_addr) = match pre_registered {
+            Some(reg) => {
+                info!(?peer, registered_worker_id = reg.worker_id, flight_addr = %reg.flight_addr, "worker connected (registered)");
+                (WorkerId(reg.worker_id), Some(reg.flight_addr))
+            }
+            None => {
+                let id = WorkerId(self.state.worker_seq.fetch_add(1, Ordering::Relaxed));
+                info!(?peer, worker_id = id.0, "worker connected (M2 auto-assign)");
+                (id, None)
+            }
+        };
+        let completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let handle = Arc::new(WorkerHandle {
+            tx,
+            completed: completed.clone(),
+            flight_addr,
+        });
+        self.state.workers.lock().unwrap().insert(worker_id, handle);
+        info!(worker_id = worker_id.0, "registered");
+
+        // Capture handles the spawned inbound task needs without
+        // borrowing `&self` (which can't cross the `'static`
+        // async-move boundary).
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = inbound.next().await {
+                match msg {
+                    Ok(resp) => {
+                        let tid = resp.task_id;
+                        // M3-tail #1 (RFC 0005 R7): drive the
+                        // coord's QueryStateMachine off the worker's
+                        // existing TaskResponse.state field. No
+                        // proto change; the worker already publishes
+                        // TASK_DONE / TASK_FAILED on every task; we
+                        // just count and wake.
+                        let loc = state.task_locs.lock().unwrap().get(&tid).copied();
+                        match (resp.state, loc) {
+                            (1, Some((qid, sid))) => {
+                                state.state_machine.ack_task(
+                                    qid,
+                                    sid,
+                                    pylon_coord::TaskId(tid),
+                                    pylon_coord::query_state::TaskAck::Done,
+                                );
+                                trace!(
+                                    worker = worker_id.0,
+                                    task_id = tid,
+                                    qid = qid.0,
+                                    stage_id = sid.0,
+                                    "QSM ack: done"
+                                );
+                            }
+                            (2, Some((qid, sid))) => {
+                                let msg = resp.message.clone();
+                                state.state_machine.ack_task(
+                                    qid,
+                                    sid,
+                                    pylon_coord::TaskId(tid),
+                                    pylon_coord::query_state::TaskAck::Failed,
+                                );
+                                warn!(
+                                    worker = worker_id.0, task_id = tid,
+                                    qid = qid.0, stage_id = sid.0, %msg,
+                                    "QSM ack: failed"
+                                );
+                            }
+                            _ => {
+                                // Either state is RUNNING/CANCELLED
+                                // (no ack) or task_id was never
+                                // registered by a dispatch step
+                                // (rare; ignore).
+                            }
+                        }
+                        // M3 B-3.5: decode the real Arrow IPC streaming
+                        // bytes from the worker. A single response
+                        // carries one full IPC stream (schema + N
+                        // batches + EOS), so we may decode multiple
+                        // RecordBatches per response.
+                        if !resp.batch.is_empty() {
+                            match decode_ipc_stream(&resp.batch) {
+                                Ok(batches) if !batches.is_empty() => {
+                                    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                                    debug!(
+                                        worker = worker_id.0,
+                                        task_id = tid,
+                                        batches = batches.len(),
+                                        rows = n,
+                                        "decoded IPC stream"
+                                    );
+                                    completed
+                                        .lock()
+                                        .unwrap()
+                                        .entry(tid)
+                                        .or_default()
+                                        .extend(batches.clone());
+                                    let stored = completed
+                                        .lock()
+                                        .unwrap()
+                                        .get(&tid)
+                                        .map(|v| v.len())
+                                        .unwrap_or(0);
+                                    debug!(
+                                        worker = worker_id.0,
+                                        task_id = tid,
+                                        stored_batches = stored,
+                                        "stored in completed"
+                                    );
+                                }
+                                Ok(_) => {
+                                    // Empty stream (just schema + EOS). Ignore.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        worker = worker_id.0,
+                                        task_id = tid,
+                                        error = %e,
+                                        "failed to decode TaskResponse.batch IPC stream"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => warn!(worker = worker_id.0, "stream err: {e}"),
+                }
+            }
+        });
+
+        Ok(Response::new(SessionOutStream {
+            inner: ReceiverStream::new(rx),
+        }))
+    }
+}
+
+/// Decode an Arrow IPC streaming payload (schema + N RecordBatch
+/// messages + EOS) into the contained RecordBatches. M3 B-3.5.
+fn decode_ipc_stream(bytes: &[u8]) -> anyhow::Result<Vec<arrow_array::RecordBatch>> {
+    use arrow_ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None)?;
+    reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub struct SessionOutStream {
+    inner: ReceiverStream<TaskRequest>,
+}
+
+impl futures::Stream for SessionOutStream {
+    type Item = Result<TaskRequest, Status>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::pin::Pin;
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map(|opt| opt.map(Ok))
+    }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pylon=info")),
+        )
+        .try_init();
 }
 
 #[cfg(test)]
@@ -786,245 +1120,4 @@ mod b3_rewrite_tests {
             "x;y;z;x;y;z;x"
         );
     }
-}
-
-fn parse_sql(sql: &str) -> Result<Statement> {
-    Parser::parse_sql(&GenericDialect {}, sql)
-        .map_err(|e| anyhow::anyhow!("sql parse: {e}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty sql"))
-}
-
-fn translate_filter_ast(e: &AstExpr) -> Result<(String, String, String)> {
-    match e {
-        AstExpr::BinaryOp { left, op, right } => {
-            let col = match left.as_ref() {
-                AstExpr::Identifier(ident) => ident.value.clone(),
-                _ => anyhow::bail!("only simple col = literal filter"),
-            };
-            let op_s = match op {
-                BinaryOperator::Gt => ">",
-                BinaryOperator::Lt => "<",
-                BinaryOperator::GtEq => ">=",
-                BinaryOperator::LtEq => "<=",
-                BinaryOperator::Eq => "=",
-                BinaryOperator::NotEq => "<>",
-                _ => anyhow::bail!("op {op:?} not in M2"),
-            };
-            let lit = match right.as_ref() {
-                AstExpr::Value(v) => match &v.value {
-                    Value::Number(n, _) => n.clone(),
-                    Value::SingleQuotedString(s) => s.clone(),
-                    _ => format!("{v:?}"),
-                },
-                _ => anyhow::bail!("right of filter must be literal"),
-            };
-            Ok((col, op_s.to_string(), lit))
-        }
-        _ => anyhow::bail!("only binary op filter supported"),
-    }
-}
-
-pub struct CoordGrpc { state: Arc<CoordState> }
-
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
-
-#[tonic::async_trait]
-impl Worker for CoordGrpc {
-    type OpenSessionStream = SessionOutStream;
-
-    async fn register_worker(
-        &self,
-        request: tonic::Request<pylon_proto::pylon::RegisterWorkerRequest>,
-    ) -> Result<tonic::Response<pylon_proto::pylon::RegisterWorkerResponse>, tonic::Status> {
-        let req = request.into_inner();
-        if req.flight_addr.is_empty() {
-            return Err(tonic::Status::invalid_argument(
-                "flight_addr is required",
-            ));
-        }
-        let worker_id = self
-            .state
-            .worker_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let reg = self.state.discovery.register(
-            worker_id,
-            req.flight_addr,
-            req.grpc_addr,
-        );
-        info!(
-            worker_id = reg.worker_id,
-            flight_addr = %reg.flight_addr,
-            "worker registered via RegisterWorker"
-        );
-        Ok(tonic::Response::new(
-            pylon_proto::pylon::RegisterWorkerResponse {
-                worker_id: reg.worker_id,
-            },
-        ))
-    }
-
-    async fn open_session(
-        &self,
-        request: Request<Streaming<TaskResponse>>,
-    ) -> Result<Response<Self::OpenSessionStream>, Status> {
-        let peer = request.remote_addr();
-        // M3 B-1: if the worker passed x-pylon-worker-id (returned by
-        // RegisterWorker), pair the session with the prior
-        // registration and use that worker_id. Otherwise fall back
-        // to the M2 auto-assign path (no flight_addr).
-        let header_worker_id: Option<u64> = request
-            .metadata()
-            .get("x-pylon-worker-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok());
-        let pre_registered = header_worker_id
-            .and_then(|id| self.state.discovery.lookup(id));
-
-        let mut inbound = request.into_inner();
-        let (tx, rx) = mpsc::channel::<TaskRequest>(16);
-
-        let (worker_id, flight_addr) = match pre_registered {
-            Some(reg) => {
-                info!(?peer, registered_worker_id = reg.worker_id, flight_addr = %reg.flight_addr, "worker connected (registered)");
-                (WorkerId(reg.worker_id), Some(reg.flight_addr.clone()))
-            }
-            None => {
-                let id = WorkerId(self.state.worker_seq.fetch_add(1, Ordering::Relaxed));
-                info!(?peer, worker_id = id.0, "worker connected (M2 auto-assign)");
-                (id, None)
-            }
-        };
-        let completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let handle = Arc::new(WorkerHandle {
-            tx,
-            completed: completed.clone(),
-            flight_addr,
-        });
-        self.state.workers.lock().unwrap().insert(worker_id, handle.clone());
-        info!(worker_id = worker_id.0, "registered");
-
-        // Capture handles the spawned inbound task needs without
-        // borrowing `&self` (which can't cross the `'static`
-        // async-move boundary).
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = inbound.next().await {
-                match msg {
-                    Ok(resp) => {
-                        let tid = resp.task_id;
-                        // M3-tail #1 (RFC 0005 R7): drive the
-                        // coord's QueryStateMachine off the worker's
-                        // existing TaskResponse.state field. No
-                        // proto change; the worker already publishes
-                        // TASK_DONE / TASK_FAILED on every task; we
-                        // just count and wake.
-                        let loc = state.task_locs.lock().unwrap().get(&tid).copied();
-                        match (resp.state, loc) {
-                            (1, Some((qid, sid))) => {
-                                state.state_machine.ack_task(
-                                    qid, sid, pylon_coord::TaskId(tid),
-                                    pylon_coord::query_state::TaskAck::Done,
-                                );
-                                trace!(
-                                    worker = worker_id.0, task_id = tid,
-                                    qid = qid.0, stage_id = sid.0,
-                                    "QSM ack: done"
-                                );
-                            }
-                            (2, Some((qid, sid))) => {
-                                let msg = resp.message.clone();
-                                state.state_machine.ack_task(
-                                    qid, sid, pylon_coord::TaskId(tid),
-                                    pylon_coord::query_state::TaskAck::Failed,
-                                );
-                                warn!(
-                                    worker = worker_id.0, task_id = tid,
-                                    qid = qid.0, stage_id = sid.0, %msg,
-                                    "QSM ack: failed"
-                                );
-                            }
-                            _ => {
-                                // Either state is RUNNING/CANCELLED
-                                // (no ack) or task_id was never
-                                // registered by a dispatch step
-                                // (rare; ignore).
-                            }
-                        }
-                        // M3 B-3.5: decode the real Arrow IPC streaming
-                        // bytes from the worker. A single response
-                        // carries one full IPC stream (schema + N
-                        // batches + EOS), so we may decode multiple
-                        // RecordBatches per response.
-                        if !resp.batch.is_empty() {
-                            match decode_ipc_stream(&resp.batch) {
-                                Ok(batches) if !batches.is_empty() => {
-                                    let n: usize =
-                                        batches.iter().map(|b| b.num_rows()).sum();
-                                    debug!(worker = worker_id.0, task_id = tid, batches = batches.len(), rows = n, "decoded IPC stream");
-                                    completed
-                                        .lock()
-                                        .unwrap()
-                                        .entry(tid)
-                                        .or_default()
-                                        .extend(batches.clone());
-                                    let stored = completed.lock().unwrap().get(&tid).map(|v| v.len()).unwrap_or(0);
-                                    debug!(worker = worker_id.0, task_id = tid, stored_batches = stored, "stored in completed");
-                                }
-                                Ok(_) => {
-                                    // Empty stream (just schema + EOS). Ignore.
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        worker = worker_id.0,
-                                        task_id = tid,
-                                        error = %e,
-                                        "failed to decode TaskResponse.batch IPC stream"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => warn!(worker = worker_id.0, "stream err: {e}"),
-                }
-            }
-        });
-
-        Ok(Response::new(SessionOutStream { inner: ReceiverStream::new(rx) }))
-    }
-}
-
-/// Decode an Arrow IPC streaming payload (schema + N RecordBatch
-/// messages + EOS) into the contained RecordBatches. M3 B-3.5.
-fn decode_ipc_stream(bytes: &[u8]) -> anyhow::Result<Vec<arrow_array::RecordBatch>> {
-    use arrow_ipc::reader::StreamReader;
-    let cursor = std::io::Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None)?;
-    reader.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
-}
-
-pub struct SessionOutStream { inner: ReceiverStream<TaskRequest> }
-
-impl futures::Stream for SessionOutStream {
-    type Item = Result<TaskRequest, Status>;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use std::pin::Pin;
-        Pin::new(&mut self.inner).poll_next(cx).map(|opt| opt.map(Ok))
-    }
-}
-
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pylon=info")),
-        )
-        .try_init();
 }

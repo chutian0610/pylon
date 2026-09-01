@@ -117,10 +117,7 @@ impl Stage {
     /// R2.2.b: attach the canonical plan root. Used by the
     /// fragmenter after `wrap_legacy_plan` produces an
     /// `Arc<dyn ExecutionPlan>`; future schedulers read this.
-    pub fn with_plan(
-        mut self,
-        plan: Arc<dyn pylon_plan::physical::exec::ExecutionPlan>,
-    ) -> Self {
+    pub fn with_plan(mut self, plan: Arc<dyn pylon_plan::physical::exec::ExecutionPlan>) -> Self {
         self.plan = Some(plan);
         self
     }

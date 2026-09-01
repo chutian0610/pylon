@@ -81,9 +81,7 @@ impl Fragmenter {
     /// at `cfg.default_partition_count`). This preserves the M3
     /// legacy API exactly.
     pub fn new(cfg: FragmenterConfig) -> Self {
-        let rule = Arc::new(AggregateFragmenterRule::new(
-            cfg.default_partition_count,
-        ));
+        let rule = Arc::new(AggregateFragmenterRule::new(cfg.default_partition_count));
         Self {
             cfg,
             rules: vec![rule],
@@ -115,7 +113,6 @@ impl Fragmenter {
     pub fn with_default_partition_count(n: usize) -> Self {
         Self::new(FragmenterConfig {
             default_partition_count: n,
-            ..FragmenterConfig::default()
         })
     }
 
@@ -387,9 +384,7 @@ fn visit(
             .map(|p| {
                 format!(
                     "pylon://query/{}/stage/{}/task/{}",
-                    query_id,
-                    next_stage.0,
-                    p
+                    query_id, next_stage.0, p
                 )
             })
             .collect();
@@ -406,10 +401,7 @@ fn visit(
         sink_cfg.insert("descriptors".into(), descriptors.join(";"));
         sink_cfg.insert("n_partitions".into(), producer_n.to_string());
         sink_cfg.insert("partition_keys".into(), partition_keys);
-        sink_cfg.insert(
-            "target_flight_addrs".into(),
-            target_flight_addrs.join(";"),
-        );
+        sink_cfg.insert("target_flight_addrs".into(), target_flight_addrs.join(";"));
         sink_cfg.insert("exchange_kind".into(), strategy.as_str().to_string());
 
         builder.push_op(
@@ -421,8 +413,7 @@ fn visit(
         )?;
 
         // Head of the new stage: N×ExchangeSource, one per partition.
-        for p in 0..consumer_n {
-            let desc = &descriptors[p];
+        for (p, desc) in descriptors.iter().enumerate().take(consumer_n) {
             let mut cfg = HashMap::new();
             cfg.insert("descriptor".into(), desc.clone());
             cfg.insert("partition".into(), p.to_string());
@@ -561,5 +552,8 @@ fn decompose_filter(
 }
 
 fn kv(items: &[(&str, &str)]) -> HashMap<String, String> {
-    items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    items
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }

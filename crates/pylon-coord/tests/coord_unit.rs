@@ -5,12 +5,8 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
-use pylon_plan::physical::exec::{
-    AggregateExec, ExecutionPlan, FilterExec, SeqScanExec,
-};
-use pylon_plan::physical::expr::{
-    BinaryOpExpr, ColumnExpr, LiteralExpr,
-};
+use pylon_plan::physical::exec::{AggregateExec, ExecutionPlan, FilterExec, SeqScanExec};
+use pylon_plan::physical::expr::{BinaryOpExpr, ColumnExpr, LiteralExpr};
 
 fn schema_two() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -27,15 +23,12 @@ fn scan() -> Arc<dyn ExecutionPlan> {
 /// Build `Filter { input: scan, predicate: id > 5 }`.
 fn filter_scan() -> Arc<dyn ExecutionPlan> {
     let input = scan();
-    let id_col: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> = Arc::new(
-        ColumnExpr::new(0, input.schema().field(0).clone()),
-    );
-    let five: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> = Arc::new(
-        LiteralExpr::new("5", DataType::Utf8),
-    );
-    let pred: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> = Arc::new(
-        BinaryOpExpr::new(id_col, ">".to_string(), five),
-    );
+    let id_col: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> =
+        Arc::new(ColumnExpr::new(0, input.schema().field(0).clone()));
+    let five: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> =
+        Arc::new(LiteralExpr::new("5", DataType::Utf8));
+    let pred: Arc<dyn pylon_plan::physical::expr::PhysicalExpr> =
+        Arc::new(BinaryOpExpr::new(id_col, ">".to_string(), five));
     let schema = input.schema();
     Arc::new(FilterExec::new(input, pred, schema))
 }
@@ -56,7 +49,11 @@ fn fragmenter_collapses_simple_plan_into_single_stage() {
     // boundary — stage0 carries just the scan + filter. ExchangeSink
     // is only emitted at Aggregate boundaries.
     let ops = &dag.stages[0].fragment.ops;
-    assert_eq!(ops.len(), 2, "SeqScan, Filter (no ExchangeSink without Aggregate)");
+    assert_eq!(
+        ops.len(),
+        2,
+        "SeqScan, Filter (no ExchangeSink without Aggregate)"
+    );
     assert_eq!(ops[0].name, "SeqScan");
     assert_eq!(ops[1].name, "Filter");
     assert_eq!(ops[1].config.get("col").map(|s| s.as_str()), Some("id"));
@@ -64,7 +61,10 @@ fn fragmenter_collapses_simple_plan_into_single_stage() {
     assert_eq!(ops[1].config.get("literal").map(|s| s.as_str()), Some("5"));
     // Stage 1 should be empty (or near-empty) — no Aggregate means
     // no second stage in M3 first cut.
-    assert!(dag.stages[1].fragment.ops.is_empty(), "stage1 empty without Aggregate");
+    assert!(
+        dag.stages[1].fragment.ops.is_empty(),
+        "stage1 empty without Aggregate"
+    );
 }
 
 #[test]
@@ -83,11 +83,9 @@ fn fragment_then_schedule_pipelines_through() {
     // Build a minimal `Aggregate` exec via the struct; we don't
     // care about the inner expr shape for this test — only that
     // the boundary flag fires.
-    use pylon_plan::physical::exec::AggregateExec as _;
     let agg_schema = schema_two();
-    let group_by: Vec<Arc<dyn pylon_plan::physical::expr::PhysicalExpr>> = vec![Arc::new(
-        ColumnExpr::new(1, agg_schema.field(1).clone()),
-    )];
+    let group_by: Vec<Arc<dyn pylon_plan::physical::expr::PhysicalExpr>> =
+        vec![Arc::new(ColumnExpr::new(1, agg_schema.field(1).clone()))];
     let aggs: Vec<Arc<dyn pylon_plan::physical::expr::PhysicalExpr>> = vec![Arc::new(
         pylon_plan::physical::expr::AggregateFunctionExpr::new(
             "count",

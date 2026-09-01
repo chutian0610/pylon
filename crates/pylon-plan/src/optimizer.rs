@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use pylon_types::PylonError;
 
-use crate::logical::{input_schema, Expr, LogicalPlan};
+use crate::logical::{Expr, LogicalPlan, input_schema};
 
 // =====================================================================
 // ApplyOrder
@@ -201,10 +201,7 @@ impl LogicalOptimizer {
     ///   before fixed point (signals a non-terminating rule —
     ///   never expected from the built-ins, defensive against
     ///   custom rules).
-    pub fn optimize(
-        &self,
-        plan: LogicalPlan,
-    ) -> Result<(LogicalPlan, RewriteContext), PylonError> {
+    pub fn optimize(&self, plan: LogicalPlan) -> Result<(LogicalPlan, RewriteContext), PylonError> {
         let mut ctx = RewriteContext::new();
         let mut current = plan;
         // Set of rules that already fired once (ApplyOrder::Once).
@@ -322,12 +319,10 @@ fn push_down_filter(plan: LogicalPlan) -> LogicalPlan {
             let rewritten_input = push_down_filter(*input);
             try_swap_filter(rewritten_input, predicate)
         }
-        LogicalPlan::Project { input, projections } => {
-            LogicalPlan::Project {
-                input: Box::new(push_down_filter(*input)),
-                projections,
-            }
-        }
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(push_down_filter(*input)),
+            projections,
+        },
         LogicalPlan::Aggregate {
             input,
             group_by,
@@ -644,7 +639,10 @@ mod tests {
             LogicalPlan::Project { input, projections } => {
                 assert_eq!(projections, vec![col("id", DataType::Int64)]);
                 match *input {
-                    LogicalPlan::Filter { input: deepest, predicate } => {
+                    LogicalPlan::Filter {
+                        input: deepest,
+                        predicate,
+                    } => {
                         assert_eq!(predicate, pred);
                         assert!(matches!(*deepest, LogicalPlan::Scan { .. }));
                     }
@@ -795,18 +793,23 @@ mod tests {
         );
         let out = collapse_projects(outer);
         // Still nested.
-        assert!(matches!(out, LogicalPlan::Project { input, .. } if matches!(*input, LogicalPlan::Project { .. })));
+        assert!(
+            matches!(out, LogicalPlan::Project { input, .. } if matches!(*input, LogicalPlan::Project { .. }))
+        );
     }
 
     #[test]
     fn collapse_passes_through_filter() {
         // Project(Filter(scan, pred), projs) — collapse only
         // touches nested Projects. Filter in between is left.
-        let p = filter(scan_a(), Expr::BinaryOp {
-            left: Box::new(col("id", DataType::Int64)),
-            op: ">".into(),
-            right: Box::new(lit("0")),
-        });
+        let p = filter(
+            scan_a(),
+            Expr::BinaryOp {
+                left: Box::new(col("id", DataType::Int64)),
+                op: ">".into(),
+                right: Box::new(lit("0")),
+            },
+        );
         let plan = project(p, vec![col("id", DataType::Int64)]);
         let out = collapse_projects(plan);
         // Top should still be Project; the inner is Filter.
@@ -963,8 +966,7 @@ mod tests {
                 ApplyOrder::EveryPass
             }
         }
-        let optimizer = LogicalOptimizer::new(vec![Arc::new(InfiniteRule)])
-            .with_max_iterations(3);
+        let optimizer = LogicalOptimizer::new(vec![Arc::new(InfiniteRule)]).with_max_iterations(3);
         let err = optimizer.optimize(scan_a()).expect_err("must not converge");
         let s = format!("{err:?}");
         assert!(s.contains("did not converge"), "got: {s}");

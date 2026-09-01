@@ -11,8 +11,8 @@ use std::time::Duration;
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use pylon_exchange::FlightDescriptor;
-use pylon_runtime::ops::{ExchangeSinkRpc, RpcTarget};
 use pylon_runtime::PipelineOp;
+use pylon_runtime::ops::{ExchangeSinkRpc, RpcTarget};
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -25,12 +25,16 @@ fn schema() -> Arc<Schema> {
 fn mk_batch() -> RecordBatch {
     let s = schema();
     let ids = Int64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7]);
-    let names = StringArray::from(vec![
-        "a", "b", "a", "c", "b", "a", "c", "b",
-    ]);
+    let names = StringArray::from(vec!["a", "b", "a", "c", "b", "a", "c", "b"]);
     let amounts = Float64Array::from(vec![
-        Some(1.0), Some(2.0), Some(3.0), Some(4.0),
-        Some(5.0), Some(6.0), Some(7.0), Some(8.0),
+        Some(1.0),
+        Some(2.0),
+        Some(3.0),
+        Some(4.0),
+        Some(5.0),
+        Some(6.0),
+        Some(7.0),
+        Some(8.0),
     ]);
     RecordBatch::try_new(s, vec![Arc::new(ids), Arc::new(names), Arc::new(amounts)]).unwrap()
 }
@@ -80,13 +84,7 @@ async fn partitioned_sink_routes_rows_by_group_by_col() {
     let mut sink = ExchangeSinkRpc::new_partitioned(targets, vec!["name".into()]);
     sink.add_input(mk_batch()).await.unwrap();
     sink.no_more_input().await.unwrap();
-    common::wait_for_spawned_send_jobs(
-        &service,
-        &descs,
-        1,
-        Duration::from_secs(5),
-    )
-    .await;
+    common::wait_for_spawned_send_jobs(&service, &descs, 1, Duration::from_secs(5)).await;
 
     let mut total_rows = 0;
     let mut non_empty_partitions = 0;
@@ -97,11 +95,7 @@ async fn partitioned_sink_routes_rows_by_group_by_col() {
         if n > 0 {
             non_empty_partitions += 1;
             for b in &batches {
-                let names = b
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
                 for r in 0..b.num_rows() {
                     name_per_partition[p].push(names.value(r).to_string());
                 }
@@ -111,7 +105,10 @@ async fn partitioned_sink_routes_rows_by_group_by_col() {
     }
     assert_eq!(total_rows, 8, "all rows routed");
     assert!(non_empty_partitions >= 1);
-    assert!(non_empty_partitions <= 3, "at most 3 partitions for {n_partitions}");
+    assert!(
+        non_empty_partitions <= 3,
+        "at most 3 partitions for {n_partitions}"
+    );
 
     for (p, names) in name_per_partition.iter().enumerate() {
         if names.is_empty() {
@@ -132,23 +129,13 @@ async fn partitioned_sink_split_batch_by_row() {
     let mut sink = ExchangeSinkRpc::new_partitioned(targets, vec!["id".into()]);
     sink.add_input(mk_batch()).await.unwrap();
     sink.no_more_input().await.unwrap();
-    common::wait_for_spawned_send_jobs(
-        &service,
-        &descs,
-        1,
-        Duration::from_secs(5),
-    )
-    .await;
+    common::wait_for_spawned_send_jobs(&service, &descs, 1, Duration::from_secs(5)).await;
 
     let mut total_rows = 0;
     let mut all_ids: Vec<i64> = Vec::new();
     for desc in &descs {
         for b in drain(&service, desc).await {
-            let ids = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             for r in 0..b.num_rows() {
                 all_ids.push(ids.value(r));
                 total_rows += 1;
@@ -167,10 +154,7 @@ async fn partitioned_sink_unknown_key_col_errors() {
     let (targets, _descs) = build_targets(addr, 1, "err").await;
     let mut sink = ExchangeSinkRpc::new_partitioned(targets, vec!["nope".into()]);
     let err = sink.add_input(mk_batch()).await.unwrap_err();
-    assert!(
-        err.to_string().contains("not found"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("not found"), "got: {err}");
     h.abort();
 }
 
@@ -202,13 +186,7 @@ async fn single_target_sink_still_works() {
     let mut sink = ExchangeSinkRpc::new_partitioned(targets, vec!["id".into()]);
     sink.add_input(mk_batch()).await.unwrap();
     sink.no_more_input().await.unwrap();
-    common::wait_for_spawned_send_jobs(
-        &service,
-        &descs,
-        1,
-        Duration::from_secs(5),
-    )
-    .await;
+    common::wait_for_spawned_send_jobs(&service, &descs, 1, Duration::from_secs(5)).await;
     let batches = drain(&service, &descs[0]).await;
     let n: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n, 8, "all 8 rows in single target");

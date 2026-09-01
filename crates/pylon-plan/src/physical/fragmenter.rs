@@ -74,11 +74,13 @@ impl BoundaryStrategy {
     /// `target_partitions`; for Single / Gather / GatherToOne `1`.
     pub fn partition_count(&self) -> usize {
         match self {
-            BoundaryStrategy::HashPartition { target_partitions, .. } => *target_partitions,
+            BoundaryStrategy::HashPartition {
+                target_partitions, ..
+            } => *target_partitions,
             BoundaryStrategy::Broadcast { target_consumers } => *target_consumers,
-            BoundaryStrategy::Single
-            | BoundaryStrategy::Gather
-            | BoundaryStrategy::GatherToOne => 1,
+            BoundaryStrategy::Single | BoundaryStrategy::Gather | BoundaryStrategy::GatherToOne => {
+                1
+            }
         }
     }
 
@@ -88,11 +90,13 @@ impl BoundaryStrategy {
     /// broadcast as a hash-routed N; M4 may revise).
     pub fn producer_partition_count(&self) -> usize {
         match self {
-            BoundaryStrategy::HashPartition { target_partitions, .. } => *target_partitions,
+            BoundaryStrategy::HashPartition {
+                target_partitions, ..
+            } => *target_partitions,
             BoundaryStrategy::Broadcast { target_consumers } => *target_consumers,
-            BoundaryStrategy::Single
-            | BoundaryStrategy::Gather
-            | BoundaryStrategy::GatherToOne => 1,
+            BoundaryStrategy::Single | BoundaryStrategy::Gather | BoundaryStrategy::GatherToOne => {
+                1
+            }
         }
     }
 
@@ -274,12 +278,15 @@ impl FragmenterRule for AggregateFragmenterRule {
         use crate::physical::exec::AggregateExec;
         use crate::physical::expr::{AggregateFunctionExpr, ColumnExpr};
 
-        let agg = node.as_any().downcast_ref::<AggregateExec>().ok_or_else(|| {
-            PylonError::Internal(format!(
-                "AggregateFragmenterRule::stage1_op_spec: node '{}' is not AggregateExec",
-                node.name()
-            ))
-        })?;
+        let agg = node
+            .as_any()
+            .downcast_ref::<AggregateExec>()
+            .ok_or_else(|| {
+                PylonError::Internal(format!(
+                    "AggregateFragmenterRule::stage1_op_spec: node '{}' is not AggregateExec",
+                    node.name()
+                ))
+            })?;
 
         // Match the byte-for-byte legacy format from
         // `pylon-coord::fragment::agg_spec_to_string_v2`. Any change
@@ -348,24 +355,20 @@ mod tests {
     use crate::physical::expr::{AggregateFunctionExpr, ColumnExpr, PhysicalExpr};
 
     fn scan() -> Arc<dyn ExecutionPlan> {
-        let s: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, false)]));
+        let s: SchemaRef = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, false)]));
         Arc::new(SeqScanExec::new("t", s))
     }
 
     fn agg(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let s = input.schema();
-        let g: Vec<Arc<dyn PhysicalExpr>> =
-            vec![Arc::new(ColumnExpr::new(0, s.field(0).clone()))];
-        let a: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(
-            AggregateFunctionExpr::new(
-                "count",
-                "count_c0",
-                vec![],
-                DataType::Int64,
-                vec![],
-            ),
-        )];
+        let g: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(ColumnExpr::new(0, s.field(0).clone()))];
+        let a: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(AggregateFunctionExpr::new(
+            "count",
+            "count_c0",
+            vec![],
+            DataType::Int64,
+            vec![],
+        ))];
         Arc::new(AggregateExec::new(input, g, a, s))
     }
 
@@ -380,7 +383,10 @@ mod tests {
             8
         );
         assert_eq!(
-            BoundaryStrategy::Broadcast { target_consumers: 4 }.partition_count(),
+            BoundaryStrategy::Broadcast {
+                target_consumers: 4
+            }
+            .partition_count(),
             4
         );
         assert_eq!(BoundaryStrategy::Single.partition_count(), 1);
@@ -401,7 +407,10 @@ mod tests {
             "hash_partition"
         );
         assert_eq!(
-            BoundaryStrategy::Broadcast { target_consumers: 1 }.as_str(),
+            BoundaryStrategy::Broadcast {
+                target_consumers: 1
+            }
+            .as_str(),
             "broadcast"
         );
         assert_eq!(BoundaryStrategy::Single.as_str(), "single");
@@ -415,9 +424,15 @@ mod tests {
             target_partitions: 2,
             keys: vec!["a".into(), "b".into()],
         };
-        assert_eq!(h.partition_keys(), Some(&["a".to_string(), "b".to_string()][..]));
         assert_eq!(
-            BoundaryStrategy::Broadcast { target_consumers: 1 }.partition_keys(),
+            h.partition_keys(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert_eq!(
+            BoundaryStrategy::Broadcast {
+                target_consumers: 1
+            }
+            .partition_keys(),
             None
         );
         assert_eq!(BoundaryStrategy::Single.partition_keys(), None);
@@ -474,12 +489,9 @@ mod tests {
     fn aggregate_rule_stage1_op_spec_carries_group_by_and_aggs() {
         let rule = AggregateFragmenterRule::default();
         let agg_node: Arc<dyn ExecutionPlan> = agg(scan());
-        let emit = rule
-            .stage1_op_spec(agg_node.as_ref())
-            .expect("emit ok");
+        let emit = rule.stage1_op_spec(agg_node.as_ref()).expect("emit ok");
         assert_eq!(emit.op_name, "Aggregate");
-        let cfg: std::collections::HashMap<String, String> =
-            emit.config.into_iter().collect();
+        let cfg: std::collections::HashMap<String, String> = emit.config.into_iter().collect();
         assert_eq!(cfg.get("group_by_cols").map(String::as_str), Some("c0"));
         assert_eq!(cfg.get("agg_specs").map(String::as_str), Some("count()"));
     }
@@ -499,10 +511,9 @@ mod tests {
     fn rule_fires_helper_returns_first_match() {
         let r1 = Arc::new(AggregateFragmenterRule::default());
         let r2 = Arc::new(AggregateFragmenterRule::new(8));
-        let rules: Vec<Arc<dyn FragmenterRule>> = vec![r1.clone(), r2.clone()];
+        let rules: Vec<Arc<dyn FragmenterRule>> = vec![r1, r2];
         let agg_node: Arc<dyn ExecutionPlan> = agg(scan());
-        let (idx, strategy) =
-            rule_fires(&rules, agg_node.as_ref()).expect("first rule fires");
+        let (idx, strategy) = rule_fires(&rules, agg_node.as_ref()).expect("first rule fires");
         assert_eq!(idx, 0, "first rule wins (16, not 8)");
         assert_eq!(
             strategy,

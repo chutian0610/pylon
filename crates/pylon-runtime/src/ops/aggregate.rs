@@ -4,16 +4,14 @@
 //! `no_more_input()` a single output batch with one row per group is
 //! emitted. Streaming emit + spilling arrives in M4+.
 
+use crate::memory_pool::NoopMemoryPool;
 use crate::op::PipelineOp;
-use arrow_array::{
-    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-};
+use crate::spill::{SpillHandle, SpillManager, Spillable};
+use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use crate::memory_pool::NoopMemoryPool;
 use pylon_types::{MemoryPool, PylonError, Result};
 use std::collections::HashMap;
-use crate::spill::{SpillHandle, SpillManager, Spillable};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -249,7 +247,11 @@ impl HashAggregateOp {
                     .clone();
                 fields.push(f);
             }
-            for (agg, input_type) in self.aggregates.iter().zip(self.input_types.as_ref().unwrap().iter()) {
+            for (agg, input_type) in self
+                .aggregates
+                .iter()
+                .zip(self.input_types.as_ref().unwrap().iter())
+            {
                 let out_dt = match agg.func.as_str() {
                     "count" => DataType::Int64,
                     "sum" => match input_type.as_ref().unwrap() {
@@ -258,14 +260,14 @@ impl HashAggregateOp {
                         other => {
                             return Err(PylonError::InvalidPlan(format!(
                                 "SUM does not support input type {other:?}"
-                            )))
+                            )));
                         }
                     },
                     "min" | "max" => input_type.as_ref().unwrap().clone(),
                     other => {
                         return Err(PylonError::InvalidPlan(format!(
                             "aggregate {other} not supported in output-schema derivation"
-                        )))
+                        )));
                     }
                 };
                 fields.push(Field::new(&agg.out_name, out_dt, true));
@@ -348,8 +350,9 @@ impl HashAggregateOp {
         row: usize,
     ) -> Result<()> {
         // For COUNT(arg), null input doesn't count.
-        if func == "count" && arg_value.is_some() {
-            let arr = arg_value.unwrap();
+        if func == "count"
+            && let Some(arr) = arg_value
+        {
             if arr.is_null(row) {
                 return Ok(());
             }
@@ -373,19 +376,31 @@ impl HashAggregateOp {
         }
         match (func, input_type) {
             ("sum", DataType::Int64) => {
-                let v = arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::SumI64(s) = state {
                     *s += v;
                 }
             }
             ("sum", DataType::Float64) => {
-                let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::SumF64(s) = state {
                     *s += v;
                 }
             }
             ("min", DataType::Int64) => {
-                let v = arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MinI64(slot) = state {
                     *slot = Some(match *slot {
                         None => v,
@@ -394,7 +409,11 @@ impl HashAggregateOp {
                 }
             }
             ("min", DataType::Float64) => {
-                let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MinF64(slot) = state {
                     *slot = Some(match *slot {
                         None => v,
@@ -403,7 +422,11 @@ impl HashAggregateOp {
                 }
             }
             ("min", DataType::Utf8) => {
-                let v = arr.as_any().downcast_ref::<StringArray>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MinUtf8(slot) = state {
                     *slot = Some(match slot.as_deref() {
                         None => v.to_string(),
@@ -418,7 +441,11 @@ impl HashAggregateOp {
                 }
             }
             ("max", DataType::Int64) => {
-                let v = arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MaxI64(slot) = state {
                     *slot = Some(match *slot {
                         None => v,
@@ -427,7 +454,11 @@ impl HashAggregateOp {
                 }
             }
             ("max", DataType::Float64) => {
-                let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MaxF64(slot) = state {
                     *slot = Some(match *slot {
                         None => v,
@@ -436,7 +467,11 @@ impl HashAggregateOp {
                 }
             }
             ("max", DataType::Utf8) => {
-                let v = arr.as_any().downcast_ref::<StringArray>().unwrap().value(row);
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(row);
                 if let AggState::MaxUtf8(slot) = state {
                     *slot = Some(match slot.as_deref() {
                         None => v.to_string(),
@@ -453,7 +488,7 @@ impl HashAggregateOp {
             (f, t) => {
                 return Err(PylonError::InvalidPlan(format!(
                     "aggregate {f} on {t:?} not implemented"
-                )))
+                )));
             }
         }
         Ok(())
@@ -500,7 +535,8 @@ impl HashAggregateOp {
         let n_aggs = self.aggregates.len();
 
         // One column per output field: group_by cols + agg cols.
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.group_by_cols.len() + n_aggs);
+        let mut columns: Vec<Arc<dyn Array>> =
+            Vec::with_capacity(self.group_by_cols.len() + n_aggs);
 
         for (g_idx, _) in self.group_by_cols.iter().enumerate() {
             // Build a single column by iterating groups and pulling the
@@ -670,7 +706,7 @@ impl HashAggregateOp {
                 (f, t) => {
                     return Err(PylonError::Internal(format!(
                         "aggregate {f} with output type {t:?} not implemented in build_output"
-                    )))
+                    )));
                 }
             }
         }
@@ -907,9 +943,8 @@ impl HashAggregateOp {
         });
         let n_groups = groups.len();
 
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(
-            self.group_by_cols.len() + self.aggregates.len(),
-        );
+        let mut columns: Vec<Arc<dyn Array>> =
+            Vec::with_capacity(self.group_by_cols.len() + self.aggregates.len());
 
         // group_by columns
         for g_idx in 0..self.group_by_cols.len() {
@@ -1061,7 +1096,9 @@ impl HashAggregateOp {
                     DataType::Float64 => {
                         let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
                         if arr.is_null(row_idx) {
-                            return Err(PylonError::Internal("spill: null group_by Float64".into()));
+                            return Err(PylonError::Internal(
+                                "spill: null group_by Float64".into(),
+                            ));
                         }
                         GroupKey::Float64Bits(arr.value(row_idx).to_bits())
                     }
@@ -1075,7 +1112,7 @@ impl HashAggregateOp {
                     other => {
                         return Err(PylonError::Internal(format!(
                             "spill fold: unsupported group_by type {other:?}"
-                        )))
+                        )));
                     }
                 };
                 key.push(k);
@@ -1135,7 +1172,11 @@ impl HashAggregateOp {
                     }
                     ("min", AggState::MinI64(v)) => {
                         let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        let cur = if arr.is_null(row_idx) {
+                            None
+                        } else {
+                            Some(arr.value(row_idx))
+                        };
                         *v = match *v {
                             None => cur,
                             Some(old) => match cur {
@@ -1146,7 +1187,11 @@ impl HashAggregateOp {
                     }
                     ("min", AggState::MinF64(v)) => {
                         let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        let cur = if arr.is_null(row_idx) {
+                            None
+                        } else {
+                            Some(arr.value(row_idx))
+                        };
                         *v = match *v {
                             None => cur,
                             Some(old) => match cur {
@@ -1157,7 +1202,11 @@ impl HashAggregateOp {
                     }
                     ("max", AggState::MaxI64(v)) => {
                         let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        let cur = if arr.is_null(row_idx) {
+                            None
+                        } else {
+                            Some(arr.value(row_idx))
+                        };
                         *v = match *v {
                             None => cur,
                             Some(old) => match cur {
@@ -1168,7 +1217,11 @@ impl HashAggregateOp {
                     }
                     ("max", AggState::MaxF64(v)) => {
                         let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                        let cur = if arr.is_null(row_idx) { None } else { Some(arr.value(row_idx)) };
+                        let cur = if arr.is_null(row_idx) {
+                            None
+                        } else {
+                            Some(arr.value(row_idx))
+                        };
                         *v = match *v {
                             None => cur,
                             Some(old) => match cur {
@@ -1210,11 +1263,7 @@ impl Spillable for HashAggregateOp {
         Ok(handle)
     }
 
-    async fn resume(
-        &mut self,
-        manager: &SpillManager,
-        handle: SpillHandle,
-    ) -> Result<()> {
+    async fn resume(&mut self, manager: &SpillManager, handle: SpillHandle) -> Result<()> {
         let batches = manager.read(&handle)?;
         for b in batches {
             self.fold_spill_batch(&b)?;
@@ -1229,8 +1278,7 @@ impl Spillable for HashAggregateOp {
 /// one column per aggregate output (typed by the resolved
 /// `input_types`).
 fn build_spill_schema(op: &HashAggregateOp) -> SchemaRef {
-    let mut fields: Vec<Field> =
-        Vec::with_capacity(op.group_by_cols.len() + op.aggregates.len());
+    let mut fields: Vec<Field> = Vec::with_capacity(op.group_by_cols.len() + op.aggregates.len());
     if let Some(first_key) = op.state.keys().next() {
         for (i, _col) in op.group_by_cols.iter().enumerate() {
             let dt = match &first_key[i] {
@@ -1252,10 +1300,7 @@ fn build_spill_schema(op: &HashAggregateOp) -> SchemaRef {
     for (agg_idx, agg) in op.aggregates.iter().enumerate() {
         let dt = match agg.func.as_str() {
             "count" => DataType::Int64,
-            "sum" => match input_types[agg_idx]
-                .as_ref()
-                .expect("sum needs arg col")
-            {
+            "sum" => match input_types[agg_idx].as_ref().expect("sum needs arg col") {
                 DataType::Int64 => DataType::Int64,
                 DataType::Float64 => DataType::Float64,
                 _ => unreachable!(),

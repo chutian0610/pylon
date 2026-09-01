@@ -19,7 +19,7 @@
 //! invariant is "`in_use` returns to baseline by the time `Drop`
 //! returns".
 
-use crate::{PylonError, Result};
+use crate::Result;
 
 /// A per-task byte budget. Implementations must be `Send + Sync` so an
 /// `Arc<dyn MemoryPool>` can be shared across threads (e.g. between the
@@ -72,4 +72,3 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug {
         target.min(headroom)
     }
 }
-

@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use pylon_runtime::ops::{AggSpec, HashAggregateOp};
 use pylon_runtime::PipelineOp;
+use pylon_runtime::ops::{AggSpec, HashAggregateOp};
 use pylon_runtime::{PerTaskPool, SpillManager};
 use pylon_types::MemoryPool;
 
@@ -178,8 +178,7 @@ async fn hash_aggregate_no_pool_constraint_does_not_spill() {
     // Sanity check: when budget is much larger than total bytes,
     // no spill is triggered.
     let pool = PerTaskPool::new(1 << 20); // 1 MiB
-    let _ = SpillManager::new(std::env::temp_dir().join("pylon-no-spill-test"))
-        .expect("tempdir");
+    let _ = SpillManager::new(std::env::temp_dir().join("pylon-no-spill-test")).expect("tempdir");
 
     let mut agg = HashAggregateOp::with_pool(
         vec!["name".to_string()],

@@ -33,14 +33,15 @@ fn sample_path() -> PathBuf {
 
 fn make_descriptors(query_id: u64, stage_id: u64, n: usize) -> Vec<FlightDescriptor> {
     (0..n)
-        .map(|i| FlightDescriptor(format!("pylon://query/{query_id}/stage/{stage_id}/task/{i}")))
+        .map(|i| {
+            FlightDescriptor(format!(
+                "pylon://query/{query_id}/stage/{stage_id}/task/{i}"
+            ))
+        })
         .collect()
 }
 
-fn make_targets(
-    addr: std::net::SocketAddr,
-    descs: &[FlightDescriptor],
-) -> Vec<RpcTarget> {
+fn make_targets(addr: std::net::SocketAddr, descs: &[FlightDescriptor]) -> Vec<RpcTarget> {
     descs
         .iter()
         .map(|d| RpcTarget {
@@ -84,7 +85,11 @@ fn expected_aggregates() -> Vec<(String, i64, f64)> {
             .unwrap();
         for row in 0..batch.num_rows() {
             let r = names.value(row).to_string();
-            let a = if amounts.is_null(row) { 0.0 } else { amounts.value(row) };
+            let a = if amounts.is_null(row) {
+                0.0
+            } else {
+                amounts.value(row)
+            };
             let entry = acc.entry(r).or_insert((0, 0.0));
             entry.0 += 1;
             entry.1 += a;
@@ -129,7 +134,9 @@ fn make_stage1_pipeline(
     Pipeline::new(vec![source, aggregate])
 }
 
-async fn collect_final_batches(mut rx: tokio::sync::mpsc::Receiver<RecordBatch>) -> Vec<RecordBatch> {
+async fn collect_final_batches(
+    mut rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     while let Some(b) = rx.recv().await {
         out.push(b);
@@ -137,7 +144,7 @@ async fn collect_final_batches(mut rx: tokio::sync::mpsc::Receiver<RecordBatch>)
     out
 }
 
-    #[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
+#[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     let n_partitions = 4;
@@ -146,13 +153,8 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     let targets = make_targets(addr, &descs);
 
     let stage0_driver = Driver::new(make_stage0_pipeline(targets));
-    let mut stage1_drivers: Vec<Driver> = (0..n_partitions)
-        .map(|p| {
-            Driver::new(make_stage1_pipeline(
-                service.clone(),
-                descs[p].clone(),
-            ))
-        })
+    let stage1_drivers: Vec<Driver> = (0..n_partitions)
+        .map(|p| Driver::new(make_stage1_pipeline(service.clone(), descs[p].clone())))
         .collect();
 
     // Run Stage 0 to completion first, then a brief barrier so the
@@ -177,10 +179,12 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     let results: Vec<_> = futures::future::join_all(
         stage1_drivers
             .into_iter()
-            .map(|d| tokio::spawn(async move {
-                let rx = d.run(None).await.expect("stage1 run");
-                collect_final_batches(rx).await
-            }))
+            .map(|d| {
+                tokio::spawn(async move {
+                    let rx = d.run(None).await.expect("stage1 run");
+                    collect_final_batches(rx).await
+                })
+            })
             .collect::<Vec<_>>(),
     )
     .await;
@@ -231,12 +235,15 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
         let (got_c, got_s) = actual.get(exp_name).expect(exp_name);
         assert_eq!(*got_c, *exp_count, "{exp_name} count");
         let diff = (got_s - exp_sum).abs();
-        assert!(diff < 1e-3, "{exp_name} sum: expected {exp_sum}, got {got_s}");
+        assert!(
+            diff < 1e-3,
+            "{exp_name} sum: expected {exp_sum}, got {got_s}"
+        );
     }
     h.abort();
 }
 
-    #[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
+#[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_same_groups_not_split_across_partitions() {
     let n_partitions = 4;
@@ -246,12 +253,7 @@ async fn e2e_2stage_same_groups_not_split_across_partitions() {
 
     let stage0_driver = Driver::new(make_stage0_pipeline(targets));
     let mut stage1_drivers: Vec<Driver> = (0..n_partitions)
-        .map(|p| {
-            Driver::new(make_stage1_pipeline(
-                service.clone(),
-                descs[p].clone(),
-            ))
-        })
+        .map(|p| Driver::new(make_stage1_pipeline(service.clone(), descs[p].clone())))
         .collect();
 
     let mut handles = Vec::new();

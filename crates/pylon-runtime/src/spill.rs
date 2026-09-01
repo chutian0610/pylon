@@ -46,21 +46,16 @@ pub struct SpillHandle {
 /// `pylon-runtime` (not `pylon-types`) because the methods take
 /// `&SpillManager`, which is a concrete runtime type.
 pub trait Spillable {
+    #[allow(async_fn_in_trait)]
     /// Persist the current working set to `manager`. Returns a handle
     /// that can be passed back to `resume` later.
-    async fn spill(
-        &mut self,
-        manager: &SpillManager,
-    ) -> Result<SpillHandle>;
+    async fn spill(&mut self, manager: &SpillManager) -> Result<SpillHandle>;
 
+    #[allow(async_fn_in_trait)]
     /// Reload previously-spilled batches from `handle` and fold them
     /// into the op's in-memory state. Idempotent over `handle` —
     /// the underlying file is consumed once.
-    async fn resume(
-        &mut self,
-        manager: &SpillManager,
-        handle: SpillHandle,
-    ) -> Result<()>;
+    async fn resume(&mut self, manager: &SpillManager, handle: SpillHandle) -> Result<()>;
 }
 
 /// File-system-backed spill manager. Single-process, single-host for
@@ -93,24 +88,18 @@ impl SpillManager {
     /// `${root}/spill-<seq>.arrow` and return a handle to it. The
     /// file is *not* deleted on read; call `delete(handle)` after
     /// `resume` has incorporated the data.
-    pub fn spill(
-        &self,
-        schema: SchemaRef,
-        batches: &[RecordBatch],
-    ) -> Result<SpillHandle> {
+    pub fn spill(&self, schema: SchemaRef, batches: &[RecordBatch]) -> Result<SpillHandle> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let path = self.root.join(format!("spill-{seq}.arrow"));
 
-        let file = File::create(&path)
-            .map_err(|e| {
-                pylon_types::PylonError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("creating spill file {}: {e}", path.display()),
-                ))
-            })?;
-        let mut writer = StreamWriter::try_new(file, &schema).map_err(|e| {
-            pylon_types::PylonError::Parquet(format!("Arrow IPC writer open: {e}"))
+        let file = File::create(&path).map_err(|e| {
+            pylon_types::PylonError::Io(std::io::Error::new(
+                e.kind(),
+                format!("creating spill file {}: {e}", path.display()),
+            ))
         })?;
+        let mut writer = StreamWriter::try_new(file, &schema)
+            .map_err(|e| pylon_types::PylonError::Parquet(format!("Arrow IPC writer open: {e}")))?;
         for b in batches {
             writer.write(b).map_err(|e| {
                 pylon_types::PylonError::Parquet(format!("Arrow IPC writer write: {e}"))
@@ -121,9 +110,7 @@ impl SpillManager {
         })?;
         drop(writer);
 
-        let bytes = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         debug!(?path, seq, bytes, "spilled");
         Ok(SpillHandle { path, bytes, seq })
     }
@@ -136,9 +123,8 @@ impl SpillManager {
                 format!("opening spill file {}: {e}", handle.path.display()),
             ))
         })?;
-        let reader = StreamReader::try_new(BufReader::new(file), None).map_err(|e| {
-            pylon_types::PylonError::Parquet(format!("Arrow IPC reader open: {e}"))
-        })?;
+        let reader = StreamReader::try_new(BufReader::new(file), None)
+            .map_err(|e| pylon_types::PylonError::Parquet(format!("Arrow IPC reader open: {e}")))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
             // ArrowError -> PylonError via the `#[from] Arrow(arrow_schema::ArrowError)`
@@ -216,7 +202,7 @@ mod tests {
 
         let b1 = batch(&[1, 2, 3], &["a", "b", "c"]);
         let b2 = batch(&[4, 5], &["d", "e"]);
-        let handle = mgr.spill(schema(), &[b1.clone(), b2.clone()]).unwrap();
+        let handle = mgr.spill(schema(), &[b1, b2]).unwrap();
         assert!(handle.path.exists());
         assert!(handle.bytes > 0);
 
@@ -254,8 +240,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let mgr = SpillManager::new(&tmp).unwrap();
         let b = batch(&[1], &["x"]);
-        let h1 = mgr.spill(schema(), &[b.clone()]).unwrap();
-        let h2 = mgr.spill(schema(), &[b.clone()]).unwrap();
+        let h1 = mgr.spill(schema(), std::slice::from_ref(&b)).unwrap();
+        let h2 = mgr.spill(schema(), &[b]).unwrap();
         assert_eq!(h1.seq, 0);
         assert_eq!(h2.seq, 1);
         mgr.delete(&h1).unwrap();

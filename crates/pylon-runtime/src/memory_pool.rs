@@ -10,8 +10,8 @@
 //!   without explicit budget (e.g. most unit tests). Always allows
 //!   `try_grow`; never refuses. Equivalent to `budget = usize::MAX`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pylon_types::{MemoryPool, PylonError};
 
@@ -86,10 +86,12 @@ impl MemoryPool for PerTaskPool {
         let mut current = self.in_use.load(Ordering::Acquire);
         loop {
             let next = current.saturating_sub(bytes);
-            match self
-                .in_use
-                .compare_exchange_weak(current, next, Ordering::Release, Ordering::Acquire)
-            {
+            match self.in_use.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => return,
                 Err(actual) => current = actual,
             }

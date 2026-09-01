@@ -38,19 +38,14 @@ pub trait PhysicalExpr: Send + Sync + std::fmt::Debug {
     fn nullable(&self, schema: &Schema) -> Result<bool, PylonError>;
 
     /// Evaluate against a `RecordBatch`. Returns a columnar `Array`.
-    fn evaluate(
-        &self,
-        batch: &arrow_array::RecordBatch,
-    ) -> Result<ArrayRef, PylonError>;
+    fn evaluate(&self, batch: &arrow_array::RecordBatch) -> Result<ArrayRef, PylonError>;
 
     /// Optional: `Arrow Field` for the output of this expr. Defaults
     /// to `Field::new(self.name(), self.data_type())`; operators
     /// that need different nullability / metadata override.
-    fn return_field(
-        &self,
-        schema: &Schema,
-    ) -> Result<FieldRef, PylonError> {
-        let f = arrow_schema::Field::new(self.name(), self.data_type(schema)?, self.nullable(schema)?);
+    fn return_field(&self, schema: &Schema) -> Result<FieldRef, PylonError> {
+        let f =
+            arrow_schema::Field::new(self.name(), self.data_type(schema)?, self.nullable(schema)?);
         Ok(Arc::new(f))
     }
 
@@ -319,7 +314,7 @@ mod tests {
         let s = schema_one_col();
         let c = ColumnExpr::new(0, s.field(0).clone());
         assert_eq!(c.data_type(&s).unwrap(), DataType::Int64);
-        assert_eq!(c.nullable(&s).unwrap(), false);
+        assert!(!c.nullable(&s).unwrap());
         assert_eq!(c.name(), "c0");
     }
 
@@ -339,13 +334,16 @@ mod tests {
         assert_eq!(l.data_type(&s).unwrap(), DataType::Utf8);
         // `evaluate` returns a length-1 StringArray when called
         // against a 1-row batch.
-        let batch =
-            arrow_array::RecordBatch::try_new(Arc::new(s.clone()), vec![Arc::new(
-                arrow_array::Int64Array::from(vec![1]),
-            ) as ArrayRef])
-            .unwrap();
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::new(s),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
         let out = l.evaluate(&batch).unwrap();
-        let arr = out.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        let arr = out
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
         assert_eq!(arr.value(0), "42");
     }
 
@@ -373,6 +371,6 @@ mod tests {
         )
         .into();
         assert_eq!(agg.data_type(&s).unwrap(), DataType::Int64);
-        assert_eq!(agg.nullable(&s).unwrap(), false);
+        assert!(!agg.nullable(&s).unwrap());
     }
 }

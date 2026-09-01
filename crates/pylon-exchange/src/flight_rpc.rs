@@ -56,13 +56,17 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
         &self,
         _request: Request<arrow_flight::Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("list_flights not supported in M3 B-1"))
+        Err(Status::unimplemented(
+            "list_flights not supported in M3 B-1",
+        ))
     }
     async fn get_flight_info(
         &self,
         _request: Request<arrow_flight::FlightDescriptor>,
     ) -> Result<Response<arrow_flight::FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info not supported in M3 B-1"))
+        Err(Status::unimplemented(
+            "get_flight_info not supported in M3 B-1",
+        ))
     }
     async fn get_schema(
         &self,
@@ -74,7 +78,9 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
         &self,
         _request: Request<arrow_flight::FlightDescriptor>,
     ) -> Result<Response<arrow_flight::PollInfo>, Status> {
-        Err(Status::unimplemented("poll_flight_info not supported in M3 B-1"))
+        Err(Status::unimplemented(
+            "poll_flight_info not supported in M3 B-1",
+        ))
     }
     async fn do_exchange(
         &self,
@@ -107,7 +113,7 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
         // FlightData with `app_metadata` carrying the descriptor
         // string. The first message must be a control frame; the
         // remaining messages are pure IPC streaming bytes.
-        let ack_tx = tx.clone();
+        let ack_tx = tx;
         tokio::spawn(async move {
             let mut descriptor: Option<FlightDescriptor> = None;
             let mut stream_bytes: Vec<u8> = Vec::new();
@@ -129,12 +135,15 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                 }
                 if descriptor.is_none() {
                     let meta = data.app_metadata.clone();
-                    let desc_str = String::from_utf8(meta.to_vec())
-                        .map_err(|e| Status::invalid_argument(format!("descriptor not utf-8: {e}")));
+                    let desc_str = String::from_utf8(meta.to_vec()).map_err(|e| {
+                        Status::invalid_argument(format!("descriptor not utf-8: {e}"))
+                    });
                     match desc_str {
                         Ok(s) if !s.is_empty() => {
                             descriptor = Some(FlightDescriptor(s));
-                            let _ = ack_tx.send(Ok(make_ack(&descriptor.as_ref().unwrap()))).await;
+                            let _ = ack_tx
+                                .send(Ok(make_ack(descriptor.as_ref().unwrap())))
+                                .await;
                             continue;
                         }
                         _ => {
@@ -167,12 +176,11 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                     loop {
                         match r.next() {
                             Some(Ok(batch)) => {
-                                if batch.num_rows() > 0 {
-                                    if let Some(d) = &descriptor {
-                                        if let Err(e) = service.push(d, batch).await {
-                                            warn!(error = ?e, "service.push failed");
-                                        }
-                                    }
+                                if batch.num_rows() > 0
+                                    && let Some(d) = &descriptor
+                                    && let Err(e) = service.push(d, batch).await
+                                {
+                                    warn!(error = ?e, "service.push failed");
                                 }
                             }
                             Some(Err(e)) => {
@@ -191,7 +199,8 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
             debug!("Flight DoExchange inbound closed");
         });
 
-        let outbound: Self::DoExchangeStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let outbound: Self::DoExchangeStream =
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
         Ok(Response::new(outbound))
     }
     async fn do_get(
@@ -216,7 +225,9 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("list_actions not supported in M3 B-1"))
+        Err(Status::unimplemented(
+            "list_actions not supported in M3 B-1",
+        ))
     }
 }
 

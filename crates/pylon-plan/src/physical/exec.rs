@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 
 use crate::physical::expr::PhysicalExpr;
 use crate::physical::properties::PlanProperties;
@@ -120,11 +120,21 @@ impl fmt::Debug for SeqScanExec {
 }
 
 impl ExecutionPlan for SeqScanExec {
-    fn name(&self) -> String { "SeqScan".to_string() }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> String {
+        "SeqScan".to_string()
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -140,7 +150,9 @@ impl ExecutionPlan for SeqScanExec {
 }
 
 impl From<SeqScanExec> for Arc<dyn ExecutionPlan> {
-    fn from(c: SeqScanExec) -> Self { Arc::new(c) }
+    fn from(c: SeqScanExec) -> Self {
+        Arc::new(c)
+    }
 }
 
 /// `Filter { input, predicate }`. Default distribution requirement:
@@ -184,11 +196,21 @@ impl fmt::Debug for FilterExec {
 }
 
 impl ExecutionPlan for FilterExec {
-    fn name(&self) -> String { "Filter".to_string() }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> String {
+        "Filter".to_string()
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -200,7 +222,12 @@ impl ExecutionPlan for FilterExec {
                 children.len()
             )));
         }
-        let Self { input: _, predicate, schema, properties } = &*self;
+        let Self {
+            input: _,
+            predicate,
+            schema,
+            properties,
+        } = &*self;
         let new = FilterExec {
             input: children.into_iter().next().unwrap(),
             predicate: predicate.clone(),
@@ -212,7 +239,9 @@ impl ExecutionPlan for FilterExec {
 }
 
 impl From<FilterExec> for Arc<dyn ExecutionPlan> {
-    fn from(c: FilterExec) -> Self { Arc::new(c) }
+    fn from(c: FilterExec) -> Self {
+        Arc::new(c)
+    }
 }
 
 /// `Project { input, projections, schema }`.
@@ -254,11 +283,21 @@ impl fmt::Debug for ProjectExec {
 }
 
 impl ExecutionPlan for ProjectExec {
-    fn name(&self) -> String { "Project".to_string() }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> String {
+        "Project".to_string()
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -270,7 +309,12 @@ impl ExecutionPlan for ProjectExec {
                 children.len()
             )));
         }
-        let Self { input: _, projections, schema, properties } = &*self;
+        let Self {
+            input: _,
+            projections,
+            schema,
+            properties,
+        } = &*self;
         let new = ProjectExec {
             input: children.into_iter().next().unwrap(),
             projections: projections.clone(),
@@ -282,7 +326,9 @@ impl ExecutionPlan for ProjectExec {
 }
 
 impl From<ProjectExec> for Arc<dyn ExecutionPlan> {
-    fn from(c: ProjectExec) -> Self { Arc::new(c) }
+    fn from(c: ProjectExec) -> Self {
+        Arc::new(c)
+    }
 }
 
 /// `Aggregate { input, group_by, aggs, schema }`. The `requires_exchange`
@@ -325,25 +371,29 @@ impl fmt::Debug for AggregateExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AggregateExec")
             .field("input", &format_args!("{:?}", self.input))
-            .field(
-                "group_by",
-                &format_args!("[{} keys]", self.group_by.len()),
-            )
-            .field(
-                "aggs",
-                &format_args!("[{} aggs]", self.aggs.len()),
-            )
+            .field("group_by", &format_args!("[{} keys]", self.group_by.len()))
+            .field("aggs", &format_args!("[{} aggs]", self.aggs.len()))
             .field("schema", &self.schema)
             .finish()
     }
 }
 
 impl ExecutionPlan for AggregateExec {
-    fn name(&self) -> String { "Aggregate".to_string() }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> String {
+        "Aggregate".to_string()
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn requires_exchange(&self) -> bool {
         // Fragmenter rule: cut a stage at every `Aggregate`. R2.2.a
@@ -382,7 +432,9 @@ impl ExecutionPlan for AggregateExec {
 }
 
 impl From<AggregateExec> for Arc<dyn ExecutionPlan> {
-    fn from(c: AggregateExec) -> Self { Arc::new(c) }
+    fn from(c: AggregateExec) -> Self {
+        Arc::new(c)
+    }
 }
 
 // =====================================================================
@@ -401,27 +453,22 @@ mod tests {
 
     fn filt(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let s = input.schema();
-        let pred: Arc<dyn PhysicalExpr> = crate::physical::expr::LiteralExpr::new(
-            "0",
-            DataType::Int64,
-        )
-        .into();
+        let pred: Arc<dyn PhysicalExpr> =
+            crate::physical::expr::LiteralExpr::new("0", DataType::Int64).into();
         Arc::new(FilterExec::new(input, pred, s))
     }
 
     fn proj(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let s = input.schema();
-        let proj: Vec<Arc<dyn PhysicalExpr>> = vec![
-            crate::physical::expr::ColumnExpr::new(0, s.field(0).clone()).into(),
-        ];
+        let proj: Vec<Arc<dyn PhysicalExpr>> =
+            vec![crate::physical::expr::ColumnExpr::new(0, s.field(0).clone()).into()];
         Arc::new(ProjectExec::new(input, proj, s))
     }
 
     fn agg(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let s = input.schema();
-        let g: Vec<Arc<dyn PhysicalExpr>> = vec![
-            crate::physical::expr::ColumnExpr::new(0, s.field(0).clone()).into(),
-        ];
+        let g: Vec<Arc<dyn PhysicalExpr>> =
+            vec![crate::physical::expr::ColumnExpr::new(0, s.field(0).clone()).into()];
         let a: Vec<Arc<dyn PhysicalExpr>> = vec![
             crate::physical::expr::AggregateFunctionExpr::new(
                 "count",
@@ -471,7 +518,7 @@ mod tests {
         let children = replaced.children();
         assert_eq!(children.len(), 1);
         // Both have the same schema so identity differs:
-        assert!(!Arc::ptr_eq(&children[0], &original.children()[0]));
+        assert!(!Arc::ptr_eq(children[0], original.children()[0]));
     }
 
     #[test]
@@ -484,7 +531,7 @@ mod tests {
         // Force the non-empty path by constructing a child; even an
         // Arc<SeqScanExec> counts, because the trait object walks
         // through `children()` and the leaf would orphan it.
-        let other = scan();
+        let _other = scan();
         // Manually wrap a non-leaf in a leaf's with_new_children by
         // asking it to take a child — that's the failure path.
         // (We don't have a non-leaf helper in scope; the type system

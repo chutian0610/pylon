@@ -12,13 +12,12 @@ pub mod fragmenter;
 pub mod properties;
 
 pub use exec::{
-    AggregateExec, ExecutionPlan, FilterExec, ProjectExec, RequiredDistribution,
-    SeqScanExec,
+    AggregateExec, ExecutionPlan, FilterExec, ProjectExec, RequiredDistribution, SeqScanExec,
 };
 pub use expr::{
     AggregateFunctionExpr, BinaryOpExpr, ColumnExpr, LiteralExpr, PhysicalExpr as PhysicalExprTrait,
 };
 pub use fragmenter::{
-    rule_fires, AggregateFragmenterRule, BoundaryEmit, BoundaryStrategy, FragmenterRule,
+    AggregateFragmenterRule, BoundaryEmit, BoundaryStrategy, FragmenterRule, rule_fires,
 };
 pub use properties::{Boundedness, Distribution, EmissionType, PlanProperties};

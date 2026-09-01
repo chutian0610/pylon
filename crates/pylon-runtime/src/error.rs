@@ -1,5 +1,5 @@
-use thiserror::Error;
 use pylon_types::PylonError;
+use thiserror::Error;
 
 pub type RuntimeResult<T> = std::result::Result<T, RuntimeError>;
 
@@ -26,4 +26,3 @@ pub enum RuntimeError {
     #[error("internal: {0}")]
     Internal(String),
 }
-

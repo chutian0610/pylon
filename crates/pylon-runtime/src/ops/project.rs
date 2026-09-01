@@ -37,12 +37,18 @@ impl ProjectOp {
         if !self.first_batch_seen {
             self.first_batch_seen = true;
             if self.output_schema.fields().is_empty() {
-                let new_fields: Vec<_> = self.col_names.iter()
-                    .map(|name| batch.schema().field_with_name(name)
-                        .cloned()
-                        .unwrap_or_else(|_| {
-                            arrow_schema::Field::new(name, arrow_schema::DataType::Null, true)
-                        }))
+                let new_fields: Vec<_> = self
+                    .col_names
+                    .iter()
+                    .map(|name| {
+                        batch
+                            .schema()
+                            .field_with_name(name)
+                            .cloned()
+                            .unwrap_or_else(|_| {
+                                arrow_schema::Field::new(name, arrow_schema::DataType::Null, true)
+                            })
+                    })
                     .collect();
                 self.output_schema = Arc::new(Schema::new(new_fields));
             }
@@ -51,10 +57,15 @@ impl ProjectOp {
         let mut arrays = Vec::with_capacity(self.col_names.len());
         let in_schema = batch.schema();
         for name in &self.col_names {
-            let idx = in_schema.fields().iter().position(|f| f.name() == name)
-                .ok_or_else(|| pylon_types::PylonError::InvalidPlan(
-                    format!("projection: column {name} not found")
-                ))?;
+            let idx = in_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == name)
+                .ok_or_else(|| {
+                    pylon_types::PylonError::InvalidPlan(format!(
+                        "projection: column {name} not found"
+                    ))
+                })?;
             arrays.push(batch.column(idx).clone());
         }
         let projected = RecordBatch::try_new(self.output_schema.clone(), arrays)?;

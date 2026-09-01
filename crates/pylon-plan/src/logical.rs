@@ -92,13 +92,15 @@ pub fn input_schema(plan: &LogicalPlan) -> arrow_schema::SchemaRef {
             // Project may rename / drop columns. Compute the
             // output field list from the projections.
             let parent = input_schema(input);
-            let mut fields: Vec<Arc<arrow_schema::Field>> =
-                Vec::with_capacity(projections.len());
+            let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(projections.len());
             for (i, e) in projections.iter().enumerate() {
                 fields.push(projection_field(e, &parent, i));
             }
             Arc::new(arrow_schema::Schema::new(
-                fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+                fields
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect::<Vec<_>>(),
             ))
         }
         LogicalPlan::Aggregate { schema, .. } => schema.clone(),
@@ -112,9 +114,9 @@ fn projection_field(
 ) -> Arc<arrow_schema::Field> {
     match e {
         Expr::Column(f) => Arc::new(f.clone()),
-        Expr::AggregateFunction { name, data_type, .. } => {
-            Arc::new(arrow_schema::Field::new(name, data_type.clone(), true))
-        }
+        Expr::AggregateFunction {
+            name, data_type, ..
+        } => Arc::new(arrow_schema::Field::new(name, data_type.clone(), true)),
         // Literal / BinaryOp / Wildcard: M3 first cut is permissive
         // — generate a synthetic field name `_<index>`. Rules that
         // need real column refs (ProjectCollapse) treat these as

@@ -17,7 +17,7 @@ use arrow_schema::{DataType, Field, Schema};
 use pylon_coord::fragment::{Fragmenter, FragmenterConfig};
 use pylon_plan::physical::exec::{ExecutionPlan, SeqScanExec};
 use pylon_plan::physical::fragmenter::{
-    rule_fires, AggregateFragmenterRule, BoundaryEmit, BoundaryStrategy, FragmenterRule,
+    AggregateFragmenterRule, BoundaryEmit, BoundaryStrategy, FragmenterRule, rule_fires,
 };
 
 fn scan_schema() -> Arc<Schema> {
@@ -53,7 +53,10 @@ impl FragmenterRule for TagBoundaryRule {
         }
     }
 
-    fn stage1_op_spec(&self, node: &dyn ExecutionPlan) -> Result<BoundaryEmit, pylon_types::PylonError> {
+    fn stage1_op_spec(
+        &self,
+        node: &dyn ExecutionPlan,
+    ) -> Result<BoundaryEmit, pylon_types::PylonError> {
         Ok(BoundaryEmit::new("TagBoundary").with("tag", node.name()))
     }
 }
@@ -86,10 +89,7 @@ fn fragmenter_with_rule_appends_rule() {
 
 #[test]
 fn fragmenter_with_rules_replaces_default_set() {
-    let f = Fragmenter::with_rules(
-        FragmenterConfig::default(),
-        vec![Arc::new(TagBoundaryRule)],
-    );
+    let f = Fragmenter::with_rules(FragmenterConfig::default(), vec![Arc::new(TagBoundaryRule)]);
     let names = f.rule_names();
     assert_eq!(
         names,
@@ -163,9 +163,7 @@ fn fragmenter_with_custom_partition_count_rule_emits_n_partitions() {
     // Build an Aggregate rule with target_partitions=12 and confirm
     // the fragmenter honours it (proves rule overrides config).
     use pylon_plan::physical::exec::AggregateExec;
-    use pylon_plan::physical::expr::{
-        AggregateFunctionExpr, ColumnExpr, PhysicalExpr,
-    };
+    use pylon_plan::physical::expr::{AggregateFunctionExpr, ColumnExpr, PhysicalExpr};
 
     let scan_node = scan();
     let s = scan_node.schema();
@@ -228,7 +226,8 @@ fn plan_with_two_aggregates_is_rejected_under_m3_cap() {
         DataType::Int64,
         vec![],
     ))];
-    let inner_agg: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::new(scan_node, g, a, s.clone()));
+    let inner_agg: Arc<dyn ExecutionPlan> =
+        Arc::new(AggregateExec::new(scan_node, g, a, s.clone()));
     // Filter on top
     let col: Arc<dyn PhysicalExpr> = Arc::new(ColumnExpr::new(0, s.field(0).clone()));
     let lit: Arc<dyn PhysicalExpr> = Arc::new(LiteralExpr::new("0", DataType::Int64));
@@ -281,9 +280,7 @@ fn default_rule_set_cuts_aggregate_boundary() {
     // Back-compat: Fragmenter::new (default rule set) must still
     // cut a boundary at Aggregate — same as the M3 baseline.
     use pylon_plan::physical::exec::AggregateExec;
-    use pylon_plan::physical::expr::{
-        AggregateFunctionExpr, ColumnExpr, PhysicalExpr,
-    };
+    use pylon_plan::physical::expr::{AggregateFunctionExpr, ColumnExpr, PhysicalExpr};
 
     let scan_node = scan();
     let s = scan_node.schema();
@@ -302,14 +299,23 @@ fn default_rule_set_cuts_aggregate_boundary() {
     });
     let dag = fragmenter.fragment(&agg, 7, &["x".into()]).unwrap();
     assert_eq!(dag.stages.len(), 2);
-    assert!(dag.stages[0].fragment.ops.iter().any(|o| o.name == "ExchangeSinkRpc"));
+    assert!(
+        dag.stages[0]
+            .fragment
+            .ops
+            .iter()
+            .any(|o| o.name == "ExchangeSinkRpc")
+    );
     let n_sources = dag.stages[1]
         .fragment
         .ops
         .iter()
         .filter(|o| o.name == "ExchangeSource")
         .count();
-    assert_eq!(n_sources, 5, "5-partition strategy must propagate to ExchangeSource count");
+    assert_eq!(
+        n_sources, 5,
+        "5-partition strategy must propagate to ExchangeSource count"
+    );
 }
 
 // =====================================================================
@@ -320,9 +326,7 @@ fn default_rule_set_cuts_aggregate_boundary() {
 #[test]
 fn aggregate_rule_partition_keys_flow_into_exchange_sink_rpc_config() {
     use pylon_plan::physical::exec::AggregateExec;
-    use pylon_plan::physical::expr::{
-        AggregateFunctionExpr, ColumnExpr, PhysicalExpr,
-    };
+    use pylon_plan::physical::expr::{AggregateFunctionExpr, ColumnExpr, PhysicalExpr};
 
     let scan_node = scan();
     let s = scan_node.schema();
@@ -346,7 +350,10 @@ fn aggregate_rule_partition_keys_flow_into_exchange_sink_rpc_config() {
         .iter()
         .find(|o| o.name == "ExchangeSinkRpc")
         .expect("ExchangeSinkRpc present");
-    assert_eq!(sink.config.get("partition_keys").map(String::as_str), Some("c0"));
+    assert_eq!(
+        sink.config.get("partition_keys").map(String::as_str),
+        Some("c0")
+    );
     assert_eq!(
         sink.config.get("n_partitions").map(String::as_str),
         Some("3")

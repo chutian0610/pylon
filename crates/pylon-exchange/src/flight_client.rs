@@ -84,7 +84,8 @@ impl PylonFlightClient {
                 if schema.as_ref() != batch.schema().as_ref() {
                     return Err(PylonError::InvalidPlan(format!(
                         "schema mismatch on flight stream: expected={}, got={}",
-                        schema, batch.schema()
+                        schema,
+                        batch.schema()
                     )));
                 }
                 writer
@@ -198,10 +199,10 @@ impl Drop for PylonFlightClient {
         // await here, so we just inspect the bool without blocking; the
         // worst case is a stale read of `true` after close, which is
         // benign (no warning emitted, which is the right behavior).
-        if let Ok(guard) = self.closed.try_lock() {
-            if !*guard {
-                warn!(endpoint = %self.endpoint, "flight client dropped without close");
-            }
+        if let Ok(guard) = self.closed.try_lock()
+            && !*guard
+        {
+            warn!(endpoint = %self.endpoint, "flight client dropped without close");
         }
     }
 }
@@ -212,7 +213,11 @@ impl Drop for PylonFlightClient {
 /// trivial single-null column schema.
 fn empty_stream_writer() -> Result<StreamWriter<Vec<u8>>> {
     use arrow_schema::{DataType, Field, Schema};
-    let schema = Schema::new(vec![Field::new("__pylon_placeholder", DataType::Null, true)]);
+    let schema = Schema::new(vec![Field::new(
+        "__pylon_placeholder",
+        DataType::Null,
+        true,
+    )]);
     StreamWriter::try_new(Vec::<u8>::new(), &schema)
         .map_err(|e| PylonError::Internal(format!("ipc placeholder writer: {e}")))
 }

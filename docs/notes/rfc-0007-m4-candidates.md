@@ -22,9 +22,9 @@ single-PR-shaped unit; pick when ready.
 
 | ID | What | Why | Est |
 |---|---|---|---|
-| **B** | Mechanical autofix PR: 276 files of `cargo fmt` drift + 22 `clippy` errors | Unblocks enabling `fmt-check` + `clippy -D warnings` jobs in `ci.yml` (PR #12 deferred these). | ~9 dev days (one big PR or split per-crate) |
-| **F** | RFC 0007 §3.1 doc alignment: text says "release at Drop" but the trait surface (PR #15) added `release(bytes: usize)` as an explicit method | Small doc-only follow-up so the RFC and the canonical trait match. | ~10 min |
-| G | RFC 0005 §3 rule updates — `M4.S1 release` was added as additive to the trait; RFC text should mention it | Same scope as F. Doc-only. | ~10 min |
+| ~~**B**~~ | ~~Mechanical autofix PR: 276 files of `cargo fmt` drift + 22 `clippy` errors~~ **DONE** — `cargo fmt --all` + clippy fixes landed; `fmt-check` + `clippy -D warnings` jobs enabled in `ci.yml`. | ~~Unblocks enabling `fmt-check` + `clippy -D warnings` jobs in `ci.yml` (PR #12 deferred these).~~ | ~~~9 dev days~~ |
+| ~~**F**~~ | ~~RFC 0007 §3.1 doc alignment: text says "release at Drop" but the trait surface (PR #15) added `release(bytes: usize)` as an explicit method~~ **DONE** — trait definition and conformance rule updated to match. | ~~Small doc-only follow-up so the RFC and the canonical trait match.~~ | ~~~10 min~~ |
+| ~~G~~ | ~~RFC 0005 §3 rule updates — `M4.S1 release` was added as additive to the trait; RFC text should mention it~~ **DONE** — additive note added to `DataSource::next` doc. | ~~Same scope as F. Doc-only.~~ | ~~~10 min~~ |
 
 ## Out-of-scope (do not pick up here)
 

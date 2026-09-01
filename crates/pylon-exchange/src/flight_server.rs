@@ -13,7 +13,9 @@ impl FlightDescriptor {
             "pylon://query/{query_id}/stage/{stage_id}/task/{partition}"
         ))
     }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Default)]
@@ -22,7 +24,9 @@ pub struct PylonFlightService {
 }
 
 impl PylonFlightService {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub async fn push(&self, descriptor: &FlightDescriptor, batch: RecordBatch) -> Result<()> {
         let mut streams = self.streams.lock().await;
@@ -35,10 +39,10 @@ impl PylonFlightService {
 
     pub async fn pop(&self, descriptor: &FlightDescriptor) -> Result<Option<RecordBatch>> {
         let mut streams = self.streams.lock().await;
-        if let Some(queue) = streams.get_mut(&descriptor.0) {
-            if !queue.is_empty() {
-                return Ok(Some(queue.remove(0)));
-            }
+        if let Some(queue) = streams.get_mut(&descriptor.0)
+            && !queue.is_empty()
+        {
+            return Ok(Some(queue.remove(0)));
         }
         Ok(None)
     }

@@ -75,9 +75,42 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
-  # fmt-check, clippy -D warnings:
-  #   intentionally OFF. Pre-PR #10 main has 276 files of `cargo fmt`
-  #   drift and 22 `clippy` errors (16 in pylon-plan tests, 6 in
-  #   pylon-exchange/flight_server.rs). Enforcing either in CI would
-  #   block every PR until a mechanical autofix lands. Track in the
-  #   follow-up "mechanical autofix" PR (separate effort).
+  fmt-check:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/*
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

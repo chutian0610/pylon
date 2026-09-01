@@ -100,9 +100,13 @@ RFC 0005 §4 已经把 `Arc<dyn MemoryPool>` 作为 `DataSourceContext` 的
 /// `Vec<u8>` / Arrow allocation in pipelined ops.
 pub trait MemoryPool: Send + Sync {
     /// Try to claim N bytes. `Ok(())` if claimed; `Err` if the pool
-    /// would exceed its budget. The op MUST release bytes via
-    /// `release(bytes)` when it drops the corresponding buffer.
+    /// would exceed its budget. The op MUST call `release(bytes)`
+    /// when it is done with the buffer.
     fn try_grow(&self, bytes: usize) -> Result<(), PylonError>;
+
+    /// Releases N bytes previously claimed via `try_grow`. The op
+    /// MUST call this explicitly; release is not automatic on Drop.
+    fn release(&self, bytes: usize);
 
     /// Returns the bytes currently claimed.
     fn in_use(&self) -> usize;
@@ -122,8 +126,9 @@ pub trait MemoryPool: Send + Sync {
 ```
 
 conformance rule: 每个 op 中规模随输入增长的 `Vec<u8>`/`RecordBatch`
-必须在分配前 `try_grow`，在 Drop 时 `release`。op 的 `Drop` 永远
-最终账平（这是 RFC 0005 §3 rule #6 的具体兑现）。
+必须在分配前 `try_grow`，用完后显式调用 `release(bytes)`。op 必须
+保证在其生命周期结束前账平所有 `try_grow` 的字节（这是 RFC 0005
+§3 rule #6 的具体兑现）。
 
 ### 3.2 `Spillable` operator contract
 

@@ -28,7 +28,11 @@ use tonic::transport::Server;
 /// return `(bound_addr, service_arc, join_handle)`. Aborting the
 /// handle closes the listener; tests do that at the end of their
 /// scope.
-pub async fn start_flight_server() -> (SocketAddr, Arc<PylonFlightService>, tokio::task::JoinHandle<()>) {
+pub async fn start_flight_server() -> (
+    SocketAddr,
+    Arc<PylonFlightService>,
+    tokio::task::JoinHandle<()>,
+) {
     let service = Arc::new(PylonFlightService::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind flight");
     let addr = listener.local_addr().expect("local_addr");
