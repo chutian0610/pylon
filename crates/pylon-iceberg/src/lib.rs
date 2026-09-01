@@ -4,7 +4,9 @@
 //! currently exposes its stable SPI identity and factory.
 
 use async_trait::async_trait;
-use pylon_connector_spi::{Connector, ConnectorConfig, ConnectorFactory, ConnectorResult};
+use pylon_connector_spi::{
+    Connector, ConnectorCapabilities, ConnectorConfig, ConnectorFactory, ConnectorResult,
+};
 
 /// The Iceberg connector name recognized by the engine.
 pub const ICEBERG_CONNECTOR_NAME: &str = "iceberg";
@@ -16,6 +18,10 @@ pub struct IcebergConnector;
 impl Connector for IcebergConnector {
     fn name(&self) -> &str {
         ICEBERG_CONNECTOR_NAME
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::NOT_FAULT_TOLERANT
     }
 }
 
