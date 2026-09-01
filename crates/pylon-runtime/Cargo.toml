@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 pylon-types = { path = "../pylon-types" }
+pylon-connector-spi = { path = "../pylon-connector-spi" }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -20,6 +21,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 parquet = { workspace = true }
 pylon-exchange = { path = "../pylon-exchange" }
+pylon-storage = { path = "../pylon-storage" }
 arrow-flight = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }

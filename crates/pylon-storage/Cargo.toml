@@ -8,7 +8,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
 pylon-connector-spi = { path = "../pylon-connector-spi" }
+pylon-types = { path = "../pylon-types" }
 async-trait = { workspace = true }
 
 [dev-dependencies]

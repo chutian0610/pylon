@@ -1,4 +1,4 @@
-//! `SpillManager` + `Spillable` trait — local-FS spill lifecycle.
+//! `SpillManager` + `Spillable` trait — connector-backed spill lifecycle.
 //!
 //! Defined by RFC 0007 §3.2 + §3.3 (trait + file layout) and
 //! §5 S2 (the first cut — local FS, single-op spill-and-resume
@@ -10,23 +10,22 @@
 //!
 //! Per RFC 0007 §3.3, a spill file is one Arrow IPC streaming
 //! message: schema + N `RecordBatch` messages + EOS marker. Filenames
-//! for S2 are rooted at the manager's `root` dir and named
-//! `spill-<seq>.arrow`. The fuller
-//! `s3://<bucket>/pylon-spill/<qid>/<sid>/<tid>/<attempt>/spill-<seq>.arrow`
-//! shape from the RFC lands when the fault-tolerant connector path
-//! (S3/S4) wires through `DataSink::append`.
+//! for S3 are rooted at the manager's `root` dir and named
+//! `spill-<seq>.arrow`. All I/O routes through `pylon-storage`'s
+//! `DataSink::append` / `DataSource::next` trait objects per RFC
+//! 0007 §2 rule [b]; the manager never touches the file system
+//! directly. C4 (S3) swaps the backing store without changing this
+//! contract.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
+use pylon_connector_spi::ConnectorPage;
+use pylon_storage::{create_spill_sink, create_spill_source, delete_spill};
 use pylon_types::Result;
-use tracing::{debug, trace};
+use tracing::debug;
 
 /// An opaque reference to a spilled file. Pass back to
 /// [`SpillManager::read`] to recover the batches, or to
@@ -87,65 +86,39 @@ impl SpillManager {
     /// Write `batches` as one Arrow IPC streaming file at
     /// `${root}/spill-<seq>.arrow` and return a handle to it. The
     /// file is *not* deleted on read; call `delete(handle)` after
-    /// `resume` has incorporated the data.
+    /// `resume` has incorporated the data. All writes go through the
+    /// connector `DataSink` (RFC 0007 §2 rule [b]).
     pub fn spill(&self, schema: SchemaRef, batches: &[RecordBatch]) -> Result<SpillHandle> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let path = self.root.join(format!("spill-{seq}.arrow"));
 
-        let file = File::create(&path).map_err(|e| {
-            pylon_types::PylonError::Io(std::io::Error::new(
-                e.kind(),
-                format!("creating spill file {}: {e}", path.display()),
-            ))
-        })?;
-        let mut writer = StreamWriter::try_new(file, &schema)
-            .map_err(|e| pylon_types::PylonError::Parquet(format!("Arrow IPC writer open: {e}")))?;
+        let mut sink = create_spill_sink(&path, schema).map_err(pylon_types::PylonError::from)?;
         for b in batches {
-            writer.write(b).map_err(|e| {
-                pylon_types::PylonError::Parquet(format!("Arrow IPC writer write: {e}"))
-            })?;
+            sink.append(ConnectorPage::new(b.clone()))
+                .map_err(pylon_types::PylonError::from)?;
         }
-        writer.finish().map_err(|e| {
-            pylon_types::PylonError::Parquet(format!("Arrow IPC writer finish: {e}"))
-        })?;
-        drop(writer);
-
-        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let stats = sink.finish().map_err(pylon_types::PylonError::from)?;
+        let bytes = stats.bytes();
         debug!(?path, seq, bytes, "spilled");
         Ok(SpillHandle { path, bytes, seq })
     }
 
-    /// Read back batches from a spill file.
+    /// Read back batches from a spill file through the connector
+    /// `DataSource` (RFC 0007 §2 rule [b]).
     pub fn read(&self, handle: &SpillHandle) -> Result<Vec<RecordBatch>> {
-        let file = File::open(&handle.path).map_err(|e| {
-            pylon_types::PylonError::Io(std::io::Error::new(
-                e.kind(),
-                format!("opening spill file {}: {e}", handle.path.display()),
-            ))
-        })?;
-        let reader = StreamReader::try_new(BufReader::new(file), None)
-            .map_err(|e| pylon_types::PylonError::Parquet(format!("Arrow IPC reader open: {e}")))?;
+        let mut source =
+            create_spill_source(&handle.path).map_err(pylon_types::PylonError::from)?;
         let mut batches: Vec<RecordBatch> = Vec::new();
-        for batch_result in reader {
-            // ArrowError -> PylonError via the `#[from] Arrow(arrow_schema::ArrowError)`
-            // variant; `?` keeps the call site short.
-            let batch = batch_result?;
-            batches.push(batch);
+        while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
+            batches.push(page.into_batch());
         }
-        trace!(?handle.path, count = batches.len(), "spill resumed");
+        debug!(?handle.path, count = batches.len(), "spill resumed");
         Ok(batches)
     }
 
     /// Unlink a spill file. Idempotent: missing file is not an error.
     pub fn delete(&self, handle: &SpillHandle) -> Result<()> {
-        match std::fs::remove_file(&handle.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(pylon_types::PylonError::Io(std::io::Error::new(
-                e.kind(),
-                format!("removing spill file {}: {e}", handle.path.display()),
-            ))),
-        }
+        delete_spill(&handle.path)
     }
 }
 

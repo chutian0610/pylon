@@ -4,7 +4,9 @@
 //! currently exposes its stable SPI identity and factory.
 
 use async_trait::async_trait;
-use pylon_connector_spi::{Connector, ConnectorConfig, ConnectorFactory, ConnectorResult};
+use pylon_connector_spi::{
+    Connector, ConnectorCapabilities, ConnectorConfig, ConnectorFactory, ConnectorResult,
+};
 
 /// The catalog connector name recognized by the engine.
 pub const CATALOG_CONNECTOR_NAME: &str = "catalog";
@@ -16,6 +18,10 @@ pub struct CatalogConnector;
 impl Connector for CatalogConnector {
     fn name(&self) -> &str {
         CATALOG_CONNECTOR_NAME
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::NOT_FAULT_TOLERANT
     }
 }
 

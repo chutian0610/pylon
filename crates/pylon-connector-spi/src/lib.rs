@@ -32,7 +32,7 @@ pub use pylon_types::{
     ConnectorError, ConnectorErrorCode, RecordBatchStream, SendableRecordBatchStream,
 };
 
-pub use connector::{Connector, ConnectorConfig, ConnectorFactory};
+pub use connector::{Connector, ConnectorCapabilities, ConnectorConfig, ConnectorFactory};
 pub use page::ConnectorPage;
 pub use source::{DataSink, DataSource, WriteStats};
 

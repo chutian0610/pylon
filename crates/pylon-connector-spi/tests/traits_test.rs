@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use futures::executor::block_on;
 use pylon_connector_spi::{
-    Connector, ConnectorConfig, ConnectorFactory, ConnectorPage, ConnectorResult, DataSink,
-    DataSource, WriteStats,
+    Connector, ConnectorCapabilities, ConnectorConfig, ConnectorFactory, ConnectorPage,
+    ConnectorResult, DataSink, DataSource, WriteStats,
 };
 use pylon_types::{RecordBatch, Schema};
 
@@ -11,6 +11,10 @@ struct TestConnector;
 impl Connector for TestConnector {
     fn name(&self) -> &str {
         "test"
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::NOT_FAULT_TOLERANT
     }
 }
 

@@ -11,7 +11,7 @@ single-PR-shaped unit; pick when ready.
 
 | ID | Phase | What | Why | Est | Pre-req |
 |---|---|---|---|---|---|
-| **C3** | M4.S3 | `ConnectorCapabilities.fault_tolerant` flag + `pylon-storage` impl | Move spill bytes from local-FS to `DataSink::append` (RFC 0007 §2 rule `[b]`). Production-grade spill path. | ~5 dev days | PR #16 (M4.S2 — `Spillable` trait, `SpillManager` local-FS) |
+| ~~**C3**~~ | ~~M4.S3~~ | ~~`ConnectorCapabilities.fault_tolerant` flag + `pylon-storage` impl~~ **DONE** — SPI adds `ConnectorCapabilities` + `Connector::capabilities()`; `pylon-storage` implements local-FS Arrow IPC `DataSink`/`DataSource`; `SpillManager` routes all I/O through connector trait objects per RFC 0007 §2 rule [b]. | ~~Move spill bytes from local-FS to `DataSink::append` (RFC 0007 §2 rule `[b]`). Production-grade spill path.~~ | ~~~5 dev days~~ | ~~PR #16 (M4.S2)~~ |
 | **C4** | M4.S4 | `pylon-storage` adds `object_store` dep + `s3://` config | Real S3-compatible ObjectStorage. Without this, the `Connector::supports_fte` flag has no working backend. | ~6 dev days | C3 |
 | **C5** | M4.S5 | `QueryStateMachine::TaskAck::Stalled` + coord-side spill-handle bookkeeping (R7 follow-up) | Retries use the spill handle instead of restarting from scratch. **Also un-ignores the 2 `aggregate_2stage_e2e_test` tests deferred by PR #12.** | ~3 dev days | C3 + R7 (DONE) |
 | (skip) | M4.S6 | Spillable `SortOp` (new op) | Sort doesn't exist in M3 cut. Lower priority — wait for a real Sort use case. | ~6 dev days | C3 |
