@@ -140,6 +140,10 @@ pub struct HashAggregateOp {
     /// Where to write spill files. `None` => auto-create a tempdir
     /// on first spill.
     spill_root: Option<PathBuf>,
+    /// Spill handle from a coord re-dispatch (RFC 0007 §3.5). The
+    /// op folds the spilled batches into its state at
+    /// `no_more_input` time, before its own spill files reload.
+    pending_resume: Option<SpillHandle>,
 }
 
 impl HashAggregateOp {
@@ -184,6 +188,7 @@ impl HashAggregateOp {
             pool_allocated: 0,
             spill_handles: Vec::new(),
             spill_root: None,
+            pending_resume: None,
         }
     }
 
@@ -193,6 +198,15 @@ impl HashAggregateOp {
     /// is created lazily on the first spill.
     pub fn with_spill_root(mut self, root: PathBuf) -> Self {
         self.spill_root = Some(root);
+        self
+    }
+
+    /// Builder for a coord-retried task: the op folds the spilled
+    /// state at `handle` back in before emitting, so the retry
+    /// continues from the stall point instead of restarting
+    /// (RFC 0007 §3.5).
+    pub fn with_pending_resume(mut self, handle: SpillHandle) -> Self {
+        self.pending_resume = Some(handle);
         self
     }
 
@@ -843,6 +857,24 @@ impl PipelineOp for HashAggregateOp {
 
     async fn no_more_input(&mut self) -> Result<()> {
         if !self.emitted {
+            // RFC 0007 §3.5: a coord-retried task resumes from the
+            // spill file the stalled attempt left behind. The
+            // manager is rooted at the handle's own directory so the
+            // file is found regardless of this worker's spill_root.
+            if let Some(handle) = self.pending_resume.take() {
+                let root = handle
+                    .path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(std::env::temp_dir);
+                let mgr = SpillManager::new(root).map_err(|e| {
+                    PylonError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("retry spill manager: {e}"),
+                    ))
+                })?;
+                self.resume(&mgr, handle).await?;
+            }
             // RFC 0007 §4.1: before emitting, reload every pending
             // spill handle so the in-memory bucket map is complete.
             // (resume() unlinks the file on success.)
@@ -1252,7 +1284,9 @@ impl Spillable for HashAggregateOp {
         }
         let schema = build_spill_schema(self);
         let batch = self.build_spill_batch(schema.clone())?;
-        let handle = manager.spill(schema, std::slice::from_ref(&batch))?;
+        // RFC 0007 §2 rule [c]: the blocking I/O runs on the
+        // spawn_blocking pool; the driver awaits instead of stalling.
+        let handle = manager.spill_async(schema, vec![batch]).await?;
 
         // Free in-memory state; keep pool accounting consistent.
         self.state.clear();
@@ -1264,11 +1298,11 @@ impl Spillable for HashAggregateOp {
     }
 
     async fn resume(&mut self, manager: &SpillManager, handle: SpillHandle) -> Result<()> {
-        let batches = manager.read(&handle)?;
+        let batches = manager.read_async(handle.clone()).await?;
         for b in batches {
             self.fold_spill_batch(&b)?;
         }
-        manager.delete(&handle)?;
+        manager.delete_async(handle).await?;
         Ok(())
     }
 }

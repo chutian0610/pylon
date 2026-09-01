@@ -81,6 +81,10 @@ struct CoordState {
     /// `OpenSession` inbound handler to translate a `TaskResponse`
     /// into a `QueryStateMachine::ack_task` call.
     task_locs: Mutex<HashMap<u64, (pylon_coord::QueryId, pylon_coord::StageId)>>,
+    /// RFC 0007 §3.5 retry path: the last TaskSpec sent for each
+    /// task id. The retry watcher clones the spec, injects the
+    /// spill handle, and re-dispatches without rebuilding the DAG.
+    task_specs: Mutex<HashMap<u64, pylon_proto::pylon::TaskSpec>>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -96,6 +100,7 @@ async fn main() -> Result<()> {
         discovery: pylon_coord::Discovery::new(),
         state_machine: pylon_coord::QueryStateMachine::new(),
         task_locs: Mutex::new(HashMap::new()),
+        task_specs: Mutex::new(HashMap::new()),
     });
 
     let grpc = tonic::transport::Server::builder()
@@ -274,6 +279,77 @@ async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse
     (StatusCode::OK, Json(serde_json::json!({"workers": list}))).into_response()
 }
 
+/// RFC 0007 §3.5: watch one stage for `Stalled` acks and re-dispatch
+/// the affected tasks from their stashed specs, injecting the spill
+/// handle so the retried attempt resumes from the spill instead of
+/// restarting. Exits when the stage reaches a terminal state or the
+/// hard cap elapses.
+async fn retry_watcher(
+    state: Arc<CoordState>,
+    qid: pylon_coord::QueryId,
+    sid: pylon_coord::StageId,
+    hard_cap: std::time::Duration,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match state.state_machine.stage_state(qid, sid) {
+            Some(pylon_coord::query_state::StageState::Done)
+            | Some(pylon_coord::query_state::StageState::Failed) => return,
+            _ => {}
+        }
+        if start.elapsed() >= hard_cap {
+            warn!(query_id = qid.0, stage_id = sid.0, "retry watcher hard cap");
+            return;
+        }
+        for (tid, _) in state.state_machine.stalled_handles(qid, sid) {
+            // Consume the handle exactly once; the retried attempt's
+            // terminal ack clears the QSM entry.
+            let Some(handle) = state.state_machine.clear_stalled(qid, sid, tid) else {
+                continue;
+            };
+            let spec = state.task_specs.lock().unwrap().get(&tid.0).cloned();
+            let Some(mut spec) = spec else {
+                continue;
+            };
+            if let Some(fragment) = spec.fragment.as_mut() {
+                for op in &mut fragment.ops {
+                    if op.name == "Aggregate" {
+                        op.config.insert(
+                            "spill_handle".to_string(),
+                            handle.path.to_string_lossy().to_string(),
+                        );
+                    }
+                }
+            }
+            let workers: Vec<Arc<WorkerHandle>> =
+                state.workers.lock().unwrap().values().cloned().collect();
+            let Some(worker) = workers.get(tid.0 as usize % workers.len().max(1)).cloned() else {
+                // No worker available; put the handle back for the
+                // next pass.
+                state.state_machine.put_back_stalled(qid, sid, tid, handle);
+                continue;
+            };
+            if worker
+                .tx
+                .send(TaskRequest { spec: Some(spec) })
+                .await
+                .is_ok()
+            {
+                info!(
+                    task_id = tid.0,
+                    query_id = qid.0,
+                    stage_id = sid.0,
+                    spill = %handle.path.display(),
+                    "re-dispatched stalled task"
+                );
+            } else {
+                state.state_machine.put_back_stalled(qid, sid, tid, handle);
+            }
+        }
+    }
+}
+
 async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> Result<()> {
     // 1. Parse SQL to PhysicalPlan
     let stmt = parse_sql(sql).context("sql parse")?;
@@ -436,6 +512,13 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
         .await
         .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
         info!(stage = 0, worker = 0, "stage0 dispatched");
+        // RFC 0007 §3.5: keep the spec so the retry watcher can
+        // re-dispatch from it if the task acks Stalled.
+        state
+            .task_specs
+            .lock()
+            .unwrap()
+            .insert(stage0.id, stage0.clone());
         // Save stage0 task ID for the polling task to drain.
         {
             let mut qmap = state.queries.lock().unwrap();
@@ -475,6 +558,18 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             .lock()
             .unwrap()
             .insert(stage0_task_id_for_register, (stage0_qid, stage0_sid));
+        // RFC 0007 §3.5: consume Stalled acks while the stage runs.
+        {
+            let watcher_state = state_for_send.clone();
+            let watcher_qid = stage0_qid;
+            let watcher_sid = stage0_sid;
+            tokio::spawn(retry_watcher(
+                watcher_state,
+                watcher_qid,
+                watcher_sid,
+                stage0_deadline + std::time::Duration::from_secs(5),
+            ));
+        }
         let stage0_wait = state_for_send
             .state_machine
             .wait_for_stage_done(stage0_qid, stage0_sid, stage0_deadline)
@@ -549,6 +644,12 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     warn!(partition = p, worker = worker_idx, "stage1 send failed");
                     continue;
                 }
+                // RFC 0007 §3.5: stash the spec for the retry watcher.
+                state_for_send
+                    .task_specs
+                    .lock()
+                    .unwrap()
+                    .insert(stage1_task_id, task_spec.clone());
                 // Register with QSM + reverse index immediately so
                 // the inbound open_session handler can resolve
                 // TaskResponse.task_id → (qid, sid) and the
@@ -574,6 +675,17 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     stage1_sid,
                     stage1_register_ids,
                 );
+                {
+                    let watcher_state = state_for_send.clone();
+                    let watcher_qid = stage1_qid;
+                    let watcher_sid = stage1_sid;
+                    tokio::spawn(retry_watcher(
+                        watcher_state,
+                        watcher_qid,
+                        watcher_sid,
+                        stage1_deadline + std::time::Duration::from_secs(5),
+                    ));
+                }
                 let stage1_wait = state_for_send
                     .state_machine
                     .wait_for_stage_done(stage1_qid, stage1_sid, stage1_deadline)

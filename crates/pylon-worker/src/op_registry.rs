@@ -160,7 +160,19 @@ fn build_default_registry() -> OpRegistry {
             let aggregates = parse_agg_specs(&get(cfg, "agg_specs")?)?;
             // Schema::empty() — the op derives it on first input batch.
             let schema = Arc::new(arrow_schema::Schema::empty());
-            Ok(Box::new(HashAggregateOp::new(group_by_cols, aggregates, schema)))
+            let mut op = HashAggregateOp::new(group_by_cols, aggregates, schema);
+            // RFC 0007 §3.5: a coord-retried task carries the spill
+            // handle of the stalled attempt; the op resumes from it
+            // at no_more_input instead of restarting from scratch.
+            if let Some(key) = cfg.get("spill_handle").filter(|k| !k.is_empty()) {
+                let handle = pylon_runtime::spill::SpillHandle {
+                    path: std::path::PathBuf::from(key),
+                    bytes: 0,
+                    seq: 0,
+                };
+                op = op.with_pending_resume(handle);
+            }
+            Ok(Box::new(op))
         })
 }
 

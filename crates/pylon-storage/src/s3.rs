@@ -11,6 +11,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
@@ -35,6 +36,29 @@ static S3_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     S3_RUNTIME.block_on(fut)
+}
+
+/// Per-operation S3 deadlines. A hung endpoint (network partition,
+/// MinIO overload) must fail the op within these bounds instead of
+/// blocking the calling thread forever.
+const PUT_TIMEOUT: Duration = Duration::from_secs(30);
+const GET_TIMEOUT: Duration = Duration::from_secs(60);
+const DELETE_TIMEOUT: Duration = Duration::from_secs(15);
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn timeout_err(op: &str) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorCode::Io, format!("s3 {op}: timed out"))
+}
+
+fn block_on_timeout<T>(
+    op: &str,
+    deadline: Duration,
+    fut: impl std::future::Future<Output = object_store::Result<T>>,
+) -> ConnectorResult<T> {
+    match block_on(tokio::time::timeout(deadline, fut)) {
+        Ok(res) => res.map_err(|e| object_store_err(op, e)),
+        Err(_) => Err(timeout_err(op)),
+    }
 }
 
 /// Connection settings for an S3-compatible object store.
@@ -303,15 +327,15 @@ impl S3SpillStore {
     pub fn put(&self, key: &str, bytes: Vec<u8>) -> ConnectorResult<()> {
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(bytes);
-        block_on(self.store.put(&path, payload)).map_err(|e| object_store_err("put", e))?;
+        block_on_timeout("put", PUT_TIMEOUT, self.store.put(&path, payload))?;
         Ok(())
     }
 
     /// Reads the full object at `key`.
     pub fn get(&self, key: &str) -> ConnectorResult<Vec<u8>> {
         let path = ObjectPath::from(key);
-        let result = block_on(self.store.get(&path)).map_err(|e| object_store_err("get", e))?;
-        let bytes = block_on(result.bytes()).map_err(|e| object_store_err("get body", e))?;
+        let result = block_on_timeout("get", GET_TIMEOUT, self.store.get(&path))?;
+        let bytes = block_on_timeout("get body", GET_TIMEOUT, result.bytes())?;
         Ok(bytes.to_vec())
     }
 
@@ -319,17 +343,19 @@ impl S3SpillStore {
     /// gone (S3 semantics: DELETE on missing key is a no-op).
     pub fn delete(&self, key: &str) -> ConnectorResult<()> {
         let path = ObjectPath::from(key);
-        block_on(self.store.delete(&path)).map_err(|e| object_store_err("delete", e))?;
+        block_on_timeout("delete", DELETE_TIMEOUT, self.store.delete(&path))?;
         Ok(())
     }
 
     /// Returns `true` if the object exists (best-effort via HEAD).
     pub fn exists(&self, key: &str) -> ConnectorResult<bool> {
         let path = ObjectPath::from(key);
-        match block_on(self.store.head(&path)) {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(object_store_err("head", e)),
+        let fut = self.store.head(&path);
+        match block_on(tokio::time::timeout(HEAD_TIMEOUT, fut)) {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(object_store::Error::NotFound { .. })) => Ok(false),
+            Ok(Err(e)) => Err(object_store_err("head", e)),
+            Err(_) => Err(timeout_err("head")),
         }
     }
 }

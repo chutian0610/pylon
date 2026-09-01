@@ -102,6 +102,42 @@ impl SpillManager {
         &self.root
     }
 
+    fn open_sink(
+        s3: Option<&S3SpillStore>,
+        path: &Path,
+        schema: SchemaRef,
+    ) -> Result<Box<dyn DataSink>> {
+        if let Some(store) = s3 {
+            Ok(Box::new(S3DataSink::new(
+                store.clone(),
+                path.to_string_lossy(),
+                schema,
+            )))
+        } else {
+            create_spill_sink(path, schema).map_err(pylon_types::PylonError::from)
+        }
+    }
+
+    fn open_source(s3: Option<&S3SpillStore>, path: &Path) -> Result<Box<dyn DataSource>> {
+        if let Some(store) = s3 {
+            let source = S3DataSource::new(store.clone(), path.to_string_lossy())
+                .map_err(pylon_types::PylonError::from)?;
+            Ok(Box::new(source))
+        } else {
+            create_spill_source(path).map_err(pylon_types::PylonError::from)
+        }
+    }
+
+    fn remove(s3: Option<&S3SpillStore>, path: &Path) -> Result<()> {
+        if let Some(store) = s3 {
+            store
+                .delete(&path.to_string_lossy())
+                .map_err(pylon_types::PylonError::from)
+        } else {
+            delete_spill(path)
+        }
+    }
+
     /// Write `batches` as one Arrow IPC streaming file at
     /// `${root}/spill-<seq>.arrow` and return a handle to it. The
     /// file is *not* deleted on read; call `delete(handle)` after
@@ -111,25 +147,25 @@ impl SpillManager {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let path = self.root.join(format!("spill-{seq}.arrow"));
 
-        let bytes = if let Some(store) = &self.s3 {
-            let mut sink = S3DataSink::new(store.clone(), path.to_string_lossy(), schema);
+        let mut sink = Self::open_sink(self.s3.as_ref(), &path, schema)?;
+        let write_result = (|| -> Result<u64> {
             for b in batches {
                 sink.append(ConnectorPage::new(b.clone()))
                     .map_err(pylon_types::PylonError::from)?;
             }
-            sink.finish()
+            Ok(sink
+                .finish()
                 .map_err(pylon_types::PylonError::from)?
-                .bytes()
-        } else {
-            let mut sink =
-                create_spill_sink(&path, schema).map_err(pylon_types::PylonError::from)?;
-            for b in batches {
-                sink.append(ConnectorPage::new(b.clone()))
-                    .map_err(pylon_types::PylonError::from)?;
+                .bytes())
+        })();
+        let bytes = match write_result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Roll back the partial write so a failed spill does
+                // not leave an orphan file / object behind.
+                let _ = sink.abort();
+                return Err(e);
             }
-            sink.finish()
-                .map_err(pylon_types::PylonError::from)?
-                .bytes()
         };
         debug!(?path, seq, bytes, "spilled");
         Ok(SpillHandle { path, bytes, seq })
@@ -138,16 +174,9 @@ impl SpillManager {
     /// Read back batches from a spill file through the connector
     /// `DataSource` (RFC 0007 §2 rule [b]).
     pub fn read(&self, handle: &SpillHandle) -> Result<Vec<RecordBatch>> {
+        let mut source = Self::open_source(self.s3.as_ref(), &handle.path)?;
         let mut batches: Vec<RecordBatch> = Vec::new();
-        if let Some(store) = &self.s3 {
-            let mut source = S3DataSource::new(store.clone(), handle.path.to_string_lossy())
-                .map_err(pylon_types::PylonError::from)?;
-            while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
-                batches.push(page.into_batch());
-            }
-        } else {
-            let mut source =
-                create_spill_source(&handle.path).map_err(pylon_types::PylonError::from)?;
+        {
             while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
                 batches.push(page.into_batch());
             }
@@ -158,13 +187,69 @@ impl SpillManager {
 
     /// Unlink a spill file. Idempotent: missing file is not an error.
     pub fn delete(&self, handle: &SpillHandle) -> Result<()> {
-        if let Some(store) = &self.s3 {
-            store
-                .delete(&handle.path.to_string_lossy())
-                .map_err(pylon_types::PylonError::from)
-        } else {
-            delete_spill(&handle.path)
-        }
+        Self::remove(self.s3.as_ref(), &handle.path)
+    }
+
+    /// Async variant of [`SpillManager::spill`]. RFC 0007 §2 rule
+    /// [c]: the engine must not block a tokio worker on object
+    /// storage, so the blocking I/O runs on the spawn_blocking pool
+    /// and the driver awaits completion.
+    pub async fn spill_async(
+        &self,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<SpillHandle> {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let path = self.root.join(format!("spill-{seq}.arrow"));
+        let s3 = self.s3.clone();
+        tokio::task::spawn_blocking(move || -> Result<SpillHandle> {
+            let mut sink = Self::open_sink(s3.as_ref(), &path, schema)?;
+            let write_result = (|| -> Result<u64> {
+                for b in &batches {
+                    sink.append(ConnectorPage::new(b.clone()))
+                        .map_err(pylon_types::PylonError::from)?;
+                }
+                Ok(sink
+                    .finish()
+                    .map_err(pylon_types::PylonError::from)?
+                    .bytes())
+            })();
+            let bytes = match write_result {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = sink.abort();
+                    return Err(e);
+                }
+            };
+            debug!(?path, seq, bytes, "spilled");
+            Ok(SpillHandle { path, bytes, seq })
+        })
+        .await
+        .map_err(|e| pylon_types::PylonError::Internal(format!("spill task: {e}")))?
+    }
+
+    /// Async variant of [`SpillManager::read`] (see `spill_async`).
+    pub async fn read_async(&self, handle: SpillHandle) -> Result<Vec<RecordBatch>> {
+        let s3 = self.s3.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<RecordBatch>> {
+            let mut source = Self::open_source(s3.as_ref(), &handle.path)?;
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            while let Some(page) = source.next().map_err(pylon_types::PylonError::from)? {
+                batches.push(page.into_batch());
+            }
+            debug!(?handle.path, count = batches.len(), "spill resumed");
+            Ok(batches)
+        })
+        .await
+        .map_err(|e| pylon_types::PylonError::Internal(format!("spill read task: {e}")))?
+    }
+
+    /// Async variant of [`SpillManager::delete`] (see `spill_async`).
+    pub async fn delete_async(&self, handle: SpillHandle) -> Result<()> {
+        let s3 = self.s3.clone();
+        tokio::task::spawn_blocking(move || Self::remove(s3.as_ref(), &handle.path))
+            .await
+            .map_err(|e| pylon_types::PylonError::Internal(format!("spill delete task: {e}")))?
     }
 }
 

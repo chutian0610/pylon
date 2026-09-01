@@ -219,6 +219,38 @@ impl QueryStateMachine {
             .unwrap_or_default()
     }
 
+    /// Atomically takes (and clears) the pending spill handle for a
+    /// stalled task. The dispatcher calls this right before
+    /// re-dispatching so a handle is consumed exactly once.
+    pub fn clear_stalled(
+        &self,
+        query_id: QueryId,
+        stage_id: StageId,
+        task_id: TaskId,
+    ) -> Option<SpillHandle> {
+        let mut g = self.inner.lock().unwrap();
+        g.stalled
+            .get_mut(&(query_id, stage_id))
+            .and_then(|m| m.remove(&task_id))
+    }
+
+    /// Restores a previously-taken stalled handle (e.g. a re-dispatch
+    /// that could not find a free worker). Overwrites any newer entry
+    /// for the task.
+    pub fn put_back_stalled(
+        &self,
+        query_id: QueryId,
+        stage_id: StageId,
+        task_id: TaskId,
+        handle: SpillHandle,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        g.stalled
+            .entry((query_id, stage_id))
+            .or_default()
+            .insert(task_id, handle);
+    }
+
     /// Await stage-done (or timeout). Returns `Ok(())` once every
     /// expected task has acked Done; `Err(PylonError::Internal)`
     /// on ack Failed or timeout.
@@ -513,6 +545,33 @@ mod tests {
         // Every task has *an* ack, but t(2)'s is Stalled — the stage
         // must not report Done until the retry lands.
         assert_eq!(qsm.stage_state(q(1), s(1)), Some(StageState::Running));
+    }
+
+    #[test]
+    fn clear_and_put_back_stalled_handle() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1)]);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(1),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/spill-take.arrow"),
+            },
+        );
+        // Dispatcher takes the handle for re-dispatch.
+        let taken = qsm.clear_stalled(q(1), s(1), t(1));
+        assert!(taken.is_some(), "handle taken once");
+        assert!(
+            qsm.clear_stalled(q(1), s(1), t(1)).is_none(),
+            "no double take"
+        );
+        // Re-dispatch fails (no worker): the handle goes back for
+        // the next watcher pass.
+        qsm.put_back_stalled(q(1), s(1), t(1), taken.unwrap());
+        let again = qsm.stalled_handle(q(1), s(1), t(1));
+        assert!(again.is_some(), "handle restored");
+        assert_eq!(again.unwrap().path, PathBuf::from("/tmp/spill-take.arrow"));
     }
 
     #[tokio::test(flavor = "current_thread")]
