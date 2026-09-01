@@ -198,3 +198,81 @@ async fn hash_aggregate_no_pool_constraint_does_not_spill() {
     let out = agg.get_output().await.expect("get_output").expect("batch");
     assert_eq!(out.num_rows(), 4);
 }
+
+/// RFC 0007 §3.5: a coord-retried task resumes from the stalled
+/// attempt's spill file via `with_pending_resume`. Op A spills and
+/// dies (simulating the stall); Op B — the retry — folds the spilled
+/// state plus its own input and emits the merged groups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_resume_folds_retry_spill() {
+    let spill_root = std::env::temp_dir().join(format!(
+        "pylon-spill-retry-pid{}-t{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&spill_root);
+    let mgr = SpillManager::new(&spill_root).expect("tempdir");
+
+    // Op A (stalled attempt): fold b1, spill its state, drop.
+    let mut op_a = HashAggregateOp::new(
+        vec!["name".to_string()],
+        vec![AggSpec {
+            func: "count".to_string(),
+            arg_col: None,
+            out_name: "count".to_string(),
+        }],
+        Arc::new(Schema::empty()),
+    );
+    op_a.add_input(make_batch(0, 100)).await.expect("b1 in");
+    let handle = {
+        use pylon_runtime::Spillable;
+        op_a.spill(&mgr).await.expect("op A spills state")
+    };
+    // Op A dies here without emitting (the stall). The spill file
+    // stays on disk for the retry.
+    drop(op_a);
+    assert!(handle.path.exists(), "spill file exists for retry");
+
+    // Op B (coord retry): carries the handle; folds the spilled
+    // state plus its own input at no_more_input.
+    let mut op_b = HashAggregateOp::new(
+        vec!["name".to_string()],
+        vec![AggSpec {
+            func: "count".to_string(),
+            arg_col: None,
+            out_name: "count".to_string(),
+        }],
+        Arc::new(Schema::empty()),
+    )
+    .with_pending_resume(handle);
+    op_b.add_input(make_batch(100, 100)).await.expect("b2 in");
+    op_b.no_more_input().await.expect("no_more_input");
+
+    let final_batch = op_b
+        .get_output()
+        .await
+        .expect("get_output")
+        .expect("final batch");
+    assert_eq!(final_batch.num_rows(), 4, "4 groups");
+    let names = final_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = final_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut actual: Vec<(String, i64)> = (0..final_batch.num_rows())
+        .map(|i| (names.value(i).to_string(), counts.value(i)))
+        .collect();
+    actual.sort();
+    // Merged result = the same groups an uninterrupted 200-row run
+    // would produce: b1 (spilled state) contributed name_00/01,
+    // the retry's own input b2 contributed name_02/03.
+    assert_eq!(actual, expected_groups(), "retry folded spilled state");
+}

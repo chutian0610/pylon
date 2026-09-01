@@ -212,6 +212,15 @@ Stalled → coord 端 `QueryStateMachine.attempt + 1`，spill_handle 落
 到 coord-side metadata（in-memory + on-disk log，跟随
 milestones.md M4 "FTE source" 那一栏的实现走）。
 
+> **Status (2026-09, M4.S5 + C5.5)**: Stalled ack + coord-side
+> bookkeeping 已落地（`TaskAck::Stalled` / attempt counter /
+> stalled-handle registry）。重派链条也已闭合：dispatcher 为每个
+> stage 启动 retry watcher，消费 `stalled_handles()` 后按原
+> `TaskSpec` 重派并注入 `spill_handle` OpSpec 键；
+> `HashAggregateOp::with_pending_resume` 在 `no_more_input` 时折叠
+> spilled state，重试从断点续算而非重启。on-disk log 与跨 S3
+> spill root 的重派仍在 M4.S7/S8 之前补（见 candidates C5.6）。
+
 ## 4. Operator-level changes (where to look during implementation)
 
 ### 4.1 `HashAggregateOp` 重写（aggregate.rs）
