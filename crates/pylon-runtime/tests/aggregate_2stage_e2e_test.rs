@@ -144,7 +144,6 @@ async fn collect_final_batches(
     out
 }
 
-#[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     let n_partitions = 4;
@@ -157,15 +156,11 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
         .map(|p| Driver::new(make_stage1_pipeline(service.clone(), descs[p].clone())))
         .collect();
 
-    // Run Stage 0 to completion first, then a brief barrier so the
-    // DoExchange tasks (spawned by `ExchangeSinkRpc`) flush, then
-    // Stage 1. Sequential stages avoid the ExchangeSourceOp
-    // `producer_done_threshold` heuristic (5 empty polls × 50 ms)
-    // tripping between stage0 driver exit and RPC completion.
-    //
-    // M3-tail item #1 — real TaskDone ack — replaces the sleep
-    // with an explicit barrier; for now the heuristic + sleep is
-    // good enough for the e2e shape test.
+    // Run Stage 0 to completion first, then wait deterministically
+    // until every row has landed in the FlightService queues before
+    // starting Stage 1. The old 500 ms sleep raced on shared CI
+    // runners; `pending_rows` is an exact drain barrier (RFC 0007
+    // M4.S5 follow-up).
     let stage0_handle = tokio::spawn(async move {
         let rx = stage0_driver.run(None).await.expect("stage0 run");
         collect_final_batches(rx).await
@@ -175,7 +170,22 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
         stage0_batches.is_empty(),
         "stage0 sink produces no output batches"
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let total_rows = 100_000; // sample.parquet row count
+    let barrier_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut landed = 0usize;
+        for d in &descs {
+            landed += service.pending_rows(d).await;
+        }
+        if landed >= total_rows {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < barrier_deadline,
+            "stage0 drain barrier: only {landed}/{total_rows} rows landed in 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let results: Vec<_> = futures::future::join_all(
         stage1_drivers
             .into_iter()
@@ -243,7 +253,6 @@ async fn e2e_2stage_partitioned_aggregate_matches_expected() {
     h.abort();
 }
 
-#[ignore = "flaky on shared CI runners (tokio::time::sleep 500ms is not deterministic enough on ubuntu-latest); the proper fix is RFC 0007 M4.S5 — replace the heuristic with a real TaskAck::Stalled barrier. Run locally with `cargo test --workspace -- --ignored`."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_2stage_same_groups_not_split_across_partitions() {
     let n_partitions = 4;
@@ -256,11 +265,36 @@ async fn e2e_2stage_same_groups_not_split_across_partitions() {
         .map(|p| Driver::new(make_stage1_pipeline(service.clone(), descs[p].clone())))
         .collect();
 
-    let mut handles = Vec::new();
-    handles.push(tokio::spawn(async move {
+    // Stage 0 first, then a deterministic drain barrier (all rows
+    // landed in the FlightService queues), then Stage 1. This
+    // removes the race that made this test flaky on shared CI
+    // runners (it previously ran both stages concurrently and
+    // relied on the ExchangeSourceOp empty-poll heuristic).
+    let stage0_handle = tokio::spawn(async move {
         let rx = stage0_driver.run(None).await.expect("stage0 run");
         collect_final_batches(rx).await
-    }));
+    });
+    let stage0_batches = stage0_handle.await.expect("stage0 task ok");
+    assert!(stage0_batches.is_empty(), "stage0 produces no output");
+
+    let mut handles = Vec::new();
+    let total_rows = 100_000; // sample.parquet row count
+    let barrier_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut landed = 0usize;
+        for d in &descs {
+            landed += service.pending_rows(d).await;
+        }
+        if landed >= total_rows {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < barrier_deadline,
+            "stage0 drain barrier: only {landed}/{total_rows} rows landed in 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     for d in stage1_drivers.drain(..) {
         handles.push(tokio::spawn(async move {
             let rx = d.run(None).await.expect("stage1 run");
@@ -268,7 +302,7 @@ async fn e2e_2stage_same_groups_not_split_across_partitions() {
         }));
     }
     let results = futures::future::join_all(handles).await;
-    let stage1_results: Vec<Vec<RecordBatch>> = results[1..]
+    let stage1_results: Vec<Vec<RecordBatch>> = results
         .iter()
         .map(|h| h.as_ref().unwrap().clone())
         .collect();

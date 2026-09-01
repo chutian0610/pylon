@@ -925,6 +925,32 @@ impl Worker for CoordGrpc {
                                     "QSM ack: failed"
                                 );
                             }
+                            (4, Some((qid, sid))) => {
+                                // RFC 0007 §3.5: recoverable spill
+                                // boundary. Record the handle; the
+                                // dispatcher reads it back via
+                                // stalled_handles() to re-dispatch.
+                                let key = resp.spill_handle.clone();
+                                state.state_machine.ack_task(
+                                    qid,
+                                    sid,
+                                    pylon_coord::TaskId(tid),
+                                    pylon_coord::query_state::TaskAck::Stalled {
+                                        spill_handle: pylon_runtime::spill::SpillHandle {
+                                            path: std::path::PathBuf::from(key),
+                                            bytes: 0,
+                                            seq: 0,
+                                        },
+                                    },
+                                );
+                                info!(
+                                    worker = worker_id.0,
+                                    task_id = tid,
+                                    qid = qid.0,
+                                    stage_id = sid.0,
+                                    "QSM ack: stalled"
+                                );
+                            }
                             _ => {
                                 // Either state is RUNNING/CANCELLED
                                 // (no ack) or task_id was never
