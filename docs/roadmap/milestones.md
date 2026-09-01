@@ -9,8 +9,8 @@
 | 任务 | 状态 |
 |---|---|
 | 创建 workspace `Cargo.toml` | ✅ 完成 |
-| 添加 `pre-commit` (rustfmt, clippy, cargo-deny) | 🟡 进行中 (PR #12 落地: `.pre-commit-config.yaml` + `tools/deny.toml` + `cargo deny check` CI job。**rustfmt** 跟 **clippy -D warnings** 尚未接 — main 上现有 276 文件 cargo fmt 漂移 + 22 clippy errors，留给独立 *mechanical autofix* PR。) |
-| GitHub Actions CI 模版 | ✅ 完成 (PR #12: `.github/workflows/ci.yml` 现在有 3 jobs — `boundary-checks`、`build-test` (cargo build + cargo test)、`deny-check` (cargo deny)。fmt-check / clippy -D warnings jobs 留待 mechanical autofix PR。) |
+| 添加 `pre-commit` (rustfmt, clippy, cargo-deny) | ✅ 完成 (PR #12 落地 `.pre-commit-config.yaml` + `tools/deny.toml` + `cargo deny check` CI job；PR #17 mechanical autofix 完成 `cargo fmt --all` + 全部 clippy 修复，rustfmt / clippy -D warnings 质量门已开。) |
+| GitHub Actions CI 模版 | ✅ 完成 (PR #12: `.github/workflows/ci.yml` 3 jobs (`boundary-checks`、`build-test`、`deny-check`)；PR #17 新增 `fmt-check` + `clippy (-D warnings)` 两个 job，共 5 jobs。) |
 | 8 个 crate 全部创建空 stub | ✅ 完成 (11 main crates + 2 tools: pylon-types / -plan / -runtime / -connector-spi / -exchange / -catalog / -iceberg / -proto / -storage / -coord / -worker / tools/gen-sample-data / tools/verify-output。每个 crate 都有自己的 `src/`，远超 stub。) |
 | 调研笔记 `docs/research/findings.md` | ✅ 完成 |
 | RFC 0001 Architecture | ✅ 完成 |
