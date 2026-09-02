@@ -138,6 +138,15 @@ fn build_default_registry() -> OpRegistry {
         })
         .register("ExchangeSource", move |cfg, _ctx, flight| {
             let desc = pylon_exchange::FlightDescriptor(get(cfg, "descriptor")?);
+            // FTE source: a persisted input log replaces the
+            // drain-once queue — required for re-dispatched tasks and
+            // used for every dispatched stage-1 task.
+            if let Some(log) = cfg.get("input_log").filter(|p| !p.is_empty()) {
+                return Ok(Box::new(ExchangeSourceOp::from_log(
+                    desc,
+                    std::path::Path::new(log),
+                )?));
+            }
             Ok(Box::new(ExchangeSourceOp::new(desc, flight)))
         })
         .register("ExchangeSinkRpc", move |cfg, _ctx, _flight| {

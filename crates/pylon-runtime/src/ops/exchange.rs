@@ -135,6 +135,10 @@ pub struct ExchangeSourceOp {
     /// M4+ replaces this with explicit Flight FIN signal.
     empty_polls: u32,
     producer_done_threshold: u32,
+    /// FTE source (RFC 0007): when set, input comes from a persisted
+    /// exchange log (survives worker loss) instead of the drain-once
+    /// flight queue. Served FIFO via `VecDeque`.
+    log_backed: Option<std::collections::VecDeque<RecordBatch>>,
 }
 
 impl ExchangeSourceOp {
@@ -146,7 +150,32 @@ impl ExchangeSourceOp {
             upstream_done: false,
             empty_polls: 0,
             producer_done_threshold: 5, // M3 heuristic
+            log_backed: None,
         }
+    }
+
+    /// FTE source: constructs a source that replays a persisted
+    /// exchange-input log (written by the flight server's do_exchange
+    /// on the partition-owner worker). The log is read eagerly; the
+    /// drain-once queue is bypassed entirely.
+    pub fn from_log(descriptor: FlightDescriptor, log_path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(log_path).map_err(|e| {
+            pylon_types::PylonError::Io(std::io::Error::new(
+                e.kind(),
+                format!("reading input log {}: {e}", log_path.display()),
+            ))
+        })?;
+        let batches = pylon_exchange::codec::read_concatenated_ipc(bytes)
+            .map_err(|e| pylon_types::PylonError::Internal(format!("input log decode: {e}")))?;
+        Ok(Self {
+            descriptor,
+            service: Arc::new(PylonFlightService::new()),
+            input_buf: Vec::new(),
+            upstream_done: false,
+            empty_polls: 0,
+            producer_done_threshold: 5,
+            log_backed: Some(std::collections::VecDeque::from(batches)),
+        })
     }
 }
 
@@ -161,6 +190,9 @@ impl PipelineOp for ExchangeSourceOp {
     }
 
     async fn get_output(&mut self) -> Result<Option<RecordBatch>> {
+        if let Some(log) = &mut self.log_backed {
+            return Ok(log.pop_front());
+        }
         if let Some(b) = self.input_buf.pop() {
             return Ok(Some(b));
         }
@@ -192,6 +224,9 @@ impl PipelineOp for ExchangeSourceOp {
     }
 
     async fn is_finished(&self) -> bool {
+        if let Some(log) = &self.log_backed {
+            return self.upstream_done && log.is_empty();
+        }
         let pending = self.service.pending(&self.descriptor).await;
         self.upstream_done && self.input_buf.is_empty() && pending == 0
     }
@@ -231,6 +266,12 @@ pub struct ExchangeSinkRpc {
     /// Lazily resolved column indices (None until first add_input).
     partition_key_indices: Option<Vec<usize>>,
     upstream_done: bool,
+    /// M4 FTE: in-flight DoExchange jobs. `no_more_input` joins them
+    /// so the stage-0 TASK_DONE ack implies every target has finished
+    /// processing (and, with FTE source, finished appending its
+    /// persisted input log). Replaces the old fire-and-forget spawn
+    /// + 500 ms sleep heuristic.
+    inflight: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ExchangeSinkRpc {
@@ -278,6 +319,7 @@ impl ExchangeSinkRpc {
         );
         Self {
             targets,
+            inflight: Vec::new(),
             partition_keys,
             partition_key_indices: None,
             upstream_done: false,
@@ -398,7 +440,7 @@ impl PipelineOp for ExchangeSinkRpc {
         for (url, messages) in jobs {
             let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
                 Self::send_rpc_job(url, messages);
-            tokio::spawn(fut);
+            self.inflight.push(tokio::spawn(fut));
         }
         Ok(())
     }
@@ -409,6 +451,15 @@ impl PipelineOp for ExchangeSinkRpc {
 
     async fn no_more_input(&mut self) -> Result<()> {
         self.upstream_done = true;
+        // FTE ordering guarantee: every DoExchange job (and therefore
+        // every target-side input-log append + queue push) completes
+        // before this op reports done. Stage 1 dispatches only after
+        // this ack, so persisted logs are complete at dispatch time.
+        let handles = std::mem::take(&mut self.inflight);
+        for h in handles {
+            h.await
+                .map_err(|e| PylonError::Internal(format!("exchange rpc join: {e}")))?;
+        }
         Ok(())
     }
 

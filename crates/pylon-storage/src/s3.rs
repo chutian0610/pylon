@@ -12,10 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use pylon_connector_spi::{ConnectorPage, ConnectorResult, DataSink, DataSource, WriteStats};
+use pylon_exchange::codec::encode_batch_stream;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
@@ -108,6 +107,10 @@ fn store_err(context: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorCode::Io, context.into())
 }
 
+fn codec_err(e: PylonError) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorCode::Other, e.to_string())
+}
+
 fn object_store_err(context: &str, e: object_store::Error) -> ConnectorError {
     ConnectorError::new(ConnectorErrorCode::Io, format!("s3 {context}: {e}"))
 }
@@ -120,50 +123,6 @@ pub const DEFAULT_S3_PART_SIZE: usize = 8 * 1024 * 1024;
 /// S3 protocol floor: every part except the last must be >= 5 MiB.
 /// MinIO and AWS both reject smaller completes (`EntityTooSmall`).
 pub const MIN_S3_PART_SIZE: usize = 5 * 1024 * 1024;
-
-/// Encode one Arrow batch as a complete IPC stream (schema + batch +
-/// EOS). Concatenating these per-batch streams yields a valid file
-/// that [`read_concatenated_ipc`] reads back; it also lets the
-/// multipart sink bound its memory without keeping a single
-/// long-lived `StreamWriter` open across part uploads.
-pub(crate) fn encode_batch_stream(
-    schema: &SchemaRef,
-    batch: &arrow_array::RecordBatch,
-) -> ConnectorResult<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut writer =
-        StreamWriter::try_new(&mut buf, schema).map_err(|e| ipc_err("write open", e))?;
-    writer.write(batch).map_err(|e| ipc_err("write batch", e))?;
-    writer.finish().map_err(|e| ipc_err("write finish", e))?;
-    Ok(buf)
-}
-
-/// Decode bytes holding one Arrow IPC stream — or several complete
-/// streams concatenated back-to-back (the multipart sink's format).
-/// Also accepts plain single-stream files, so objects written by
-/// earlier versions remain readable.
-pub fn read_concatenated_ipc(bytes: Vec<u8>) -> ConnectorResult<Vec<arrow_array::RecordBatch>> {
-    let mut cursor = std::io::Cursor::new(bytes);
-    let mut out = Vec::new();
-    while (cursor.position() as usize) < cursor.get_ref().len() {
-        let mut reader = StreamReader::try_new(&mut cursor, None).map_err(|e| {
-            ConnectorError::new(ConnectorErrorCode::Other, format!("arrow ipc read: {e}"))
-        })?;
-        for batch in reader.by_ref() {
-            out.push(batch.map_err(|e| {
-                ConnectorError::new(ConnectorErrorCode::Other, format!("arrow ipc decode: {e}"))
-            })?);
-        }
-    }
-    Ok(out)
-}
-
-fn ipc_err(context: &str, e: arrow_schema::ArrowError) -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorCode::Other,
-        format!("arrow ipc {context}: {e}"),
-    )
-}
 
 // ---------------------------------------------------------------------------
 // S3-backed DataSink / DataSource
@@ -275,7 +234,8 @@ impl DataSink for S3DataSink {
     fn append(&mut self, page: ConnectorPage) -> ConnectorResult<()> {
         let batch = page.into_batch();
         self.rows_written += batch.num_rows() as u64;
-        let stream = encode_batch_stream(&self.schema, &batch)?;
+        let stream =
+            pylon_exchange::codec::encode_batch_stream(&self.schema, &batch).map_err(codec_err)?;
         self.pending.extend_from_slice(&stream);
         while self.pending.len() >= self.chunk_size {
             let part: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
@@ -313,7 +273,8 @@ impl DataSink for S3DataSink {
             let stream = encode_batch_stream(&self.schema, &{
                 use arrow_array::RecordBatch;
                 RecordBatch::new_empty(self.schema.clone())
-            })?;
+            })
+            .map_err(codec_err)?;
             self.store.put(&self.key, stream)?;
             self.finished = true;
             return Ok(WriteStats::new(self.rows_written, 0));
@@ -369,7 +330,9 @@ impl S3DataSource {
         let key = key.into();
         let bytes = store.get(&key)?;
         let completed_bytes = bytes.len() as u64;
-        let pending = read_concatenated_ipc(bytes)?.into();
+        let pending = pylon_exchange::codec::read_concatenated_ipc(bytes)
+            .map_err(codec_err)?
+            .into();
         Ok(Self {
             key,
             pending,
@@ -528,7 +491,9 @@ impl S3SpillStore {
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, RecordBatch};
+    use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
+    use pylon_exchange::codec::read_concatenated_ipc;
     use std::sync::Arc;
 
     #[test]

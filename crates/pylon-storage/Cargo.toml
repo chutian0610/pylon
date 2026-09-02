@@ -13,6 +13,7 @@ arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 pylon-connector-spi = { path = "../pylon-connector-spi" }
 pylon-types = { path = "../pylon-types" }
+pylon-exchange = { path = "../pylon-exchange" }
 async-trait = { workspace = true }
 object_store = { workspace = true }
 once_cell = { workspace = true }

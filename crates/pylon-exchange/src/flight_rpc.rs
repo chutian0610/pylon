@@ -13,6 +13,7 @@
 //! We intentionally implement only `DoExchange` for M3 first cut.
 //! `GetFlightInfo` / `GetSchema` / `DoPut` / `DoGet` are M4+.
 
+use crate::codec::encode_batch_stream;
 use crate::flight_server::{FlightDescriptor, PylonFlightService};
 use arrow_ipc::reader::StreamReader;
 use futures::{Stream, StreamExt};
@@ -26,12 +27,68 @@ use tracing::{debug, warn};
 /// Wrapper that implements `arrow_flight::flight_service_server::FlightService`.
 pub struct FlightServerImpl {
     pub service: Arc<PylonFlightService>,
+    /// FTE source (RFC 0007): when set, every batch pushed through
+    /// `do_exchange` is additionally appended — as a complete IPC
+    /// stream — to `<spill_root>/pylon-input/<descriptor path>.arrow`.
+    /// The persisted log is the replay base for re-dispatched tasks
+    /// whose drain-once queue is gone.
+    pub spill_root: Option<std::path::PathBuf>,
 }
 
 impl FlightServerImpl {
     pub fn new(service: Arc<PylonFlightService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            spill_root: None,
+        }
     }
+
+    /// Enables persisted exchange input (see `spill_root`).
+    pub fn with_spill_root(
+        service: Arc<PylonFlightService>,
+        spill_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            service,
+            spill_root: Some(spill_root.into()),
+        }
+    }
+}
+
+/// Deterministic input-log path for a flight descriptor:
+/// `pylon://query/0/stage/2/task/1` →
+/// `pylon-input/query/0/stage/2/task/1.arrow` (relative to a worker's
+/// spill root). The coord derives the same path when building the
+/// re-dispatch OpSpec — keep the two formatters in sync.
+pub fn input_log_relative_path(descriptor: &str) -> Option<String> {
+    let rest = descriptor.strip_prefix("pylon://")?;
+    if rest.is_empty() || rest.contains("..") {
+        return None;
+    }
+    Some(format!("pylon-input/{rest}.arrow"))
+}
+
+/// Appends one batch (as a complete IPC stream) to the persisted
+/// input log for `rel`. Concatenated streams read back via
+/// `read_concatenated_ipc`.
+fn append_batch_to_log(
+    root: &std::path::Path,
+    rel: &str,
+    schema: &arrow_schema::SchemaRef,
+    batch: &arrow_array::RecordBatch,
+) -> std::io::Result<()> {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    use std::io::Write as _;
+    let stream = encode_batch_stream(schema, batch)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("ipc encode: {e}")))?;
+    file.write_all(&stream)
 }
 
 type FlightStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -88,6 +145,7 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         let mut inbound = request.into_inner();
         let service = self.service.clone();
+        let spill_root = self.spill_root.clone();
 
         // Spawn a task that reads FlightData messages, decodes them
         // as Arrow IPC streaming batches, and routes to the local
@@ -178,9 +236,24 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                             Some(Ok(batch)) => {
                                 if batch.num_rows() > 0
                                     && let Some(d) = &descriptor
-                                    && let Err(e) = service.push(d, batch).await
                                 {
-                                    warn!(error = ?e, "service.push failed");
+                                    // FTE source: persist the batch to
+                                    // the input log BEFORE queueing, so a
+                                    // crash can never lose acknowledged
+                                    // replay data (write-ahead ordering).
+                                    if let (Some(root), Some(rel)) =
+                                        (spill_root.as_deref(), input_log_relative_path(&d.0))
+                                    {
+                                        let schema = batch.schema();
+                                        if let Err(e) =
+                                            append_batch_to_log(root, &rel, &schema, &batch)
+                                        {
+                                            warn!(error = %e, "input-log append failed");
+                                        }
+                                    }
+                                    if let Err(e) = service.push(d, batch).await {
+                                        warn!(error = ?e, "service.push failed");
+                                    }
                                 }
                             }
                             Some(Err(e)) => {

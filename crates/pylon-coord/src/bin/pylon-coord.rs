@@ -92,6 +92,10 @@ struct CoordState {
     /// worker disconnects, its stalled checkpoints are re-dispatched
     /// to survivors.
     task_worker: Mutex<HashMap<u64, WorkerId>>,
+    /// FTE source: worker id -> registered spill root. Outlives the
+    /// worker's handle so re-dispatch can derive persisted input-log
+    /// paths from the ORIGINAL (possibly dead) worker's root.
+    worker_spill_roots: Mutex<HashMap<u64, String>>,
 }
 
 /// Poisoning-tolerant mutex lock (C5.6). The coord is a
@@ -130,6 +134,7 @@ async fn main() -> Result<()> {
         task_locs: Mutex::new(HashMap::new()),
         task_specs: Mutex::new(HashMap::new()),
         task_worker: Mutex::new(HashMap::new()),
+        worker_spill_roots: Mutex::new(HashMap::new()),
     });
 
     let grpc = tonic::transport::Server::builder()
@@ -504,7 +509,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
     let _expected_stage0_acks = 1_usize; // legacy field; QSM owns the count now
     let state_for_send = state.clone();
     let workers_snapshot = workers.clone();
-    let stage1_tasks_clone = stage1_tasks.clone();
+    let mut stage1_tasks_clone = stage1_tasks.clone();
     let stage0_task_id_for_register = stage0.id;
     let qid_u64_for_spawn = qid_u64;
     let stage0_qid_for_register = qid_u64;
@@ -567,7 +572,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             let n_workers = workers_snapshot.len().max(1);
             let stage1_qid = stage0_qid;
             let stage1_sid = pylon_coord::StageId(2);
-            for (p, partition_ops) in stage1_tasks_clone.iter().enumerate() {
+            for (p, partition_ops) in stage1_tasks_clone.iter_mut().enumerate() {
                 let worker_idx = p % n_workers;
                 let worker = match workers_snapshot.get(worker_idx) {
                     Some(w) => w.clone(),
@@ -580,6 +585,28 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     .wrapping_mul(1000)
                     .wrapping_add(2)
                     .wrapping_add(p as u64);
+                // FTE source: point the ExchangeSource at the
+                // persisted input log on the TARGET worker's spill
+                // root (complete before dispatch — stage1 starts only
+                // after stage0's done ack). Re-dispatch reuses the
+                // spec verbatim: the log survives worker loss.
+                {
+                    let roots = lock_ok(&state_for_send.worker_spill_roots);
+                    if let Some(root) = roots.get(&worker.id.0) {
+                        for op in &mut partition_ops.iter_mut() {
+                            if op.name == "ExchangeSource" {
+                                if let Some(desc) = op.config.get("descriptor") {
+                                    if let Some(rel) = desc.strip_prefix("pylon://") {
+                                        op.config.insert(
+                                            "input_log".to_string(),
+                                            format!("{root}/pylon-input/{rel}.arrow"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let task_spec = pylon_proto::pylon::TaskSpec {
                     id: stage1_task_id,
                     query_id: qid_u64_for_spawn,
@@ -899,6 +926,11 @@ impl Worker for CoordGrpc {
             .state
             .discovery
             .register(worker_id, req.flight_addr, req.grpc_addr);
+        // FTE source: keep the spill root even after the worker
+        // dies — re-dispatch derives input-log paths from it.
+        if !req.spill_root.is_empty() {
+            lock_ok(&self.state.worker_spill_roots).insert(reg.worker_id, req.spill_root);
+        }
         info!(
             worker_id = reg.worker_id,
             flight_addr = %reg.flight_addr,
@@ -1084,12 +1116,13 @@ impl Worker for CoordGrpc {
                 }
             }
 
-            // M4.S7 (RFC 0007 §3.5): the session ended — clean close
-            // or worker death (SIGKILL). A stalled checkpoint is the
-            // task's durable progress; re-dispatch it to a surviving
-            // worker before the stage wait can time out. Tasks that
-            // never checkpointed are NOT recovered here (that is the
-            // FTE persisted-exchange scope, deferred).
+            // M4.S7 + FTE source (RFC 0007 §3.5): the session ended —
+            // clean close or worker death (SIGKILL). Re-dispatch every
+            // owned task whose spec carries a persisted input log: the
+            // re-dispatched task replays the log from offset 0 (full
+            // recompute), so no checkpoint alignment is needed. Stalled
+            // handles are cleared, not re-injected — folding a state
+            // checkpoint AND replaying full input would double-count.
             lock_ok(&state.workers).remove(&worker_id);
             let owned: Vec<u64> = lock_ok(&state.task_worker)
                 .iter()
@@ -1100,31 +1133,23 @@ impl Worker for CoordGrpc {
                 let Some((qid, sid)) = lock_ok(&state.task_locs).get(&tid).copied() else {
                     continue;
                 };
-                let Some(handle) =
-                    state
-                        .state_machine
-                        .clear_stalled(qid, sid, pylon_coord::TaskId(tid))
-                else {
-                    continue; // already terminal or re-dispatched
-                };
+                // Consume any pending checkpoint: the input replay
+                // makes it obsolete.
+                let _ = state
+                    .state_machine
+                    .clear_stalled(qid, sid, pylon_coord::TaskId(tid));
                 let Some(mut spec) = lock_ok(&state.task_specs).get(&tid).cloned() else {
-                    state.state_machine.put_back_stalled(
-                        qid,
-                        sid,
-                        pylon_coord::TaskId(tid),
-                        handle,
-                    );
                     continue;
                 };
-                if let Some(fragment) = spec.fragment.as_mut() {
-                    for op in &mut fragment.ops {
-                        if op.name == "Aggregate" {
-                            op.config.insert(
-                                "spill_handle".to_string(),
-                                handle.path.to_string_lossy().to_string(),
-                            );
-                        }
-                    }
+                let has_log = spec.fragment.as_ref().is_some_and(|f| {
+                    f.ops.iter().any(|op| {
+                        op.name == "ExchangeSource" && op.config.contains_key("input_log")
+                    })
+                });
+                if !has_log {
+                    // Stage-0 scan tasks (and any future non-input-log
+                    // stage) cannot be replayed yet — FTE sink scope.
+                    continue;
                 }
                 let survivor = lock_ok(&state.workers).values().next().cloned();
                 match survivor {
@@ -1134,29 +1159,16 @@ impl Worker for CoordGrpc {
                                 task_id = tid,
                                 query_id = qid.0,
                                 stage_id = sid.0,
-                                spill = %handle.path.display(),
                                 from_worker = worker_id.0,
                                 to_worker = w.id.0,
-                                "re-dispatched stalled checkpoint after worker loss"
-                            );
-                        } else {
-                            state.state_machine.put_back_stalled(
-                                qid,
-                                sid,
-                                pylon_coord::TaskId(tid),
-                                handle,
+                                "re-dispatched task with persisted input log after worker loss"
                             );
                         }
                     }
-                    None => {
-                        warn!(task_id = tid, "no surviving worker for stalled checkpoint");
-                        state.state_machine.put_back_stalled(
-                            qid,
-                            sid,
-                            pylon_coord::TaskId(tid),
-                            handle,
-                        );
-                    }
+                    None => warn!(
+                        task_id = tid,
+                        "no surviving worker for input-log re-dispatch"
+                    ),
                 }
             }
         });

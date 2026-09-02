@@ -42,6 +42,27 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("PYLON_GRPC_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:0".to_string());
 
+    // FTE source (RFC 0007): stable per-worker spill root. The
+    // flight server persists exchange input under
+    // `<spill_root>/pylon-input/...`; the coord derives replay
+    // paths for re-dispatched tasks from the registered value.
+    let spill_root = std::env::args()
+        .skip(1)
+        .find(|a| a == "--spill-root")
+        .and_then(|_| {
+            let pos = std::env::args()
+                .position(|a| a == "--spill-root")
+                .expect("flag found");
+            std::env::args().nth(pos + 1)
+        })
+        .or_else(|| std::env::var("PYLON_SPILL_ROOT").ok())
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join(format!("pylon-worker-pid{}", std::process::id()))
+                .to_string_lossy()
+                .to_string()
+        });
+
     // Single in-process Flight service shared by all tasks in this worker.
     // M3 B-1: now also served as Arrow Flight RPC server.
     let flight_service = Arc::new(PylonFlightService::new());
@@ -64,7 +85,8 @@ async fn main() -> Result<()> {
         bound = %bound_flight_addr,
         "pylon-worker Flight listener bound"
     );
-    let flight_server = FlightServerImpl::new(flight_service.clone());
+    let flight_server =
+        FlightServerImpl::with_spill_root(flight_service.clone(), spill_root.clone());
     let incoming_flight = tokio_stream::wrappers::TcpListenerStream::new(flight_listener);
     tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
@@ -80,6 +102,7 @@ async fn main() -> Result<()> {
         flight_service,
         bound_flight_addr.to_string(),
         grpc_local_addr,
+        spill_root,
     )
     .await
 }
@@ -88,6 +111,7 @@ async fn run(
     flight_service: Arc<PylonFlightService>,
     flight_addr: String,
     grpc_addr: String,
+    spill_root: String,
 ) -> Result<()> {
     let coord_addr = std::env::args()
         .nth(1)
@@ -103,6 +127,7 @@ async fn run(
     let reg = client
         .register_worker(RegisterWorkerRequest {
             flight_addr: flight_addr.clone(),
+            spill_root: spill_root.clone(),
             grpc_addr: grpc_addr.clone(),
         })
         .await
