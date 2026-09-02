@@ -193,7 +193,7 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                             Ok(s) if !s.is_empty() => {
                                 descriptor = Some(FlightDescriptor(s));
                                 let _ = ack_tx
-                                    .send(Ok(make_ack(&descriptor.as_ref().unwrap())))
+                                    .send(Ok(make_ack(descriptor.as_ref().unwrap())))
                                     .await;
                                 continue;
                             }

@@ -594,15 +594,14 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     let roots = lock_ok(&state_for_send.worker_spill_roots);
                     if let Some(root) = roots.get(&worker.id.0) {
                         for op in &mut partition_ops.iter_mut() {
-                            if op.name == "ExchangeSource" {
-                                if let Some(desc) = op.config.get("descriptor") {
-                                    if let Some(rel) = desc.strip_prefix("pylon://") {
-                                        op.config.insert(
-                                            "input_log".to_string(),
-                                            format!("{root}/pylon-input/{rel}.arrow"),
-                                        );
-                                    }
-                                }
+                            if op.name == "ExchangeSource"
+                                && let Some(desc) = op.config.get("descriptor")
+                                && let Some(rel) = desc.strip_prefix("pylon://")
+                            {
+                                op.config.insert(
+                                    "input_log".to_string(),
+                                    format!("{root}/pylon-input/{rel}.arrow"),
+                                );
                             }
                         }
                     }
