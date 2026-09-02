@@ -7,7 +7,7 @@
 //!
 //! Mirrors Velox's `PlanNodeTranslator` (a global registry of
 //! `PlanNode → Operator` translators). New ops register at
-//! startup; the worker binary calls `registry().build(name, cfg, flight)`
+//! startup; the worker binary calls `registry().build(name, cfg, ctx, flight)`
 //! per `OpSpec`.
 
 use std::collections::HashMap;
@@ -15,9 +15,28 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use pylon_exchange::PylonFlightService;
-use pylon_runtime::PipelineOp;
+use pylon_runtime::spill::SpillHandle;
+use pylon_runtime::{PerTaskPool, PipelineOp};
+use std::sync::Arc as StdArc;
 
-pub type OpFactory = dyn Fn(&HashMap<String, String>, Arc<PylonFlightService>) -> Result<Box<dyn PipelineOp>>
+/// Per-task execution context passed to every op factory. Carries
+/// the knobs an op cannot get from its `OpSpec` config alone:
+/// the task memory budget (from `TaskSpec.memory_budget_bytes`)
+/// and the spill-checkpoint callback (RFC 0007 §3.5).
+pub struct TaskContext {
+    /// Per-task byte budget; `0` = unbounded (no-op pool).
+    pub memory_budget: u64,
+    /// Invoked by an op after it persists a spill checkpoint.
+    /// The worker maps this to a `TASK_STALLED` ack so the coord
+    /// holds a resume point for fault-tolerant re-dispatch.
+    pub on_spill: Option<StdArc<dyn Fn(SpillHandle) + Send + Sync>>,
+}
+
+pub type OpFactory = dyn Fn(
+        &HashMap<String, String>,
+        &TaskContext,
+        Arc<PylonFlightService>,
+    ) -> Result<Box<dyn PipelineOp>>
     + Send
     + Sync;
 
@@ -36,7 +55,11 @@ impl OpRegistry {
     /// helpers in this module call this in a single expression.
     pub fn register<F>(mut self, name: &'static str, factory: F) -> Self
     where
-        F: Fn(&HashMap<String, String>, Arc<PylonFlightService>) -> Result<Box<dyn PipelineOp>>
+        F: Fn(
+                &HashMap<String, String>,
+                &TaskContext,
+                Arc<PylonFlightService>,
+            ) -> Result<Box<dyn PipelineOp>>
             + Send
             + Sync
             + 'static,
@@ -53,13 +76,14 @@ impl OpRegistry {
         &self,
         name: &str,
         config: &HashMap<String, String>,
+        ctx: &TaskContext,
         flight_service: Arc<PylonFlightService>,
     ) -> Result<Box<dyn PipelineOp>> {
         let factory = self
             .factories
             .get(name)
             .ok_or_else(|| anyhow!("unknown op: {name}"))?;
-        factory(config, flight_service)
+        factory(config, ctx, flight_service)
     }
 }
 
@@ -88,17 +112,17 @@ fn build_default_registry() -> OpRegistry {
     };
 
     OpRegistry::new()
-        .register("SeqScan", move |cfg, _flight| {
+        .register("SeqScan", move |cfg, _ctx, _flight| {
             Ok(Box::new(SeqScanOp::new(get(cfg, "path")?, 8192)))
         })
-        .register("Filter", move |cfg, _flight| {
+        .register("Filter", move |cfg, _ctx, _flight| {
             Ok(Box::new(FilterOp::new(
                 get(cfg, "col")?,
                 get(cfg, "op")?,
                 get(cfg, "literal")?,
             )))
         })
-        .register("Project", move |cfg, _flight| {
+        .register("Project", move |cfg, _ctx, _flight| {
             let cols: Vec<String> = get(cfg, "cols")?
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -107,16 +131,16 @@ fn build_default_registry() -> OpRegistry {
             let schema = Arc::new(arrow_schema::Schema::empty());
             Ok(Box::new(ProjectOp::new(cols, schema)))
         })
-        .register("PartitionFilter", move |cfg, _flight| {
+        .register("PartitionFilter", move |cfg, _ctx, _flight| {
             Ok(Box::new(
                 PartitionFilterOp::new(get(cfg, "col")?, &get(cfg, "literal")?)?,
             ))
         })
-        .register("ExchangeSource", move |cfg, flight| {
+        .register("ExchangeSource", move |cfg, _ctx, flight| {
             let desc = pylon_exchange::FlightDescriptor(get(cfg, "descriptor")?);
             Ok(Box::new(ExchangeSourceOp::new(desc, flight)))
         })
-        .register("ExchangeSinkRpc", move |cfg, _flight| {
+        .register("ExchangeSinkRpc", move |cfg, _ctx, _flight| {
             let descs: Vec<pylon_exchange::FlightDescriptor> = get(cfg, "descriptors")?
                 .split(';')
                 .filter(|s| !s.is_empty())
@@ -151,7 +175,7 @@ fn build_default_registry() -> OpRegistry {
                 ExchangeSinkRpc::new_partitioned(targets, partition_keys),
             ))
         })
-        .register("Aggregate", move |cfg, _flight| {
+        .register("Aggregate", move |cfg, ctx, _flight| {
             let group_by_cols: Vec<String> = get(cfg, "group_by_cols")?
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -160,7 +184,23 @@ fn build_default_registry() -> OpRegistry {
             let aggregates = parse_agg_specs(&get(cfg, "agg_specs")?)?;
             // Schema::empty() — the op derives it on first input batch.
             let schema = Arc::new(arrow_schema::Schema::empty());
-            let mut op = HashAggregateOp::new(group_by_cols, aggregates, schema);
+            // M4.S7: honor the task's memory budget — a tight budget
+            // is what makes the spill → TASK_STALLED checkpoint path
+            // actually fire in production.
+            let mut op = if ctx.memory_budget > 0 {
+                HashAggregateOp::with_pool(
+                    group_by_cols,
+                    aggregates,
+                    schema,
+                    PerTaskPool::new(ctx.memory_budget as usize),
+                )
+            } else {
+                HashAggregateOp::new(group_by_cols, aggregates, schema)
+            };
+            // RFC 0007 §3.5: report every spill checkpoint upstream.
+            if let Some(cb) = ctx.on_spill.clone() {
+                op = op.with_on_spill(cb);
+            }
             // RFC 0007 §3.5: a coord-retried task carries the spill
             // handle of the stalled attempt; the op resumes from it
             // at no_more_input instead of restarting from scratch.
@@ -221,10 +261,22 @@ mod tests {
         HashMap::new()
     }
 
+    fn empty_task_context() -> TaskContext {
+        TaskContext {
+            memory_budget: 0,
+            on_spill: None,
+        }
+    }
+
     #[test]
     fn registry_unknown_op_is_an_error() {
         let r = OpRegistry::new();
-        let result = r.build("DoesNotExist", &empty_config(), build_flight_stub());
+        let result = r.build(
+            "DoesNotExist",
+            &empty_config(),
+            &empty_task_context(),
+            build_flight_stub(),
+        );
         assert!(result.is_err());
     }
 

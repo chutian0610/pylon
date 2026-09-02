@@ -55,6 +55,9 @@ impl Clone for QueryStatus {
 }
 
 struct WorkerHandle {
+    /// Registry key (also the `RegisterWorker` id). M4.S7: the
+    /// death handler needs it to attribute stalled checkpoints.
+    id: WorkerId,
     tx: mpsc::Sender<TaskRequest>,
     completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>>,
     /// Arrow Flight host:port registered via `RegisterWorker`. `None`
@@ -82,9 +85,13 @@ struct CoordState {
     /// into a `QueryStateMachine::ack_task` call.
     task_locs: Mutex<HashMap<u64, (pylon_coord::QueryId, pylon_coord::StageId)>>,
     /// RFC 0007 §3.5 retry path: the last TaskSpec sent for each
-    /// task id. The retry watcher clones the spec, injects the
-    /// spill handle, and re-dispatches without rebuilding the DAG.
+    /// task id. The worker-death handler clones the spec, injects
+    /// the spill handle, and re-dispatches without rebuilding the DAG.
     task_specs: Mutex<HashMap<u64, pylon_proto::pylon::TaskSpec>>,
+    /// RFC 0007 §3.5 (M4.S7): task id -> worker that ran it. When a
+    /// worker disconnects, its stalled checkpoints are re-dispatched
+    /// to survivors.
+    task_worker: Mutex<HashMap<u64, WorkerId>>,
 }
 
 /// Poisoning-tolerant mutex lock (C5.6). The coord is a
@@ -95,10 +102,23 @@ fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Resolves a listen port from the environment, falling back to the
+/// compile-time default. (The smoke/chaos harnesses set these env
+/// vars; before M4.S7 they were silently ignored — every deployment
+/// got 8080/9090 whether it asked or not.)
+fn port_from_env(key: &str, default: u16) -> u16 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
-    info!("pylon-coord M2 starting; HTTP :{HTTP_PORT} / gRPC :{GRPC_PORT}");
+    let http_port = port_from_env("PYLON_HTTP_PORT", HTTP_PORT);
+    let grpc_port = port_from_env("PYLON_GRPC_PORT", GRPC_PORT);
+    info!("pylon-coord M2 starting; HTTP :{http_port} / gRPC :{grpc_port}");
 
     let state = Arc::new(CoordState {
         workers: Mutex::new(HashMap::new()),
@@ -109,6 +129,7 @@ async fn main() -> Result<()> {
         state_machine: pylon_coord::QueryStateMachine::new(),
         task_locs: Mutex::new(HashMap::new()),
         task_specs: Mutex::new(HashMap::new()),
+        task_worker: Mutex::new(HashMap::new()),
     });
 
     let grpc = tonic::transport::Server::builder()
@@ -116,7 +137,7 @@ async fn main() -> Result<()> {
             state: state.clone(),
         }))
         .serve(
-            format!("0.0.0.0:{GRPC_PORT}")
+            format!("0.0.0.0:{grpc_port}")
                 .parse()
                 .context("grpc addr")?,
         );
@@ -127,7 +148,7 @@ async fn main() -> Result<()> {
         .route("/v1/workers", get(list_workers))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{HTTP_PORT}")).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
     let http = axum::serve(listener, app);
 
     tokio::select! {
@@ -287,77 +308,6 @@ async fn list_workers(State(state): State<Arc<CoordState>>) -> impl IntoResponse
     (StatusCode::OK, Json(serde_json::json!({"workers": list}))).into_response()
 }
 
-/// RFC 0007 §3.5: watch one stage for `Stalled` acks and re-dispatch
-/// the affected tasks from their stashed specs, injecting the spill
-/// handle so the retried attempt resumes from the spill instead of
-/// restarting. Exits when the stage reaches a terminal state or the
-/// hard cap elapses.
-async fn retry_watcher(
-    state: Arc<CoordState>,
-    qid: pylon_coord::QueryId,
-    sid: pylon_coord::StageId,
-    hard_cap: std::time::Duration,
-) {
-    let start = std::time::Instant::now();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        match state.state_machine.stage_state(qid, sid) {
-            Some(pylon_coord::query_state::StageState::Done)
-            | Some(pylon_coord::query_state::StageState::Failed) => return,
-            _ => {}
-        }
-        if start.elapsed() >= hard_cap {
-            warn!(query_id = qid.0, stage_id = sid.0, "retry watcher hard cap");
-            return;
-        }
-        for (tid, _) in state.state_machine.stalled_handles(qid, sid) {
-            // Consume the handle exactly once; the retried attempt's
-            // terminal ack clears the QSM entry.
-            let Some(handle) = state.state_machine.clear_stalled(qid, sid, tid) else {
-                continue;
-            };
-            let spec = lock_ok(&state.task_specs).get(&tid.0).cloned();
-            let Some(mut spec) = spec else {
-                continue;
-            };
-            if let Some(fragment) = spec.fragment.as_mut() {
-                for op in &mut fragment.ops {
-                    if op.name == "Aggregate" {
-                        op.config.insert(
-                            "spill_handle".to_string(),
-                            handle.path.to_string_lossy().to_string(),
-                        );
-                    }
-                }
-            }
-            let workers: Vec<Arc<WorkerHandle>> =
-                lock_ok(&state.workers).values().cloned().collect();
-            let Some(worker) = workers.get(tid.0 as usize % workers.len().max(1)).cloned() else {
-                // No worker available; put the handle back for the
-                // next pass.
-                state.state_machine.put_back_stalled(qid, sid, tid, handle);
-                continue;
-            };
-            if worker
-                .tx
-                .send(TaskRequest { spec: Some(spec) })
-                .await
-                .is_ok()
-            {
-                info!(
-                    task_id = tid.0,
-                    query_id = qid.0,
-                    stage_id = sid.0,
-                    spill = %handle.path.display(),
-                    "re-dispatched stalled task"
-                );
-            } else {
-                state.state_machine.put_back_stalled(qid, sid, tid, handle);
-            }
-        }
-    }
-}
-
 async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> Result<()> {
     // 1. Parse SQL to PhysicalPlan
     let stmt = parse_sql(sql).context("sql parse")?;
@@ -448,6 +398,12 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
         }
     };
     // Use 2 partitions for M3 first cut cross-worker demo.
+    // M4.S7: per-task memory budget is operator-tunable so chaos
+    // runs can force the spill → TASK_STALLED checkpoint path.
+    let memory_budget: u64 = std::env::var("PYLON_TASK_MEMORY_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 * 1024 * 1024);
     let fragmenter = Fragmenter::new(FragmenterConfig {
         default_partition_count: 2,
     });
@@ -505,7 +461,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
         }),
         sources: vec![],
         sinks: vec![],
-        memory_budget_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: memory_budget,
     };
     // (Stage1 dispatch happens in the spawned task below, per-partition.)
 
@@ -520,6 +476,11 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
         .await
         .map_err(|e| anyhow::anyhow!("worker stage0 send: {e}"))?;
         info!(stage = 0, worker = 0, "stage0 dispatched");
+        // M4.S7: remember which worker owns the task so a disconnect
+        // can re-dispatch its stalled checkpoints.
+        if let Some(w) = workers.first() {
+            lock_ok(&state.task_worker).insert(stage0.id, w.id);
+        }
         // RFC 0007 §3.5: keep the spec so the retry watcher can
         // re-dispatch from it if the task acks Stalled.
         state
@@ -566,18 +527,6 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             .lock()
             .unwrap()
             .insert(stage0_task_id_for_register, (stage0_qid, stage0_sid));
-        // RFC 0007 §3.5: consume Stalled acks while the stage runs.
-        {
-            let watcher_state = state_for_send.clone();
-            let watcher_qid = stage0_qid;
-            let watcher_sid = stage0_sid;
-            tokio::spawn(retry_watcher(
-                watcher_state,
-                watcher_qid,
-                watcher_sid,
-                stage0_deadline + std::time::Duration::from_secs(5),
-            ));
-        }
         let stage0_wait = state_for_send
             .state_machine
             .wait_for_stage_done(stage0_qid, stage0_sid, stage0_deadline)
@@ -642,7 +591,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     }),
                     sources: vec![],
                     sinks: vec![],
-                    memory_budget_bytes: 256 * 1024 * 1024,
+                    memory_budget_bytes: memory_budget,
                 };
                 if worker
                     .tx
@@ -679,6 +628,7 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     task_id = stage1_task_id,
                     "stage1 dispatched"
                 );
+                lock_ok(&state_for_send.task_worker).insert(stage1_task_id, worker.id);
             }
             if !stage1_register_ids.is_empty() {
                 state_for_send.state_machine.register_stage(
@@ -686,17 +636,6 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
                     stage1_sid,
                     stage1_register_ids,
                 );
-                {
-                    let watcher_state = state_for_send.clone();
-                    let watcher_qid = stage1_qid;
-                    let watcher_sid = stage1_sid;
-                    tokio::spawn(retry_watcher(
-                        watcher_state,
-                        watcher_qid,
-                        watcher_sid,
-                        stage1_deadline + std::time::Duration::from_secs(5),
-                    ));
-                }
                 let stage1_wait = state_for_send
                     .state_machine
                     .wait_for_stage_done(stage1_qid, stage1_sid, stage1_deadline)
@@ -786,7 +725,13 @@ async fn plan_and_dispatch(state: Arc<CoordState>, qid: QueryId, sql: &str) -> R
             if let Some(s) = qmap.get_mut(&qid_q) {
                 s.rows = all_batches;
                 s.schema = schema;
-                s.state = pylon_coord::query::QueryState::Done;
+                // C5.6/M4.S7: a stage-failed query stays Failed. The
+                // drain task runs even after a failed wait (it is
+                // spawned first) and must not launder the state into
+                // Done over a partial result set.
+                if s.state != pylon_coord::query::QueryState::Failed {
+                    s.state = pylon_coord::query::QueryState::Done;
+                }
             }
             // C5.6: terminal query — drop QSM bookkeeping.
             state_inner.state_machine.remove_query(qid_q);
@@ -999,6 +944,7 @@ impl Worker for CoordGrpc {
         let completed: Arc<Mutex<HashMap<u64, Vec<arrow_array::RecordBatch>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let handle = Arc::new(WorkerHandle {
+            id: worker_id,
             tx,
             completed: completed.clone(),
             flight_addr,
@@ -1135,6 +1081,82 @@ impl Worker for CoordGrpc {
                         }
                     }
                     Err(e) => warn!(worker = worker_id.0, "stream err: {e}"),
+                }
+            }
+
+            // M4.S7 (RFC 0007 §3.5): the session ended — clean close
+            // or worker death (SIGKILL). A stalled checkpoint is the
+            // task's durable progress; re-dispatch it to a surviving
+            // worker before the stage wait can time out. Tasks that
+            // never checkpointed are NOT recovered here (that is the
+            // FTE persisted-exchange scope, deferred).
+            lock_ok(&state.workers).remove(&worker_id);
+            let owned: Vec<u64> = lock_ok(&state.task_worker)
+                .iter()
+                .filter(|(_, w)| w.0 == worker_id.0)
+                .map(|(t, _)| *t)
+                .collect();
+            for tid in owned {
+                let Some((qid, sid)) = lock_ok(&state.task_locs).get(&tid).copied() else {
+                    continue;
+                };
+                let Some(handle) =
+                    state
+                        .state_machine
+                        .clear_stalled(qid, sid, pylon_coord::TaskId(tid))
+                else {
+                    continue; // already terminal or re-dispatched
+                };
+                let Some(mut spec) = lock_ok(&state.task_specs).get(&tid).cloned() else {
+                    state.state_machine.put_back_stalled(
+                        qid,
+                        sid,
+                        pylon_coord::TaskId(tid),
+                        handle,
+                    );
+                    continue;
+                };
+                if let Some(fragment) = spec.fragment.as_mut() {
+                    for op in &mut fragment.ops {
+                        if op.name == "Aggregate" {
+                            op.config.insert(
+                                "spill_handle".to_string(),
+                                handle.path.to_string_lossy().to_string(),
+                            );
+                        }
+                    }
+                }
+                let survivor = lock_ok(&state.workers).values().next().cloned();
+                match survivor {
+                    Some(w) => {
+                        if w.tx.send(TaskRequest { spec: Some(spec) }).await.is_ok() {
+                            info!(
+                                task_id = tid,
+                                query_id = qid.0,
+                                stage_id = sid.0,
+                                spill = %handle.path.display(),
+                                from_worker = worker_id.0,
+                                to_worker = w.id.0,
+                                "re-dispatched stalled checkpoint after worker loss"
+                            );
+                        } else {
+                            state.state_machine.put_back_stalled(
+                                qid,
+                                sid,
+                                pylon_coord::TaskId(tid),
+                                handle,
+                            );
+                        }
+                    }
+                    None => {
+                        warn!(task_id = tid, "no surviving worker for stalled checkpoint");
+                        state.state_machine.put_back_stalled(
+                            qid,
+                            sid,
+                            pylon_coord::TaskId(tid),
+                            handle,
+                        );
+                    }
                 }
             }
         });

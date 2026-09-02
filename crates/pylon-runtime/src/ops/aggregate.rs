@@ -144,6 +144,10 @@ pub struct HashAggregateOp {
     /// op folds the spilled batches into its state at
     /// `no_more_input` time, before its own spill files reload.
     pending_resume: Option<SpillHandle>,
+    /// Checkpoint callback (RFC 0007 §3.5): invoked after every
+    /// successful spill so the worker can ack `TASK_STALLED` and the
+    /// coord holds a resume point for FTE.
+    on_spill: Option<Arc<dyn Fn(SpillHandle) + Send + Sync>>,
 }
 
 impl HashAggregateOp {
@@ -189,6 +193,7 @@ impl HashAggregateOp {
             spill_handles: Vec::new(),
             spill_root: None,
             pending_resume: None,
+            on_spill: None,
         }
     }
 
@@ -207,6 +212,15 @@ impl HashAggregateOp {
     /// (RFC 0007 §3.5).
     pub fn with_pending_resume(mut self, handle: SpillHandle) -> Self {
         self.pending_resume = Some(handle);
+        self
+    }
+
+    /// Builder: registers a callback fired after every spill. The
+    /// worker uses it to emit the `TASK_STALLED` checkpoint ack; the
+    /// task keeps running (emit-and-continue) — the coord re-dispatches
+    /// from the handle only if the worker dies.
+    pub fn with_on_spill(mut self, cb: Arc<dyn Fn(SpillHandle) + Send + Sync>) -> Self {
+        self.on_spill = Some(cb);
         self
     }
 
@@ -1294,6 +1308,9 @@ impl Spillable for HashAggregateOp {
         self.pool_allocated = 0;
 
         self.spill_handles.push(handle.clone());
+        if let Some(cb) = &self.on_spill {
+            cb(handle.clone());
+        }
         Ok(handle)
     }
 
