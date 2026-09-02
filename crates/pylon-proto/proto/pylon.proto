@@ -22,6 +22,10 @@ message RegisterWorkerRequest {
   // Optional: the gRPC address the worker is reachable at. For
   // diagnostics / debugging; not used for routing in M3 first cut.
   string grpc_addr = 2;
+  // FTE source (RFC 0007): the worker's spill root. Persisted
+  // exchange-input logs live under `<spill_root>/pylon-input/...`;
+  // the coord derives replay paths for re-dispatched tasks from it.
+  string spill_root = 3;
 }
 
 message RegisterWorkerResponse {

@@ -7,3 +7,4 @@ pub mod flight_server;
 pub use flight_client::PylonFlightClient;
 pub use flight_rpc::FlightServerImpl;
 pub use flight_server::{FlightDescriptor, PylonFlightService};
+pub use pylon_types::codec;
