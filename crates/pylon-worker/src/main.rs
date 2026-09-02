@@ -138,7 +138,7 @@ async fn run(
         let task_req_msg = task_req_msg.with_context(|| "decode TaskRequest")?;
         let task_id = task_req_msg.spec.as_ref().map(|s| s.id).unwrap_or(0);
         info!(task_id, "got task request");
-        match run_task(task_req_msg, flight_service.clone()).await {
+        match run_task(task_req_msg, out_tx.clone(), flight_service.clone()).await {
             Ok(batches) => {
                 let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
                 let mut emitted = 0u64;
@@ -192,12 +192,37 @@ async fn run(
 
 async fn run_task(
     req: TaskRequest,
+    out_tx: tokio::sync::mpsc::Sender<TaskResponse>,
     flight_service: Arc<PylonFlightService>,
 ) -> Result<Vec<arrow_array::RecordBatch>> {
     let spec = req.spec.context("task spec missing")?;
     let fragment = spec.fragment.as_ref().context("fragment missing")?;
 
-    let ops = build_ops(fragment, flight_service.clone())?;
+    // RFC 0007 §3.5: each spill inside an op is a fault-tolerance
+    // checkpoint. Report it upstream as TASK_STALLED (emit-and-
+    // continue): the coord stores the handle and re-dispatches from
+    // it only if this worker dies mid-task.
+    let stall_tx = out_tx.clone();
+    let stall_task_id = spec.id;
+    let on_spill = Arc::new(move |handle: pylon_runtime::spill::SpillHandle| {
+        let resp = TaskResponse {
+            task_id: stall_task_id,
+            state: TaskState::TaskStalled as i32,
+            rows_emitted: 0,
+            batch: Vec::new(),
+            message: String::new(),
+            spill_handle: handle.path.to_string_lossy().to_string(),
+        };
+        if let Err(e) = stall_tx.try_send(resp) {
+            warn!(task_id = stall_task_id, error = %e, "stall ack dropped (channel full)");
+        }
+    });
+    let ctx = op_registry::TaskContext {
+        memory_budget: spec.memory_budget_bytes,
+        on_spill: Some(on_spill),
+    };
+
+    let ops = build_ops(fragment, &ctx, flight_service.clone())?;
     let pipeline = Pipeline::new(ops);
     let driver = Driver::new(pipeline); // default mode = SingleThreadLoop
 
@@ -211,6 +236,7 @@ async fn run_task(
 
 fn build_ops(
     fragment: &pylon_proto::pylon::Fragment,
+    ctx: &op_registry::TaskContext,
     flight_service: Arc<PylonFlightService>,
 ) -> Result<Vec<Box<dyn PipelineOp>>> {
     let mut ops: Vec<Box<dyn PipelineOp>> = Vec::new();
@@ -218,6 +244,7 @@ fn build_ops(
         ops.push(build_op(
             &op_spec.name,
             &op_spec.config,
+            ctx,
             flight_service.clone(),
         )?);
     }
@@ -231,9 +258,10 @@ fn build_ops(
 fn build_op(
     name: &str,
     config: &std::collections::HashMap<String, String>,
+    ctx: &op_registry::TaskContext,
     flight_service: Arc<PylonFlightService>,
 ) -> Result<Box<dyn PipelineOp>> {
-    op_registry::registry().build(name, config, flight_service)
+    op_registry::registry().build(name, config, ctx, flight_service)
 }
 
 /// Encode a RecordBatch as Arrow IPC streaming bytes (one schema

@@ -308,23 +308,21 @@ impl QueryStateMachine {
         };
         let start = Instant::now();
         loop {
-            // Re-check state under lock.
-            let (expected_count, acked_count, failures, _stalled_count, _current) = {
+            // Re-check state under lock. Only terminal-Done acks
+            // count toward completion — a Stalled ack is a checkpoint
+            // on a still-running task (C5.6: the raw acked count here
+            // let a fully-stalled stage resolve prematurely).
+            let (expected_count, done_count, failures, _current) = {
                 let g = self.lock_inner();
                 let expected = g.expected.get(&(query_id, stage_id));
                 let acked = g.acked.get(&(query_id, stage_id));
                 (
                     expected.map(|s| s.len()).unwrap_or(0),
-                    acked.map(|m| m.len()).unwrap_or(0),
                     acked
-                        .map(|m| m.values().filter(|a| matches!(a, TaskAck::Failed)).count())
+                        .map(|m| m.values().filter(|a| matches!(a, TaskAck::Done)).count())
                         .unwrap_or(0),
                     acked
-                        .map(|m| {
-                            m.values()
-                                .filter(|a| matches!(a, TaskAck::Stalled { .. }))
-                                .count()
-                        })
+                        .map(|m| m.values().filter(|a| matches!(a, TaskAck::Failed)).count())
                         .unwrap_or(0),
                     g.state.get(&(query_id, stage_id)).copied(),
                 )
@@ -341,18 +339,18 @@ impl QueryStateMachine {
             // tasks (degenerate — empty broadcast / Gather-to-one
             // collapse) resolves immediately, since there's no
             // work to await.
-            if expected_count == 0 && acked_count == 0 {
+            if expected_count == 0 && done_count == 0 {
                 return Ok(());
             }
-            if expected_count > 0 && acked_count >= expected_count {
+            if expected_count > 0 && done_count >= expected_count {
                 return Ok(());
             }
             // Accept Running/Pending if no failures and not all acked yet.
             let elapsed = start.elapsed();
             if elapsed >= deadline {
                 return Err(PylonError::Internal(format!(
-                    "stage ({}, {}) timed out after {:?} ({}/{} acked)",
-                    query_id.0, stage_id.0, deadline, acked_count, expected_count
+                    "stage ({}, {}) timed out after {:?} ({}/{} done)",
+                    query_id.0, stage_id.0, deadline, done_count, expected_count
                 )));
             }
             let remaining = deadline.saturating_sub(elapsed);
@@ -651,6 +649,36 @@ mod tests {
         // panicking and the state machine remains usable.
         qsm.register_stage(q(3), s(1), vec![t(1)]);
         assert_eq!(qsm.stage_state(q(3), s(1)), Some(StageState::Pending));
+    }
+
+    /// C5.6 regression: a stage whose every task has only stalled
+    /// (checkpointed) must NOT resolve — the raw acked count used to
+    /// let it through and the coord drained an empty result set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_keeps_waiting_when_all_tasks_only_stalled() {
+        let qsm = QueryStateMachine::new();
+        qsm.register_stage(q(1), s(1), vec![t(1), t(2)]);
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(1),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/a.arrow"),
+            },
+        );
+        qsm.ack_task(
+            q(1),
+            s(1),
+            t(2),
+            TaskAck::Stalled {
+                spill_handle: handle("/tmp/b.arrow"),
+            },
+        );
+        let res = qsm
+            .wait_for_stage_done(q(1), s(1), Duration::from_millis(100))
+            .await;
+        assert!(res.is_err(), "fully-stalled stage must not resolve");
+        assert!(res.unwrap_err().to_string().contains("timed out"));
     }
 
     #[tokio::test(flavor = "current_thread")]
