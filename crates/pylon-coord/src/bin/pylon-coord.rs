@@ -1138,7 +1138,7 @@ impl Worker for CoordGrpc {
                 let _ = state
                     .state_machine
                     .clear_stalled(qid, sid, pylon_coord::TaskId(tid));
-                let Some(mut spec) = lock_ok(&state.task_specs).get(&tid).cloned() else {
+                let Some(spec) = lock_ok(&state.task_specs).get(&tid).cloned() else {
                     continue;
                 };
                 let has_log = spec.fragment.as_ref().is_some_and(|f| {

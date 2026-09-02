@@ -1,5 +1,6 @@
 //! Basic shared types for the Pylon query engine.
 
+pub mod codec;
 pub mod error;
 pub mod memory_pool;
 pub mod stream;

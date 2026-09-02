@@ -7,11 +7,11 @@
 //! multipart sink's on-disk format and is backward compatible with
 //! plain single-stream files.
 
+use crate::PylonError;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
-use pylon_types::PylonError;
 
 /// Encodes one Arrow batch as a complete IPC stream (schema + batch
 /// + EOS).

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arrow_schema::SchemaRef;
 use pylon_connector_spi::{ConnectorPage, ConnectorResult, DataSink, DataSource, WriteStats};
-use pylon_exchange::codec::encode_batch_stream;
+use pylon_types::codec::{encode_batch_stream, read_concatenated_ipc};
 
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
@@ -234,8 +234,7 @@ impl DataSink for S3DataSink {
     fn append(&mut self, page: ConnectorPage) -> ConnectorResult<()> {
         let batch = page.into_batch();
         self.rows_written += batch.num_rows() as u64;
-        let stream =
-            pylon_exchange::codec::encode_batch_stream(&self.schema, &batch).map_err(codec_err)?;
+        let stream = encode_batch_stream(&self.schema, &batch).map_err(codec_err)?;
         self.pending.extend_from_slice(&stream);
         while self.pending.len() >= self.chunk_size {
             let part: Vec<u8> = self.pending.drain(..self.chunk_size).collect();
@@ -330,9 +329,7 @@ impl S3DataSource {
         let key = key.into();
         let bytes = store.get(&key)?;
         let completed_bytes = bytes.len() as u64;
-        let pending = pylon_exchange::codec::read_concatenated_ipc(bytes)
-            .map_err(codec_err)?
-            .into();
+        let pending = read_concatenated_ipc(bytes).map_err(codec_err)?.into();
         Ok(Self {
             key,
             pending,
@@ -493,7 +490,6 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
-    use pylon_exchange::codec::read_concatenated_ipc;
     use std::sync::Arc;
 
     #[test]

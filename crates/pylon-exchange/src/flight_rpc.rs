@@ -13,10 +13,10 @@
 //! We intentionally implement only `DoExchange` for M3 first cut.
 //! `GetFlightInfo` / `GetSchema` / `DoPut` / `DoGet` are M4+.
 
-use crate::codec::encode_batch_stream;
 use crate::flight_server::{FlightDescriptor, PylonFlightService};
 use arrow_ipc::reader::StreamReader;
 use futures::{Stream, StreamExt};
+use pylon_types::codec::encode_batch_stream;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -87,7 +87,7 @@ fn append_batch_to_log(
         .open(path)?;
     use std::io::Write as _;
     let stream = encode_batch_stream(schema, batch)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("ipc encode: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("ipc encode: {e}")))?;
     file.write_all(&stream)
 }
 
@@ -174,9 +174,6 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
         let ack_tx = tx;
         tokio::spawn(async move {
             let mut descriptor: Option<FlightDescriptor> = None;
-            let mut stream_bytes: Vec<u8> = Vec::new();
-            let mut schema_seen = false;
-            let mut reader: Option<StreamReader<Cursor<Vec<u8>>>> = None;
             while let Some(item) = inbound.next().await {
                 let data = match item {
                     Ok(d) => d,
@@ -185,88 +182,73 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                         break;
                     }
                 };
-                // First-time routing: if this is a control frame
-                // (descriptor-only, no body), use its app_metadata.
-                if data.data_body.is_empty() && data.app_metadata.is_empty() {
-                    // Pure ack? Just skip.
-                    continue;
-                }
-                if descriptor.is_none() {
-                    let meta = data.app_metadata.clone();
-                    let desc_str = String::from_utf8(meta.to_vec()).map_err(|e| {
-                        Status::invalid_argument(format!("descriptor not utf-8: {e}"))
-                    });
-                    match desc_str {
-                        Ok(s) if !s.is_empty() => {
-                            descriptor = Some(FlightDescriptor(s));
-                            let _ = ack_tx
-                                .send(Ok(make_ack(descriptor.as_ref().unwrap())))
-                                .await;
-                            continue;
-                        }
-                        _ => {
-                            warn!("first FlightData has no descriptor in app_metadata");
-                            break;
-                        }
-                    }
-                }
-                // Otherwise, accumulate into the IPC stream and
-                // decode whole batches. The Arrow IPC streaming
-                // format is: 4 bytes continuation (0xFF×4) +
-                // 4 bytes metadata length + N bytes metadata +
-                // 0..M bytes body. We just push the entire
-                // FlightData.data_body into a buffer and let
-                // StreamReader parse it incrementally.
-                stream_bytes.extend_from_slice(&data.data_body);
-                if !schema_seen {
-                    // First time we see non-empty body: try to
-                    // construct the StreamReader.
-                    match StreamReader::try_new(Cursor::new(stream_bytes.clone()), None) {
-                        Ok(r) => {
-                            reader = Some(r);
-                            schema_seen = true;
-                        }
-                        Err(_) => continue, // need more bytes
-                    }
-                }
-                // Drain any complete batches the reader has now.
-                if let Some(mut r) = reader.take() {
-                    loop {
-                        match r.next() {
-                            Some(Ok(batch)) => {
-                                if batch.num_rows() > 0
-                                    && let Some(d) = &descriptor
-                                {
-                                    // FTE source: persist the batch to
-                                    // the input log BEFORE queueing, so a
-                                    // crash can never lose acknowledged
-                                    // replay data (write-ahead ordering).
-                                    if let (Some(root), Some(rel)) =
-                                        (spill_root.as_deref(), input_log_relative_path(&d.0))
-                                    {
-                                        let schema = batch.schema();
-                                        if let Err(e) =
-                                            append_batch_to_log(root, &rel, &schema, &batch)
-                                        {
-                                            warn!(error = %e, "input-log append failed");
-                                        }
-                                    }
-                                    if let Err(e) = service.push(d, batch).await {
-                                        warn!(error = ?e, "service.push failed");
-                                    }
-                                }
+                // Control frame: descriptor-only (empty body), pins
+                // the route for every subsequent data body.
+                if data.data_body.is_empty() {
+                    if descriptor.is_none() {
+                        let desc_str = String::from_utf8(data.app_metadata.to_vec()).map_err(|e| {
+                            Status::invalid_argument(format!("descriptor not utf-8: {e}"))
+                        });
+                        match desc_str {
+                            Ok(s) if !s.is_empty() => {
+                                descriptor = Some(FlightDescriptor(s));
+                                let _ = ack_tx
+                                    .send(Ok(make_ack(&descriptor.as_ref().unwrap())))
+                                    .await;
+                                continue;
                             }
-                            Some(Err(e)) => {
-                                warn!(error = %e, "StreamReader decode err");
+                            _ => {
+                                warn!("first FlightData has no descriptor in app_metadata");
                                 break;
                             }
-                            None => break, // need more bytes (or EOS)
                         }
                     }
-                    // After draining, reset stream_bytes to whatever
-                    // tail the reader may have buffered.
-                    stream_bytes.clear();
-                    reader = Some(r);
+                    continue;
+                }
+                // Data frame: each body is ONE complete Arrow IPC
+                // stream (schema + batch + EOS), written by
+                // ExchangeSinkRpc per partition slice. Decode it
+                // independently — there is deliberately no shared
+                // accumulator (the old clone-then-clear dropped bytes
+                // that arrived mid-drain).
+                let Some(d) = &descriptor else {
+                    warn!("data body before descriptor control frame");
+                    break;
+                };
+                let Ok(mut reader) =
+                    StreamReader::try_new(Cursor::new(data.data_body.clone()), None)
+                else {
+                    warn!("FlightData body is not a complete IPC stream");
+                    continue;
+                };
+                loop {
+                    match reader.next() {
+                        Some(Ok(batch)) => {
+                            if batch.num_rows() == 0 {
+                                continue;
+                            }
+                            // FTE source: persist the batch to the
+                            // input log BEFORE queueing, so a crash can
+                            // never lose acknowledged replay data
+                            // (write-ahead ordering).
+                            if let (Some(root), Some(rel)) =
+                                (spill_root.as_deref(), input_log_relative_path(&d.0))
+                            {
+                                let schema = batch.schema();
+                                if let Err(e) = append_batch_to_log(root, &rel, &schema, &batch) {
+                                    warn!(error = %e, "input-log append failed");
+                                }
+                            }
+                            if let Err(e) = service.push(d, batch).await {
+                                warn!(error = ?e, "service.push failed");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!(error = %e, "StreamReader decode err");
+                            break;
+                        }
+                        None => break,
+                    }
                 }
             }
             debug!("Flight DoExchange inbound closed");
