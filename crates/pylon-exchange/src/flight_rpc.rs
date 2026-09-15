@@ -230,17 +230,27 @@ impl arrow_flight::flight_service_server::FlightService for FlightServerImpl {
                             // FTE source: persist the batch to the
                             // input log BEFORE queueing, so a crash can
                             // never lose acknowledged replay data
-                            // (write-ahead ordering).
-                            if let (Some(root), Some(rel)) =
-                                (spill_root.as_deref(), input_log_relative_path(&d.0))
-                            {
-                                let schema = batch.schema();
-                                if let Err(e) = append_batch_to_log(root, &rel, &schema, &batch) {
-                                    warn!(error = %e, "input-log append failed");
+                            // (write-ahead ordering). When the log is
+                            // authoritative (FTE mode), the queue push
+                            // is skipped entirely — at S8 scale the
+                            // drain-once queue is dead memory that
+                            // would OOM the worker.
+                            let fte_rel = spill_root.as_deref().and_then(|root| {
+                                input_log_relative_path(&d.0).map(|rel| (root, rel))
+                            });
+                            match fte_rel {
+                                Some((root, rel)) => {
+                                    let schema = batch.schema();
+                                    if let Err(e) = append_batch_to_log(root, &rel, &schema, &batch)
+                                    {
+                                        warn!(error = %e, "input-log append failed");
+                                    }
                                 }
-                            }
-                            if let Err(e) = service.push(d, batch).await {
-                                warn!(error = ?e, "service.push failed");
+                                None => {
+                                    if let Err(e) = service.push(d, batch).await {
+                                        warn!(error = ?e, "service.push failed");
+                                    }
+                                }
                             }
                         }
                         Some(Err(e)) => {
