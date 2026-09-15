@@ -167,21 +167,31 @@ async fn run(
             Ok(batches) => {
                 let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
                 let mut emitted = 0u64;
+                // M4.S8: a stage-1 aggregate can emit one final batch
+                // far over tonic's default 4 MB message decode limit;
+                // emit in <=64k-row slices (~2.5 MB IPC each).
+                const MAX_ROWS_PER_RESPONSE: usize = 65536;
                 for batch in batches {
-                    let bytes = encode_batch_ipc(&batch).unwrap_or_default();
-                    let resp = TaskResponse {
-                        task_id,
-                        state: TaskState::TaskRunning as i32,
-                        rows_emitted: batch.num_rows() as u64,
-                        batch: bytes,
-                        message: String::new(),
-                        spill_handle: String::new(),
-                    };
-                    if out_tx.send(resp).await.is_err() {
-                        warn!("coord stream closed mid-batch");
-                        return Ok(());
+                    let mut offset = 0usize;
+                    while offset < batch.num_rows() {
+                        let len = MAX_ROWS_PER_RESPONSE.min(batch.num_rows() - offset);
+                        let slice = batch.slice(offset, len);
+                        offset += len;
+                        let bytes = encode_batch_ipc(&slice).unwrap_or_default();
+                        let resp = TaskResponse {
+                            task_id,
+                            state: TaskState::TaskRunning as i32,
+                            rows_emitted: slice.num_rows() as u64,
+                            batch: bytes,
+                            message: String::new(),
+                            spill_handle: String::new(),
+                        };
+                        if out_tx.send(resp).await.is_err() {
+                            warn!("coord stream closed mid-batch");
+                            return Ok(());
+                        }
+                        emitted += slice.num_rows() as u64;
                     }
-                    emitted += batch.num_rows() as u64;
                 }
                 // M3: emit DONE marker so coord can advance to next stage
                 let done_resp = TaskResponse {

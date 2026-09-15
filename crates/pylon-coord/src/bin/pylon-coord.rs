@@ -138,9 +138,15 @@ async fn main() -> Result<()> {
     });
 
     let grpc = tonic::transport::Server::builder()
-        .add_service(WorkerServer::new(CoordGrpc {
-            state: state.clone(),
-        }))
+        .add_service(
+            WorkerServer::new(CoordGrpc {
+                state: state.clone(),
+            })
+            // M4.S8: stage-1 aggregates emit multi-MB TaskResponse
+            // batches; the tonic default (4 MB) rejects them with
+            // proto decode errors on the coord's inbound stream.
+            .max_decoding_message_size(64 * 1024 * 1024),
+        )
         .serve(
             format!("0.0.0.0:{grpc_port}")
                 .parse()
