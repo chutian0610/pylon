@@ -1,34 +1,43 @@
-# Pylon — Pipeline-first Rust SQL query engine
+# Pylon
 
-**Status**: M1–M4 milestones complete — single worker → multi-worker gRPC → cross-worker Arrow Flight shuffle → fault-tolerant execution (per-task memory pools, spill-to-disk/S3 aggregates, persisted exchange input, worker-loss re-dispatch; sign-off: mid-task worker kill at 20M×1M reproduces the baseline exactly). See [docs/roadmap/milestones.md](docs/roadmap/milestones.md), [docs/notes/m4-status.md](docs/notes/m4-status.md), and [docs/notes/rfc-0007-m4-candidates.md](docs/notes/rfc-0007-m4-candidates.md).
+Pylon is an Apache Arrow–native, pipeline-first SQL query engine
+written in Rust. It targets the Presto/Trino workload family — SQL in,
+distributed GROUP BY aggregates out — with a Velox-inspired
+Operator/Driver/Task runtime instead of a JVM.
 
-Pylon is an Apache Arrow-native Rust query engine targeting the Presto/Trino use cases with reduced JVM/serialization overhead and a pipeline-driven execution model inspired by Velox.
+## Features
 
-## What's working today
+- **SQL front-end** — sqlparser-based parsing and planning; `GROUP BY`
+  with `COUNT` / `SUM` / `MIN` / `MAX` over Parquet
+- **Distributed execution** — coordinator + worker binaries; stages are
+  hash-partitioned across workers and shuffled over Arrow Flight
+  `DoExchange`
+- **Fault-tolerant execution** — per-task memory budgets,
+  spill-to-disk/S3 aggregates with `TASK_STALLED` checkpoints,
+  persisted exchange input, and automatic worker-loss re-dispatch.
+  Verified by chaos sign-off: killing a worker mid-query still
+  produces the exact baseline result
+- **Arrow-native** — columnar end to end; no JVM, no DataFusion runtime
 
-- ✅ `pylon-types`: shared base types and error model
-- ✅ `pylon-plan`: SQL → LogicalPlan → PhysicalPlan (sqlparser 0.55), incl. `Aggregate` with `COUNT` / `SUM` / `MIN` / `MAX` and `GROUP BY`
-- ✅ `pylon-runtime`: PipelineOp trait (Velox-style 7-method contract); `Driver::run` with true single-thread poll loop; ops:
-  - `SeqScanOp` (Parquet) · `FilterOp` (>, <, =, ≠, ≥, ≤) · `ProjectOp` (column subset)
-  - `PartitionFilterOp` (`id % n == p`) · `HashAggregateOp` (per-row hash group aggregate) · `ExchangeSinkOp` / `ExchangeSourceOp` (in-process partitioned via `PylonFlightService`)
-  - `ExchangeSinkRpc` (cross-process via real Arrow Flight `DoExchange`) · `ExchangeSourceOp` reads from local Flight server
-- ✅ `pylon-exchange`: in-process `PylonFlightService` (descriptor → `Vec<RecordBatch>` map) + `PylonFlightClient` (real Arrow IPC streaming encode/decode) + `FlightServerImpl` (tonic `arrow_flight::flight_service_server::FlightService` impl)
-- ✅ `pylon-proto`: gRPC `Worker` service with `RegisterWorker(flight_addr, grpc_addr) -> worker_id` and `OpenSession` (bidi `stream<TaskRequest, TaskResponse>`)
-- ✅ `pylon-coord`: HTTP API (`POST /v1/query`, `GET /v1/query/{id}`, `GET /v1/workers`); `pylon_coord::Discovery` registry; `Fragmenter` with post-order walk + `HashPartitionExchange` injection (per-row FNV-1a hash routing)
-- ✅ `pylon-worker` binary: gRPC + Arrow Flight server in one process; `--flight-addr` / `--grpc-addr` flags; calls `RegisterWorker` then `OpenSession` with `x-pylon-worker-id` metadata
-- ✅ Cross-process 2-worker E2E: `tools/e2e/two_worker_smoke.sh` (1 coord + 2 workers, `SELECT name, COUNT(*) FROM sample GROUP BY name` runs with real Arrow Flight `DoExchange` between workers)
-- ✅ Fault-tolerant execution (M4): per-task memory budgets, spill-to-disk/S3 aggregates with `TASK_STALLED` checkpoints, persisted exchange input, worker-loss re-dispatch from checkpoints, chaos testbed in `tools/chaos/` (incl. the M4 sign-off: mid-task worker kill at 20M×1M == baseline exactly — see [docs/notes/m4-status.md](docs/notes/m4-status.md))
+## Status
 
-## Quickstart — single worker (M1)
+M1–M4 complete (single worker → distributed exchange → fault
+tolerance). Up next: M5 hardening (auth, HA, JDBC) and M3.5+
+(Iceberg catalog, HashJoin). See
+[docs/roadmap/milestones.md](docs/roadmap/milestones.md) and the
+[sign-off packet](docs/notes/m4-status.md).
+
+## Quickstart
+
+### Single worker
 
 ```bash
-# Build everything
 cargo build --workspace
 
-# Generate a 100K-row Parquet sample table
+# Generate a 100k-row sample table
 cargo run -p gen-sample-data
 
-# Run a query
+# Run a filtered scan
 cd crates/pylon-worker
 RUST_LOG=pylon=info ../../target/debug/pylon \
   --sql "SELECT id, name FROM sample WHERE amount > 100000" \
@@ -36,87 +45,70 @@ RUST_LOG=pylon=info ../../target/debug/pylon \
   --path ../../data/sample.parquet \
   --out /tmp/result.parquet
 
-# Inspect the output
+# Inspect the result
 cargo run -p verify-output --quiet -- /tmp/result.parquet
 ```
 
-Expected output for the example above: `rows: 33333`.
-
-## Quickstart — 2-worker cross-process (M3)
+### Two-worker cluster
 
 ```bash
-# Build the binaries
 cargo build --workspace --bin pylon-coord --bin pylon-worker
-
-# Run the smoke E2E (starts 1 coord + 2 workers, runs a query, checks result)
 bash tools/e2e/two_worker_smoke.sh
 ```
 
-What this exercises:
-- Each worker calls `RegisterWorker` on the coord with its `flight_addr`
-- The coord uses `Fragmenter::fragment_with_workers(plan, qid, &[flight_addr_0, flight_addr_1])` to build the DAG
-- Stage 0 is dispatched to worker 0; stage 1 partition `p` is dispatched to worker `p % n_workers`
-- Stage 0's `ExchangeSinkRpc` opens a tonic `DoExchange` to each worker's Flight server
-- Each stage 1 worker pulls via `ExchangeSource` from its local `PylonFlightService` (fed by the local Flight server)
+Starts a coordinator and two workers, runs a distributed
+`GROUP BY` across a real Arrow Flight shuffle, and checks the result.
 
-See `docs/notes/m3-status.md` for the full accept criteria + numbers.
+## Tooling
 
-## Architecture
+| Script | Purpose |
+|---|---|
+| `tools/e2e/two_worker_smoke.sh` | 2-worker cross-process Flight shuffle E2E |
+| `tools/chaos/stall_retry_e2e.sh` | spill → `TASK_STALLED` checkpoint → DONE |
+| `tools/chaos/kill_worker_e2e.sh` | SIGKILL a worker mid-task; asserts bounded terminal state |
+| `tools/chaos/fte_kill_e2e.sh` | mid-task kill with input replay (exact result) |
+| `tools/chaos/s8_signoff_e2e.sh` | M4 sign-off: baseline vs mid-task-kill run at scale |
 
-See [docs/rfcs/0001-architecture.md](docs/rfcs/0001-architecture.md) for the full RFC and [docs/research/findings.md](docs/research/findings.md) for the research that backs every architectural decision.
-
-**Key ADRs**:
-
-1. **Two-binary split** (coordinator / worker)
-2. **arrow-rs directly, no DataFusion runtime** — DataFusion's pull-stream `ExecutionPlan` is fundamentally incompatible with pipeline MPP; we borrow the kernels and type system only
-3. **Velox Operator / Driver / Task** as the runtime reference
-4. **Doris "fixed thread pool = CPU core count"** as a hard scheduler constraint
-5. **HashJoinBridge** (Velox + Trino) for build/probe state sharing
-6. **Arrow Flight + FTE** for shuffle + fault tolerance (M4: FTE pending)
-7. **Iceberg REST Catalog** as the only catalog (Lakekeeper default; Polaris alt) — M3.5+
-8. **No Substrait in v1** — same engine, no cross-engine requirement yet
+Tuning knobs and the sample-data generator are documented in
+[docs/operations.md](docs/operations.md).
 
 ## Workspace layout
 
 ```
 crates/
-├── pylon-types/        Shared types
+├── pylon-types/        Shared types, errors, MemoryPool, IPC codec
 ├── pylon-plan/         SQL → LogicalPlan → PhysicalPlan
-├── pylon-runtime/      PipelineOp + Driver + 8 ops (incl. Exchange + HashAggregate)
-├── pylon-exchange/     Arrow IPC + PylonFlightClient + FlightServerImpl (tonic)
+├── pylon-runtime/      PipelineOp + Driver + operators (scan, filter,
+│                       project, hash aggregate with spill, exchange)
+├── pylon-exchange/     Arrow Flight transport + IPC codec + FTE logs
 ├── pylon-proto/        gRPC stubs (Worker service)
-├── pylon-catalog/      (M3.5+) Iceberg REST Catalog client
-├── pylon-iceberg/      (M3.5+) Iceberg table reader
-├── pylon-storage/      (M3.5+) object_store abstraction (S3/GCS/ADLS)
-├── pylon-coord/        Coordinator binary (HTTP + gRPC + Fragmenter + Discovery)
-└── pylon-worker/       Worker binary (gRPC + Flight server + Pipeline runner)
+├── pylon-coord/        Coordinator binary (HTTP + gRPC + Fragmenter)
+├── pylon-worker/       Worker binary (gRPC + Flight + pipelines)
+└── pylon-catalog / -iceberg / -storage   Connector SPIs (M3.5+)
 
 tools/
-├── gen-sample-data/    Generates a 100K-row test Parquet
-├── verify-output/      Reads a Parquet and prints row count + sample
-└── e2e/
-    └── two_worker_smoke.sh    2-worker cross-process Flight shuffle E2E
+├── gen-sample-data/    Sample Parquet generator (--rows/--groups)
+├── verify-output/      Parquet reader/printer
+├── e2e/                Cross-process smoke E2E
+└── chaos/              Fault-injection + sign-off testbed
 ```
 
-## Chaos / FTE tooling (M4)
+## Architecture
 
-```bash
-# Deterministic spill→checkpoint→DONE e2e (tiny budget forces spill)
-bash tools/chaos/stall_retry_e2e.sh
+Two binaries, two-stage execution: the coordinator parses SQL, plans a
+physical DAG, cuts it into hash-partitioned stages, and dispatches
+tasks to workers; workers run Velox-style operator pipelines and
+shuffle partitions over Arrow Flight. Aggregates spill to disk under
+per-task byte budgets and checkpoint their way to fault tolerance.
 
-# Kill a worker mid-task; asserts bounded terminal state
-bash tools/chaos/kill_worker_e2e.sh 3
+- Full design: [docs/architecture.md](docs/architecture.md)
+- Key ADRs and RFCs: [docs/rfcs/](docs/rfcs/)
 
-# M4 sign-off: baseline vs mid-task-kill run at scale
-# (defaults: 20M rows × 1M groups; 1B is the same script parameterized)
-bash tools/chaos/s8_signoff_e2e.sh
-# S8_ROWS=1000000000 S8_GROUPS=1000000 bash tools/chaos/s8_signoff_e2e.sh
-```
+## Documentation
 
-Worker tuning: `PYLON_TASK_MEMORY_BUDGET_BYTES` (per-task aggregate
-budget; small values force the spill/checkpoint path),
-`PYLON_HTTP_PORT` / `PYLON_GRPC_PORT` (coord), `PYLON_FLIGHT_ADDR` /
-`PYLON_GRPC_ADDR` / `PYLON_SPILL_ROOT` (worker).
+See [docs/README.md](docs/README.md) for the full map — architecture
+and ADRs for contributors, operations for running/testing, roadmap for
+what's next, and `docs/notes/` for the append-only development record.
 
 ## License
 
