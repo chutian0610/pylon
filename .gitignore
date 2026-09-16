@@ -7,10 +7,6 @@
 /data/
 **/*.parquet
 
-# Local-only config, NOT for repo
-AGENTS.md
-RTK.md
-
 # Editor / OS noise
 Cargo.lock
 *.swp
