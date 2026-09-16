@@ -123,20 +123,20 @@ headline numbers:
 
 ---
 
-## 里程碑 4 — FTE + Spill (1–2 月)
+## 里程碑 4 — FTE + Spill (1–2 月) — ✅ 完成并签收 (2026-09-15，sign-off packet 见 docs/notes/m4-status.md)
 
 **目标**：生产可用性 + 容错。
 
-| 任务 | 估计天数 |
-|---|---|
-| FTE sink：写 Arrow IPC stream 到 S3 | 6 |
-| FTE source：从 S3 读回作为 retry base | 4 |
-| per-task memory pool | 6 |
-| Spill manager (per-fragment budget) | 5 |
-| Spill 版本的 hash agg | 8 |
-| Spill 版本的 sort | 6 |
-| 故障注入测试平台 (chaos-style) | 5 |
-| 拉一个 worker 看 query 是否继续 | 3 |
+| 任务 | 估计天数 | 状态 |
+|---|---|---|
+| FTE sink：写 Arrow IPC stream 到 S3 | 6 | ✅ 完成 (input log 以拼接 IPC 流写 worker spill root，本地 FS 即签收路径；S3 经 object_store 可插拔) |
+| FTE source：从 S3 读回作为 retry base | 4 | ✅ 完成 (`ExchangeSourceOp::from_log` 重放持久化输入日志；跨主机重放需配置 S3 spill root) |
+| per-task memory pool | 6 | ✅ 完成 (M4.S1，PR #15) |
+| Spill manager (per-fragment budget) | 5 | ✅ 完成 (M4.S2，PR #16；S3 multipart 见 C5.6) |
+| Spill 版本的 hash agg | 8 | ✅ 完成 (M4.S2 自动溢写 + C5.5 checkpoint ack + pending_resume 重试) |
+| Spill 版本的 sort | 6 | ⏸ 延期 (引擎尚无 SortOp/ORDER BY，等用例；溢写栈已就绪，见 candidates S6 行) |
+| 故障注入测试平台 (chaos-style) | 5 | ✅ 完成 (M4.S7，PR #24，tools/chaos/) |
+| 拉一个 worker 看 query 是否继续 | 3 | ✅ 完成 (S7 session-loss 重派 + S8 签收：20M×1M mid-task kill == 基线) |
 
 ---
 

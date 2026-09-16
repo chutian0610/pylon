@@ -1,6 +1,6 @@
 # Pylon — Pipeline-first Rust SQL query engine
 
-**Status**: M1, M2, M3 milestones complete (single worker → multi-worker gRPC + in-process exchange → cross-worker Arrow Flight shuffle). Next: M4 (FTE + spill to object storage). See [docs/roadmap/milestones.md](docs/roadmap/milestones.md) and [docs/notes/m3-status.md](docs/notes/m3-status.md).
+**Status**: M1–M4 milestones complete — single worker → multi-worker gRPC → cross-worker Arrow Flight shuffle → fault-tolerant execution (per-task memory pools, spill-to-disk/S3 aggregates, persisted exchange input, worker-loss re-dispatch; sign-off: mid-task worker kill at 20M×1M reproduces the baseline exactly). See [docs/roadmap/milestones.md](docs/roadmap/milestones.md), [docs/notes/m4-status.md](docs/notes/m4-status.md), and [docs/notes/rfc-0007-m4-candidates.md](docs/notes/rfc-0007-m4-candidates.md).
 
 Pylon is an Apache Arrow-native Rust query engine targeting the Presto/Trino use cases with reduced JVM/serialization overhead and a pipeline-driven execution model inspired by Velox.
 
@@ -17,6 +17,7 @@ Pylon is an Apache Arrow-native Rust query engine targeting the Presto/Trino use
 - ✅ `pylon-coord`: HTTP API (`POST /v1/query`, `GET /v1/query/{id}`, `GET /v1/workers`); `pylon_coord::Discovery` registry; `Fragmenter` with post-order walk + `HashPartitionExchange` injection (per-row FNV-1a hash routing)
 - ✅ `pylon-worker` binary: gRPC + Arrow Flight server in one process; `--flight-addr` / `--grpc-addr` flags; calls `RegisterWorker` then `OpenSession` with `x-pylon-worker-id` metadata
 - ✅ Cross-process 2-worker E2E: `tools/e2e/two_worker_smoke.sh` (1 coord + 2 workers, `SELECT name, COUNT(*) FROM sample GROUP BY name` runs with real Arrow Flight `DoExchange` between workers)
+- ✅ Fault-tolerant execution (M4): per-task memory budgets, spill-to-disk/S3 aggregates with `TASK_STALLED` checkpoints, persisted exchange input, worker-loss re-dispatch from checkpoints, chaos testbed in `tools/chaos/` (incl. the M4 sign-off: mid-task worker kill at 20M×1M == baseline exactly — see [docs/notes/m4-status.md](docs/notes/m4-status.md))
 
 ## Quickstart — single worker (M1)
 
@@ -96,6 +97,26 @@ tools/
 └── e2e/
     └── two_worker_smoke.sh    2-worker cross-process Flight shuffle E2E
 ```
+
+## Chaos / FTE tooling (M4)
+
+```bash
+# Deterministic spill→checkpoint→DONE e2e (tiny budget forces spill)
+bash tools/chaos/stall_retry_e2e.sh
+
+# Kill a worker mid-task; asserts bounded terminal state
+bash tools/chaos/kill_worker_e2e.sh 3
+
+# M4 sign-off: baseline vs mid-task-kill run at scale
+# (defaults: 20M rows × 1M groups; 1B is the same script parameterized)
+bash tools/chaos/s8_signoff_e2e.sh
+# S8_ROWS=1000000000 S8_GROUPS=1000000 bash tools/chaos/s8_signoff_e2e.sh
+```
+
+Worker tuning: `PYLON_TASK_MEMORY_BUDGET_BYTES` (per-task aggregate
+budget; small values force the spill/checkpoint path),
+`PYLON_HTTP_PORT` / `PYLON_GRPC_PORT` (coord), `PYLON_FLIGHT_ADDR` /
+`PYLON_GRPC_ADDR` / `PYLON_SPILL_ROOT` (worker).
 
 ## License
 
