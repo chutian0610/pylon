@@ -24,6 +24,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::StreamExt;
 use pylon_exchange::{FlightDescriptor, PylonFlightService};
 use pylon_types::{PylonError, Result};
 use std::sync::Arc;
@@ -271,7 +272,7 @@ pub struct ExchangeSinkRpc {
     /// processing (and, with FTE source, finished appending its
     /// persisted input log). Replaces the old fire-and-forget spawn
     /// + 500 ms sleep heuristic.
-    inflight: Vec<tokio::task::JoinHandle<()>>,
+    inflight: Vec<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl ExchangeSinkRpc {
@@ -280,7 +281,7 @@ impl ExchangeSinkRpc {
     fn send_rpc_job(
         url: String,
         messages: Vec<arrow_flight::FlightData>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
             // The do_exchange future's Send bound is implicit via the
             // outer `Pin<Box<dyn Future + Send>>`. Build the stream
@@ -291,19 +292,33 @@ impl ExchangeSinkRpc {
                     Ok(ch) => ch,
                     Err(e) => {
                         warn!("ExchangeSinkRpc connect {url}: {e}");
-                        return;
+                        return Ok(());
                     }
                 },
                 Err(e) => {
-                    warn!("ExchangeSinkRpc bad url {url}: {e}");
-                    return;
+                    warn!("ExchangeSinkRpc connect {url}: {e}");
+                    return Ok(());
                 }
             };
             let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
             let s = futures::stream::iter(messages);
-            if let Err(e) = client.do_exchange(s).await {
+            // RFC 0007 FTE ordering: drain the ack stream to the END —
+            // the server closes it only after its handler has finished
+            // appending the input log + queueing every batch. Resolving
+            // at response-header time (and dropping the stream) could
+            // reset the server-side inbound mid-flight, silently
+            // dropping unprocessed batches.
+            let response = client.do_exchange(s).await.map_err(|e| {
                 warn!("ExchangeSinkRpc do_exchange {url}: {e}");
+                PylonError::Internal(format!("exchange do_exchange: {e}"))
+            })?;
+            let mut acks = response.into_inner();
+            while let Some(frame) = acks.next().await {
+                if let Err(e) = frame {
+                    warn!("ExchangeSinkRpc ack stream {url}: {e}");
+                }
             }
+            Ok(())
         })
     }
 }
@@ -438,7 +453,7 @@ impl PipelineOp for ExchangeSinkRpc {
         // to accept the Send bound (avoids higher-ranked lifetime
         // issues with bare `impl Future`).
         for (url, messages) in jobs {
-            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
                 Self::send_rpc_job(url, messages);
             self.inflight.push(tokio::spawn(fut));
         }
@@ -458,7 +473,8 @@ impl PipelineOp for ExchangeSinkRpc {
         let handles = std::mem::take(&mut self.inflight);
         for h in handles {
             h.await
-                .map_err(|e| PylonError::Internal(format!("exchange rpc join: {e}")))?;
+                .map_err(|e| PylonError::Internal(format!("exchange rpc join: {e}")))?
+                .map_err(|e| PylonError::Internal(format!("exchange rpc: {e}")))?;
         }
         Ok(())
     }
