@@ -1,6 +1,17 @@
 # RFC 0007 — M4 Fault-Tolerant Execution + Spill
 
-- **Status**: Draft (2026-08-20)
+- **Status**: Implemented (2026-09-15; sign-off packet in
+  [docs/notes/m4-status.md](../notes/m4-status.md)). All workstreams
+  landed except S6 (spillable `SortOp`) — deferred until sort support
+  exists (see `docs/notes/rfc-0007-m4-candidates.md`). Implementation
+  notes: `TaskAck::Stalled` uses emit-and-continue semantics (spill
+  checkpoints ack upstream while the task keeps running; re-dispatch
+  happens on session loss); FTE input replay is via persisted
+  input-log files on the worker spill root
+  (`<spill_root>/pylon-input/<descriptor>.arrow`, write-ahead before
+  queue push), with the drain-once queue skipped in FTE mode; the
+  sign-off ran at 20M×1M (RFC's literal 1B is a parameter of the same
+  script).
 - **Date**: 2026-08-20
 - **Author**: Pylon Working Group
 - **Discussion**: Builds on RFC 0004 (M3 Arrow Flight shuffle), RFC 0005
