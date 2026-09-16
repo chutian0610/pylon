@@ -24,10 +24,10 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::StreamExt;
 use pylon_exchange::{FlightDescriptor, PylonFlightService};
 use pylon_types::{PylonError, Result};
 use std::sync::Arc;
-use futures::StreamExt;
 
 /// Fold a single cell of an Arrow array into a u64 hash. Supports the
 /// types we currently use for group-by keys (Int64, Utf8, Float64,
@@ -295,10 +295,10 @@ impl ExchangeSinkRpc {
                         return Ok(());
                     }
                 },
-                    Err(e) => {
-                        warn!("ExchangeSinkRpc connect {url}: {e}");
-                        return Ok(());
-                    }
+                Err(e) => {
+                    warn!("ExchangeSinkRpc connect {url}: {e}");
+                    return Ok(());
+                }
             };
             let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
             let s = futures::stream::iter(messages);
@@ -308,13 +308,10 @@ impl ExchangeSinkRpc {
             // at response-header time (and dropping the stream) could
             // reset the server-side inbound mid-flight, silently
             // dropping unprocessed batches.
-            let mut response = client
-                .do_exchange(s)
-                .await
-                .map_err(|e| {
-                    warn!("ExchangeSinkRpc do_exchange {url}: {e}");
-                    PylonError::Internal(format!("exchange do_exchange: {e}"))
-                })?;
+            let response = client.do_exchange(s).await.map_err(|e| {
+                warn!("ExchangeSinkRpc do_exchange {url}: {e}");
+                PylonError::Internal(format!("exchange do_exchange: {e}"))
+            })?;
             let mut acks = response.into_inner();
             while let Some(frame) = acks.next().await {
                 if let Err(e) = frame {
@@ -456,9 +453,8 @@ impl PipelineOp for ExchangeSinkRpc {
         // to accept the Send bound (avoids higher-ranked lifetime
         // issues with bare `impl Future`).
         for (url, messages) in jobs {
-            let fut: std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<()>> + Send>,
-            > = Self::send_rpc_job(url, messages);
+            let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+                Self::send_rpc_job(url, messages);
             self.inflight.push(tokio::spawn(fut));
         }
         Ok(())
