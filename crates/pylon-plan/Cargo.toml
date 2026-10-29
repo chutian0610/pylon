@@ -1,0 +1,15 @@
+[package]
+name = "pylon-plan"
+description = "Planner：AST → 可执行 Pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pylon-sql = { workspace = true }
+pylon-table = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

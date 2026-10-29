@@ -1,0 +1,18 @@
+[package]
+name = "pylon-exec"
+description = "Morsel-driven push 执行器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pylon-plan = { workspace = true }
+pylon-table = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+async-channel = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "pylon"
+description = "Pylon CLI 前门：SQL 文本进，Arrow 结果出"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pylon-sql = { workspace = true }
+pylon-table = { workspace = true }
+pylon-plan = { workspace = true }
+pylon-exec = { workspace = true }
+arrow = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

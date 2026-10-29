@@ -1,0 +1,17 @@
+[package]
+name = "pylon-table"
+description = "TableFormat 接缝与本地 Parquet 目录 fixture 实现"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = { workspace = true }

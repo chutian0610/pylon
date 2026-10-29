@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pylon-sql",
+    "crates/pylon-table",
+    "crates/pylon-plan",
+    "crates/pylon-exec",
+    "crates/pylon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+pylon-sql = { path = "crates/pylon-sql" }
+pylon-table = { path = "crates/pylon-table" }
+pylon-plan = { path = "crates/pylon-plan" }
+pylon-exec = { path = "crates/pylon-exec" }
+
+# 全仓 arrow/parquet 锁 ^58，跟随 iceberg-rust（ADR-0001 / ADR-0007）。
+arrow = "58.4"
+parquet = { version = "58.4", features = ["async"] }
+
+nom = "8"
+tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
+futures-util = { version = "0.3", features = ["alloc", "std"] }
+async-channel = "2.5"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+tempfile = "3"

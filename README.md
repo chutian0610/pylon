@@ -1,13 +1,32 @@
 # Pylon
 
-Pylon 是一个计划中的 Rust 编写、Arrow-native 的分布式 SQL 查询引擎：读 Iceberg
-湖仓表、面向交互式分析负载（TPC-H 族），执行模型采用 morsel-driven push
-pipeline，架构目标是存算分离与无状态计算节点。对标 Trino 的 workload 家族，
-但更云原生、scale 更强。
+Pylon 是一个 Rust 编写、Arrow-native 的分布式 SQL 查询引擎：读 Iceberg 湖仓表、
+面向交互式分析负载（TPC-H 族），执行模型采用 morsel-driven push pipeline，
+架构目标是存算分离与无状态计算节点。对标 Trino 的 workload 家族，但更云原生、
+scale 更强。
 
 ## 当前状态
 
-**设计阶段，仓库尚无实现代码。** 本 README 描述目标与已定决策，不代表已有能力。
+**M1 实现中。** 首条端到端弹道（M1/T1，#2）已落地，SQL 文本进、Arrow 结果出的
+规格级接缝自第一天贯通：
+
+```
+pylon "SELECT a, b FROM t LIMIT 10"   # 表 t = <data-dir>/t/*.parquet
+```
+
+链路 = 自研 parser（手写 lexer + nom 语法层）→ planner（列绑定 + 投影裁剪下推）
+→ morsel push 执行器（tokio IO 预取 + 有界队列 + 专用计算线程，算子内无 await）
+→ stdout 表格。TableFormat 接缝已定形（schema / scan 契约，产出可并行打开的
+Morsel 流），首个实现为本地 Parquet 目录 fixture，T5 由 Iceberg adapter 取代。
+当前 SQL 面仅投影 + LIMIT，语法错误返回带行列与脱字符的用户可见错误。
+
+```bash
+cargo build --release
+cargo test --workspace          # 集成测试含 DuckDB 对拍（PATH 上有 duckdb 即跑；
+                                # 设 PYLON_REQUIRE_DUCKDB=1 可强制要求）
+./target/release/pylon --data-dir <目录> "SELECT a, b FROM t LIMIT 10"
+```
+
 术语表见 [CONTEXT.md](CONTEXT.md)，决策记录见 [docs/adr/](docs/adr/)。
 
 ## 已定架构决策

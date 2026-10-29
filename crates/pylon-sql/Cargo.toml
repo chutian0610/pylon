@@ -1,0 +1,9 @@
+[package]
+name = "pylon-sql"
+description = "Pylon SQL 前端：手写 lexer + nom 语法层，产出自有 AST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nom = { workspace = true }
