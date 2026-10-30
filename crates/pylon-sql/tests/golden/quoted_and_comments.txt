@@ -1,0 +1,6 @@
+-- SELECT "My Col" /* block */ FROM "My Table" -- tail
+(query
+  (select
+    (column "My Col")
+  )
+  (from "My Table"))

@@ -1,0 +1,25 @@
+-- SELECT a + b * c - d / e, (a + b) * c FROM t
+(query
+  (select
+    (sub
+      (add
+        (column a)
+        (mul
+          (column b)
+          (column c)
+        )
+      )
+      (div
+        (column d)
+        (column e)
+      )
+    )
+    (mul
+      (add
+        (column a)
+        (column b)
+      )
+      (column c)
+    )
+  )
+  (from t))

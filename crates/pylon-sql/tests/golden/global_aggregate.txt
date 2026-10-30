@@ -1,0 +1,11 @@
+-- SELECT SUM(a * b) FROM t
+(query
+  (select
+    (sum
+      (mul
+        (column a)
+        (column b)
+      )
+    )
+  )
+  (from t))

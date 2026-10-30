@@ -1,0 +1,13 @@
+-- SELECT a FROM t WHERE a BETWEEN 1 AND 10
+(query
+  (select
+    (column a)
+  )
+  (from t)
+  (where
+    (between
+      (column a)
+      (number 1)
+      (number 10)
+    )
+  ))

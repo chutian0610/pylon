@@ -1,0 +1,11 @@
+-- SELECT 'it''s', 0.10, 123456789012345678901234567890, true, false, NULL FROM t
+(query
+  (select
+    (string 'it''s')
+    (number 0.10)
+    (number 123456789012345678901234567890)
+    (boolean true)
+    (boolean false)
+    (null)
+  )
+  (from t))

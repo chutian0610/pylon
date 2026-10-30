@@ -1,0 +1,23 @@
+-- SELECT COUNT(a), SUM(a), MIN(a), MAX(a), AVG(a + b) FROM t
+(query
+  (select
+    (count
+      (column a)
+    )
+    (sum
+      (column a)
+    )
+    (min
+      (column a)
+    )
+    (max
+      (column a)
+    )
+    (avg
+      (add
+        (column a)
+        (column b)
+      )
+    )
+  )
+  (from t))

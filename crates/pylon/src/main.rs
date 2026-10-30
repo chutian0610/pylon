@@ -8,8 +8,12 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "pylon", version)]
 struct Cli {
-    /// 要执行的 SQL（单条 SELECT）
+    /// 要执行的 SQL（单条语句）
     sql: String,
+
+    /// 只解析并打印 AST，不执行（M1 SQL 面演示）
+    #[arg(long)]
+    parse: bool,
 
     /// 数据目录：表 t 解析为 <DIR>/t/*.parquet
     #[arg(long, env = "PYLON_DATA_DIR", default_value = ".", value_name = "DIR")]
@@ -18,6 +22,18 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.parse {
+        return match pylon_sql::parse(&cli.sql) {
+            Ok(stmt) => {
+                println!("{}", pylon_sql::pretty::render(&stmt));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e.render(&cli.sql));
+                ExitCode::from(1)
+            }
+        };
+    }
     let result = match pylon::run_query(&cli.sql, &cli.data_dir) {
         Ok(result) => result,
         Err(err) => {

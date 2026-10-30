@@ -1,0 +1,10 @@
+-- SELECT a, COUNT(*) FROM t GROUP BY a
+(query
+  (select
+    (column a)
+    (count *)
+  )
+  (from t)
+  (group-by
+    (column a)
+  ))

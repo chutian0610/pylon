@@ -1,0 +1,11 @@
+-- SELECT a FROM t ORDER BY a DESC
+(query
+  (select
+    (column a)
+  )
+  (from t)
+  (order-by
+    (desc
+      (column a)
+    )
+  ))

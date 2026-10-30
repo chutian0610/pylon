@@ -1,0 +1,14 @@
+-- SELECT a, b, SUM(c) FROM t GROUP BY a, b
+(query
+  (select
+    (column a)
+    (column b)
+    (sum
+      (column c)
+    )
+  )
+  (from t)
+  (group-by
+    (column a)
+    (column b)
+  ))

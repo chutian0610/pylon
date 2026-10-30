@@ -1,0 +1,23 @@
+-- SELECT a = 1 OR b = 2 AND NOT c = 3 FROM t
+(query
+  (select
+    (or
+      (eq
+        (column a)
+        (number 1)
+      )
+      (and
+        (eq
+          (column b)
+          (number 2)
+        )
+        (not
+          (eq
+            (column c)
+            (number 3)
+          )
+        )
+      )
+    )
+  )
+  (from t))

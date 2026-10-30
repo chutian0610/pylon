@@ -1,0 +1,8 @@
+-- SELECT a, b FROM t LIMIT 10
+(query
+  (select
+    (column a)
+    (column b)
+  )
+  (from t)
+  (limit 10))

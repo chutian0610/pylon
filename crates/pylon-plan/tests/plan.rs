@@ -173,3 +173,82 @@ fn contract_violation_by_table_format_is_internal_error() {
         "{err:?}"
     );
 }
+
+// ---- 语法已解析、执行未跟上（M1/T2 后续 ticket）：带位置的 Unsupported ----
+
+#[test]
+fn where_is_parsed_but_not_planned_yet() {
+    let (_dir, format) = fixture();
+    let sql = "SELECT a FROM t WHERE a > 1";
+    let err = plan(sql, &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { span, what } if *span == Span::new(22, 27) && *what == "WHERE"),
+        "{err:?}"
+    );
+    let rendered = err.render(sql);
+    assert!(
+        rendered.starts_with("error: WHERE is not supported yet\n"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("line 1, column 23"), "{rendered}");
+}
+
+#[test]
+fn aggregate_projection_is_not_planned_yet() {
+    let (_dir, format) = fixture();
+    let err = plan("SELECT COUNT(*) FROM t", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { span, what } if *span == Span::new(7, 15) && *what == "aggregate functions"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn arithmetic_projection_is_not_planned_yet() {
+    let (_dir, format) = fixture();
+    let sql = "SELECT a + 1 FROM t";
+    let err = plan(sql, &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { span, what } if *span == Span::new(7, 12) && *what == "expressions in SELECT"),
+        "{err:?}"
+    );
+    assert!(err.render(sql).contains("line 1, column 8"), "line check");
+}
+
+#[test]
+fn group_order_distinct_are_not_planned_yet() {
+    let (_dir, format) = fixture();
+    let err = plan("SELECT a FROM t GROUP BY a", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { what, .. } if *what == "GROUP BY"),
+        "{err:?}"
+    );
+
+    let err = plan("SELECT a FROM t ORDER BY a", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { what, .. } if *what == "ORDER BY"),
+        "{err:?}"
+    );
+
+    let err = plan("SELECT DISTINCT a FROM t", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { span, .. } if *span == Span::new(7, 15)),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn show_tables_and_describe_are_not_planned_yet() {
+    let (_dir, format) = fixture();
+    let err = plan("SHOW TABLES", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { span, what } if *span == Span::new(0, 11) && *what == "SHOW TABLES"),
+        "{err:?}"
+    );
+
+    let err = plan("DESCRIBE t", &format).unwrap_err();
+    assert!(
+        matches!(&err, PlanError::Unsupported { what, .. } if *what == "DESCRIBE"),
+        "{err:?}"
+    );
+}

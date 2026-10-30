@@ -1,0 +1,33 @@
+-- SELECT a = b, a <> c, a != d, a < e, a <= f, a > g, a >= h FROM t
+(query
+  (select
+    (eq
+      (column a)
+      (column b)
+    )
+    (neq
+      (column a)
+      (column c)
+    )
+    (neq
+      (column a)
+      (column d)
+    )
+    (lt
+      (column a)
+      (column e)
+    )
+    (lte
+      (column a)
+      (column f)
+    )
+    (gt
+      (column a)
+      (column g)
+    )
+    (gte
+      (column a)
+      (column h)
+    )
+  )
+  (from t))

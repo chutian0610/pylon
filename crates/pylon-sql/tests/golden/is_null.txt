@@ -1,0 +1,11 @@
+-- SELECT a IS NULL, b IS NOT NULL FROM t
+(query
+  (select
+    (is-null
+      (column a)
+    )
+    (is-not-null
+      (column b)
+    )
+  )
+  (from t))

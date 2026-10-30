@@ -1,0 +1,56 @@
+-- SELECT l_returnflag, l_linestatus, SUM(l_quantity), SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)), AVG(l_quantity), COUNT(*), MIN(l_quantity), MAX(l_quantity) FROM lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+(query
+  (select
+    (column l_returnflag)
+    (column l_linestatus)
+    (sum
+      (column l_quantity)
+    )
+    (sum
+      (mul
+        (mul
+          (column l_extendedprice)
+          (sub
+            (number 1)
+            (column l_discount)
+          )
+        )
+        (add
+          (number 1)
+          (column l_tax)
+        )
+      )
+    )
+    (avg
+      (column l_quantity)
+    )
+    (count *)
+    (min
+      (column l_quantity)
+    )
+    (max
+      (column l_quantity)
+    )
+  )
+  (from lineitem)
+  (where
+    (lte
+      (column l_shipdate)
+      (sub
+        (date '1998-12-01')
+        (interval '90' day)
+      )
+    )
+  )
+  (group-by
+    (column l_returnflag)
+    (column l_linestatus)
+  )
+  (order-by
+    (asc
+      (column l_returnflag)
+    )
+    (asc
+      (column l_linestatus)
+    )
+  ))

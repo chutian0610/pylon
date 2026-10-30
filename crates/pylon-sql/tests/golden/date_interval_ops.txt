@@ -1,0 +1,13 @@
+-- SELECT DATE '1998-12-01' - INTERVAL '90' DAY, DATE '2024-01-31' + INTERVAL '1' MONTH FROM t
+(query
+  (select
+    (sub
+      (date '1998-12-01')
+      (interval '90' day)
+    )
+    (add
+      (date '2024-01-31')
+      (interval '1' month)
+    )
+  )
+  (from t))

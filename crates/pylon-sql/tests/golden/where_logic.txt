@@ -1,0 +1,23 @@
+-- SELECT a FROM t WHERE a > 5 AND b = 'x' OR c IS NULL
+(query
+  (select
+    (column a)
+  )
+  (from t)
+  (where
+    (or
+      (and
+        (gt
+          (column a)
+          (number 5)
+        )
+        (eq
+          (column b)
+          (string 'x')
+        )
+      )
+      (is-null
+        (column c)
+      )
+    )
+  ))

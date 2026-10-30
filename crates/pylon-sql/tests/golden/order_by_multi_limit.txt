@@ -1,0 +1,16 @@
+-- SELECT a, b FROM t ORDER BY a DESC, b ASC LIMIT 5
+(query
+  (select
+    (column a)
+    (column b)
+  )
+  (from t)
+  (order-by
+    (desc
+      (column a)
+    )
+    (asc
+      (column b)
+    )
+  )
+  (limit 5))

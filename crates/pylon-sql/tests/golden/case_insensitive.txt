@@ -1,0 +1,12 @@
+-- select distinct A from T order by A desc limit 3
+(query
+  (select distinct
+    (column A)
+  )
+  (from T)
+  (order-by
+    (desc
+      (column A)
+    )
+  )
+  (limit 3))

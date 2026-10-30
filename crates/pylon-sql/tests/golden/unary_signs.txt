@@ -1,0 +1,17 @@
+-- SELECT -a, +2, -(a + b) FROM t
+(query
+  (select
+    (neg
+      (column a)
+    )
+    (pos
+      (number 2)
+    )
+    (neg
+      (add
+        (column a)
+        (column b)
+      )
+    )
+  )
+  (from t))

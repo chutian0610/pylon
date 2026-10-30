@@ -1,0 +1,7 @@
+-- SELECT DISTINCT a, b FROM t
+(query
+  (select distinct
+    (column a)
+    (column b)
+  )
+  (from t))

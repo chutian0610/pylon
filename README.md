@@ -18,13 +18,21 @@ pylon "SELECT a, b FROM t LIMIT 10"   # 表 t = <data-dir>/t/*.parquet
 → morsel push 执行器（tokio IO 预取 + 有界队列 + 专用计算线程，算子内无 await）
 → stdout 表格。TableFormat 接缝已定形（schema / scan 契约，产出可并行打开的
 Morsel 流），首个实现为本地 Parquet 目录 fixture，T5 由 Iceberg adapter 取代。
-当前 SQL 面仅投影 + LIMIT，语法错误返回带行列与脱字符的用户可见错误。
+
+Parser 已覆盖 M1 全部语法面（#3）：算术/比较/逻辑运算、IS NULL、BETWEEN、
+date 与 interval 字面量及运算、WHERE、GROUP BY、聚合（参数含表达式、COUNT(*)）、
+SELECT DISTINCT、ORDER BY、LIMIT、SHOW TABLES、DESCRIBE；每个构造有 AST golden
+快照（`crates/pylon-sql/tests/golden/`），非法输入返回带行列与脱字符的错误。
+执行面暂仍为投影 + LIMIT（WHERE / 聚合 / 排序的规划与执行随后续 ticket 展开，
+试跑会得到带位置的 "not supported yet"）；`pylon --parse "<sql>"` 可打印完整 AST：
 
 ```bash
 cargo build --release
 cargo test --workspace          # 集成测试含 DuckDB 对拍（PATH 上有 duckdb 即跑；
                                 # 设 PYLON_REQUIRE_DUCKDB=1 可强制要求）
 ./target/release/pylon --data-dir <目录> "SELECT a, b FROM t LIMIT 10"
+./target/release/pylon --parse "SELECT l_returnflag, SUM(l_quantity) FROM lineitem \
+  WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag"
 ```
 
 术语表见 [CONTEXT.md](CONTEXT.md)，决策记录见 [docs/adr/](docs/adr/)。

@@ -235,7 +235,73 @@ fn empty_sql_is_a_user_error() {
     let out = pylon(dir.path(), "");
     assert_user_error(
         &out,
-        &["expected SELECT, found end of input", "line 1, column 1"],
+        &[
+            "expected SELECT, SHOW TABLES, or DESCRIBE, found end of input",
+            "line 1, column 1",
+        ],
+    );
+}
+
+// ---- --parse 模式：打印 AST，不执行（issue #3 验收项 3）----
+
+fn pylon_parse(sql: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_pylon"))
+        .arg("--parse")
+        .arg(sql)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn parse_mode_prints_ast_without_data_dir() {
+    let out = pylon_parse("SELECT a, b FROM t LIMIT 10");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for fragment in [
+        "(query",
+        "(select",
+        "(column a)",
+        "(column b)",
+        "(limit 10)",
+    ] {
+        assert!(text.contains(fragment), "missing {fragment:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn parse_mode_covers_full_m1_face() {
+    for (sql, marker) in [
+        ("SHOW TABLES", "(show-tables)"),
+        ("DESCRIBE t", "(describe t)"),
+        (
+            "SELECT DISTINCT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC",
+            "(select distinct",
+        ),
+        (
+            "SELECT DATE '1998-12-01' - INTERVAL '90' DAY FROM t",
+            "(interval '90' day)",
+        ),
+        ("SELECT a FROM t WHERE a BETWEEN 1 AND 10", "(between"),
+    ] {
+        let out = pylon_parse(sql);
+        assert!(out.status.success(), "{sql}: {}", stderr(&out));
+        let text = stdout(&out);
+        assert!(
+            text.contains(marker),
+            "{sql}: missing {marker:?} in:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn parse_mode_syntax_error_has_position() {
+    let out = pylon_parse("SELECT a FROM t WHERE ?");
+    assert_user_error(&out, &["unexpected character '?'", "line 1, column 23"]);
+
+    let out = pylon_parse("SELECT FROM t");
+    assert_user_error(
+        &out,
+        &["expected an expression or '*', found 'FROM'", "column 8"],
     );
 }
 

@@ -3,11 +3,14 @@
 //! 当前职责：表/列名绑定、投影裁剪下推到 TableFormat scan、LIMIT 传递。
 //! 逻辑优化规则（谓词下推、常量折叠）与多算子物理计划留给后续 ticket；此处的
 //! Pipeline 是一条线性 Push Pipeline：Scan → ops… → Sink（LIMIT 在 Sink 生效）。
+//! parser 已覆盖 M1 全部语法（#3），但 WHERE / 表达式投影 / 聚合 / DISTINCT /
+//! ORDER BY / SHOW TABLES / DESCRIBE 的规划与执行属后续 ticket，此处一律返回
+//! 带位置的 [`PlanError::Unsupported`]，而不是悄悄拒绝解析。
 
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
-use pylon_sql::{Ident, Query, SelectItem, Span, SyntaxError, render_at};
+use pylon_sql::{Expr, Ident, Query, SelectItem, Span, Statement, SyntaxError, render_at};
 use pylon_table::{ScanPlan, TableError, TableFormat, normalize_projection};
 
 #[derive(Debug)]
@@ -40,6 +43,9 @@ pub enum PlanError {
     ColumnNotFound { ident: Ident },
     #[error("column reference is ambiguous: {}", ident.name)]
     AmbiguousColumn { ident: Ident },
+    /// 语法已解析、执行能力未跟上（M1 后续 ticket）：指向对应构造的位置
+    #[error("{what} is not supported yet")]
+    Unsupported { span: Span, what: &'static str },
     #[error(transparent)]
     Table(#[from] TableError),
     #[error("internal planner error: {0}")]
@@ -53,6 +59,7 @@ impl PlanError {
             PlanError::TableNotFound { ident }
             | PlanError::ColumnNotFound { ident }
             | PlanError::AmbiguousColumn { ident } => Some(ident.span),
+            PlanError::Unsupported { span, .. } => Some(*span),
             PlanError::Table(_) | PlanError::Internal(_) => None,
         }
     }
@@ -70,8 +77,17 @@ impl PlanError {
 }
 
 pub fn plan(sql: &str, format: &dyn TableFormat) -> Result<Pipeline, PlanError> {
-    let query = pylon_sql::parse(sql)?;
-    plan_query(&query, format)
+    match pylon_sql::parse(sql)? {
+        Statement::Query(query) => plan_query(&query, format),
+        Statement::ShowTables(span) => Err(PlanError::Unsupported {
+            span,
+            what: "SHOW TABLES",
+        }),
+        Statement::Describe { table } => Err(PlanError::Unsupported {
+            span: table.span,
+            what: "DESCRIBE",
+        }),
+    }
 }
 
 pub fn plan_query(query: &Query, format: &dyn TableFormat) -> Result<Pipeline, PlanError> {
@@ -88,8 +104,46 @@ pub fn plan_query(query: &Query, format: &dyn TableFormat) -> Result<Pipeline, P
     for item in &query.items {
         match item {
             SelectItem::Wildcard(_) => selected.extend(0..schema.fields().len()),
-            SelectItem::Column(ident) => selected.push(resolve_column(&schema, ident)?),
+            SelectItem::Expr(Expr::Column(ident)) => selected.push(resolve_column(&schema, ident)?),
+            // 语法面已全开（#3），执行面按 ticket 推进；这里给出带位置的明确错误
+            SelectItem::Expr(expr @ (Expr::Aggregate { .. } | Expr::CountStar(_))) => {
+                return Err(PlanError::Unsupported {
+                    span: expr.span(),
+                    what: "aggregate functions",
+                });
+            }
+            SelectItem::Expr(expr) => {
+                return Err(PlanError::Unsupported {
+                    span: expr.span(),
+                    what: "expressions in SELECT",
+                });
+            }
         }
+    }
+
+    if let Some(selection) = &query.selection {
+        return Err(PlanError::Unsupported {
+            span: selection.span(),
+            what: "WHERE",
+        });
+    }
+    if let Some(key) = query.group_by.first() {
+        return Err(PlanError::Unsupported {
+            span: key.span(),
+            what: "GROUP BY",
+        });
+    }
+    if let Some(key) = query.order_by.first() {
+        return Err(PlanError::Unsupported {
+            span: key.expr.span(),
+            what: "ORDER BY",
+        });
+    }
+    if let Some(span) = query.distinct {
+        return Err(PlanError::Unsupported {
+            span,
+            what: "DISTINCT",
+        });
     }
 
     // 列裁剪下推：scan 只读被引用的列

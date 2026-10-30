@@ -1,0 +1,42 @@
+-- SELECT SUM(l_extendedprice * l_quantity) FROM lineitem WHERE l_shipdate > DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 - 0.01 AND 0.05 + 0.01 AND l_quantity < 24
+(query
+  (select
+    (sum
+      (mul
+        (column l_extendedprice)
+        (column l_quantity)
+      )
+    )
+  )
+  (from lineitem)
+  (where
+    (and
+      (and
+        (and
+          (gt
+            (column l_shipdate)
+            (date '1994-01-01')
+          )
+          (lt
+            (column l_shipdate)
+            (date '1995-01-01')
+          )
+        )
+        (between
+          (column l_discount)
+          (sub
+            (number 0.05)
+            (number 0.01)
+          )
+          (add
+            (number 0.05)
+            (number 0.01)
+          )
+        )
+      )
+      (lt
+        (column l_quantity)
+        (number 24)
+      )
+    )
+  ))

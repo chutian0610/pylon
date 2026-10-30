@@ -1,0 +1,6 @@
+-- SELECT a FROM t;
+(query
+  (select
+    (column a)
+  )
+  (from t))
