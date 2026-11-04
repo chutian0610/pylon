@@ -23,14 +23,22 @@ Parser 已覆盖 M1 全部语法面（#3）：算术/比较/逻辑运算、IS NU
 date 与 interval 字面量及运算、WHERE、GROUP BY、聚合（参数含表达式、COUNT(*)）、
 SELECT DISTINCT、ORDER BY、LIMIT、SHOW TABLES、DESCRIBE；每个构造有 AST golden
 快照（`crates/pylon-sql/tests/golden/`），非法输入返回带行列与脱字符的错误。
-执行面暂仍为投影 + LIMIT（WHERE / 聚合 / 排序的规划与执行随后续 ticket 展开，
-试跑会得到带位置的 "not supported yet"）；`pylon --parse "<sql>"` 可打印完整 AST：
+Planner 已分层（#4，M1/T3）：AST lowering 为 LogicalPlan（含聚合/排序/DISTINCT 的
+完整逻辑计划），谓词下推 / 投影裁剪 / 常量折叠三条规则，再物理化为线性 Pipeline；
+`pylon --explain "<sql>"` 打印优化前后逻辑计划与物理计划。执行面 = Scan（列裁剪 +
+谓词下推提示，TableFormat 契约已定形）→ Filter → 表达式 Project → Sink(LIMIT)；
+聚合 / 排序 / DISTINCT 的物理算子随 T4 加入（试跑得到带位置的
+"not supported yet"）。表达式层（pylon-expr）按 ADR-0005 用 Arrow 类型做裁决与
+求值：整数提升、Decimal128 Hive 精度规则、date 与 interval 运算、NULL 三值逻辑。
+`pylon --parse "<sql>"` 可打印完整 AST：
 
 ```bash
 cargo build --release
 cargo test --workspace          # 集成测试含 DuckDB 对拍（PATH 上有 duckdb 即跑；
                                 # 设 PYLON_REQUIRE_DUCKDB=1 可强制要求）
 ./target/release/pylon --data-dir <目录> "SELECT a, b FROM t LIMIT 10"
+./target/release/pylon --data-dir <目录> "SELECT a + 1 FROM t WHERE a BETWEEN 0 AND 5"
+./target/release/pylon --data-dir <目录> --explain "SELECT b, COUNT(*) FROM t WHERE a > 0 GROUP BY b"
 ./target/release/pylon --parse "SELECT l_returnflag, SUM(l_quantity) FROM lineitem \
   WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag"
 ```

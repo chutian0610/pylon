@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use arrow::datatypes::DataType;
 use futures_util::StreamExt;
+use pylon_expr::Scalar;
 use pylon_table::testing::{FixtureSpec, write_fixture_table};
-use pylon_table::{ParquetDirFormat, TableError, TableFormat};
+use pylon_table::{CmpOp, ParquetDirFormat, ScanPredicate, TableError, TableFormat};
 
 const SPEC: FixtureSpec = FixtureSpec {
     files: 3,
@@ -36,7 +37,7 @@ fn table_schema_is_arrow_schema_of_files() {
 #[test]
 fn scan_lists_one_split_per_parquet_file_in_order() {
     let (dir, format) = fixture();
-    let plan = format.scan("t", None).unwrap();
+    let plan = format.scan("t", None, &[]).unwrap();
     assert_eq!(plan.projection, vec![0, 1, 2]);
     let described: Vec<String> = plan.splits.iter().map(|s| s.describe()).collect();
     let expected: Vec<String> = (0..3)
@@ -54,14 +55,14 @@ fn scan_lists_one_split_per_parquet_file_in_order() {
 #[test]
 fn scan_pushes_down_deduplicated_sorted_projection() {
     let (_dir, format) = fixture();
-    let plan = format.scan("t", Some(&[2, 0, 2])).unwrap();
+    let plan = format.scan("t", Some(&[2, 0, 2]), &[]).unwrap();
     assert_eq!(plan.projection, vec![0, 2]);
 }
 
 #[test]
 fn scan_rejects_out_of_range_projection() {
     let (_dir, format) = fixture();
-    let err = format.scan("t", Some(&[0, 3])).unwrap_err();
+    let err = format.scan("t", Some(&[0, 3]), &[]).unwrap_err();
     assert!(
         matches!(
             err,
@@ -79,7 +80,7 @@ fn scan_rejects_out_of_range_projection() {
 #[tokio::test]
 async fn split_opens_into_morsel_stream_with_projection_and_row_cap() {
     let (_dir, format) = fixture();
-    let plan = format.scan("t", Some(&[2, 0])).unwrap();
+    let plan = format.scan("t", Some(&[2, 0]), &[]).unwrap();
     assert_eq!(plan.splits.len(), 3);
 
     let mut total = 0usize;
@@ -107,7 +108,7 @@ async fn split_opens_into_morsel_stream_with_projection_and_row_cap() {
 #[tokio::test]
 async fn split_open_error_names_the_file() {
     let (dir, format) = fixture();
-    let plan = format.scan("t", None).unwrap();
+    let plan = format.scan("t", None, &[]).unwrap();
     std::fs::remove_file(dir.path().join("t").join("part-01.parquet")).unwrap();
     let err = plan.splits[1].open(8).await.err().unwrap();
     assert!(
@@ -123,7 +124,7 @@ fn unknown_table_is_not_found() {
         matches!(format.table_schema("nope"), Err(TableError::TableNotFound(n)) if n == "nope")
     );
     assert!(matches!(
-        format.scan("nope", None),
+        format.scan("nope", None, &[]),
         Err(TableError::TableNotFound(_))
     ));
 }
@@ -152,4 +153,25 @@ fn directory_without_parquet_files_is_empty_table() {
 fn format_reports_its_name() {
     let (_dir, format) = fixture();
     assert_eq!(format.name(), "parquet-dir");
+}
+
+// ---- 谓词下推契约（M1/T3）----
+/// filters 是非精确提示：传入后 scan 必须成功、投影契约不变（实现可以忽略提示，
+/// 但不能因此改变 scan 的基本行为）。
+#[test]
+fn scan_accepts_pushdown_predicate_hints() {
+    let (_dir, format) = fixture();
+    let filters = vec![ScanPredicate {
+        column: 0,
+        op: CmpOp::Gt,
+        value: Scalar::Int64(100),
+    }];
+    let plan = format.scan("t", Some(&[0]), &filters).unwrap();
+    assert_eq!(plan.projection, vec![0]);
+    assert_eq!(
+        plan.splits.len(),
+        3,
+        "与无谓词时相同的文件集（提示可忽略，不可改变行为）"
+    );
+    assert_eq!(format.scan("t", Some(&[0]), &[]).unwrap().splits.len(), 3);
 }

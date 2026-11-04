@@ -1063,6 +1063,7 @@ dependencies = [
  "arrow",
  "async-channel",
  "futures-util",
+ "pylon-expr",
  "pylon-plan",
  "pylon-table",
  "tempfile",
@@ -1071,10 +1072,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pylon-expr"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "thiserror",
+]
+
+[[package]]
 name = "pylon-plan"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "pylon-expr",
  "pylon-sql",
  "pylon-table",
  "tempfile",
@@ -1095,6 +1106,7 @@ dependencies = [
  "arrow",
  "futures-util",
  "parquet",
+ "pylon-expr",
  "tempfile",
  "thiserror",
  "tokio",

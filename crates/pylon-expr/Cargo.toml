@@ -1,0 +1,12 @@
+[package]
+name = "pylon-expr"
+description = "Pylon 表达式层：绑定后的类型化表达式、类型强制规则、Morsel 上的求值与常量折叠"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-buffer = { workspace = true }
+thiserror = { workspace = true }
+

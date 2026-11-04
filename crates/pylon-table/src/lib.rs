@@ -1,10 +1,15 @@
 //! TableFormat 接缝：Pylon 接入外部表格式的自有抽象（ADR-0007 / ADR-0009）。
 //!
 //! 职责：表 schema 解析（归一为 Arrow）与扫描规划（产出可并行打开为 Morsel 流的
-//! [`ScanSplit`]，承接列裁剪下推；谓词下推随 M1 后续 ticket 加入）。数据格式的读取
-//! 细节（Parquet 解码、对象存储 IO、delete 文件处理）全部封在 TableFormat 实现内，
-//! 执行器只消费 Morsel 流——这是该接缝"定形"的关键：T5 换 Iceberg adapter 时执行器
-//! 零改动。
+//! [`ScanSplit`]，承接列裁剪与谓词下推）。数据格式的读取细节（Parquet 解码、对象
+//! 存储 IO、delete 文件处理）全部封在 TableFormat 实现内，执行器只消费 Morsel 流
+//! ——这是该接缝"定形"的关键：T5 换 Iceberg adapter 时执行器零改动。
+//!
+//! 下推契约（M1/T3 定形）：
+//! - 列裁剪（`projection`）是**精确**的：返回的 [`ScanPlan::projection`] 之外的列
+//!   不会出现在 Morsel 中；
+//! - 谓词（`filters`）是**非精确提示**：格式实现可用它跳过文件/行组以少读数据，
+//!   但不承诺行级过滤——正确性由执行器在 scan 之上的残差 Filter 保证。
 //!
 //! 当前唯一实现：[`ParquetDirFormat`]，读取本地 Parquet 目录（M1/T1 临时 fixture，
 //! T5 由 Iceberg adapter 取代）。
@@ -19,8 +24,42 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
+use pylon_expr::Scalar;
 
 pub use parquet_dir::ParquetDirFormat;
+
+/// 可下推的简单比较谓词（`列 op 标量`）。复合谓词由 planner 拆为多个的合取。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanPredicate {
+    /// 表 schema 列索引
+    pub column: usize,
+    pub op: CmpOp,
+    pub value: Scalar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl fmt::Display for CmpOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            CmpOp::Eq => "=",
+            CmpOp::NotEq => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::LtEq => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::GtEq => ">=",
+        };
+        f.write_str(s)
+    }
+}
 
 /// Morsel 流：产出 ≤ 目标行数的 RecordBatch，出错带 [`TableError`]。
 pub type MorselStream = BoxStream<'static, Result<RecordBatch, TableError>>;
@@ -49,7 +88,15 @@ pub trait TableFormat: Send + Sync {
     /// `projection` 为表 schema 的列索引，可任意顺序、可重复；`None` 表示全列。返回的
     /// [`ScanPlan::projection`] 已去重并按表 schema 顺序排列；各 split 解码出的 Morsel
     /// schema 恰为表 schema 在该投影上的子集（表序）。
-    fn scan(&self, table: &str, projection: Option<&[usize]>) -> Result<ScanPlan, TableError>;
+    ///
+    /// `filters` 为非精确谓词提示（见模块文档）：实现可以忽略，也可以用它裁掉
+    /// 文件/行组；绝不允许因此漏掉满足谓词的行。
+    fn scan(
+        &self,
+        table: &str,
+        projection: Option<&[usize]>,
+        filters: &[ScanPredicate],
+    ) -> Result<ScanPlan, TableError>;
 }
 
 #[derive(Debug)]

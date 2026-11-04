@@ -1,10 +1,12 @@
-//! 计算侧：算子求值与 Pipeline 终点 Sink。全部同步代码。
+//! 计算侧：算子求值与 Pipeline 终点 Sink。全部同步代码（ADR-0006：算子内无 await）。
 
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arrow::array::BooleanArray;
 use arrow::array::RecordBatch;
+use arrow::compute::filter_record_batch;
 use pylon_plan::Operator;
 
 use crate::ExecError;
@@ -12,19 +14,30 @@ use crate::ExecError;
 /// 对单个 Morsel 执行一个算子。
 pub(crate) fn eval(op: &Operator, morsel: &RecordBatch) -> Result<RecordBatch, ExecError> {
     match op {
-        Operator::Project { columns, schema } => {
-            let projected = columns
+        Operator::Filter { predicate } => {
+            let mask = pylon_expr::eval(predicate, morsel)
+                .map_err(|e| ExecError::Operator(format!("Filter: {e}")))?;
+            let bools = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    ExecError::Operator(format!(
+                        "Filter: predicate produced {}, expected BOOLEAN",
+                        mask.data_type()
+                    ))
+                })?;
+            filter_record_batch(morsel, bools)
+                .map_err(|e| ExecError::Operator(format!("Filter: {e}")))
+        }
+        Operator::Project { exprs, schema } => {
+            let columns = exprs
                 .iter()
-                .map(|&i| {
-                    morsel.columns().get(i).cloned().ok_or_else(|| {
-                        ExecError::Operator(format!(
-                            "Project: column index {i} out of range for morsel with {} columns",
-                            morsel.num_columns()
-                        ))
-                    })
+                .map(|e| {
+                    pylon_expr::eval(e, morsel)
+                        .map_err(|err| ExecError::Operator(format!("Project: {err}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            RecordBatch::try_new(schema.clone(), projected)
+            RecordBatch::try_new(schema.clone(), columns)
                 .map_err(|e| ExecError::Operator(format!("Project: {e}")))
         }
     }

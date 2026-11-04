@@ -379,6 +379,29 @@ fn duckdb_oracle_agrees_on_same_parquet_directory() {
             "SELECT b FROM t LIMIT 10",
             format!("SELECT b FROM read_parquet('{glob}') LIMIT 10"),
         ),
+        // M1/T3：WHERE / 表达式投影 / BETWEEN / NULL 语义对拍
+        (
+            "SELECT a FROM t WHERE a > 4",
+            format!("SELECT a FROM read_parquet('{glob}') WHERE a > 4"),
+        ),
+        (
+            "SELECT a, b FROM t WHERE b IS NULL",
+            format!("SELECT a, b FROM read_parquet('{glob}') WHERE b IS NULL"),
+        ),
+        (
+            "SELECT a FROM t WHERE a BETWEEN -1 AND 8 AND b IS NOT NULL",
+            format!(
+                "SELECT a FROM read_parquet('{glob}') WHERE a BETWEEN -1 AND 8 AND b IS NOT NULL"
+            ),
+        ),
+        (
+            "SELECT a * 2 + 1, c FROM t WHERE c < 1.5",
+            format!("SELECT a * 2 + 1, c FROM read_parquet('{glob}') WHERE c < 1.5"),
+        ),
+        (
+            "SELECT a FROM t WHERE a + 1 >= 5 OR b = 's2'",
+            format!("SELECT a FROM read_parquet('{glob}') WHERE a + 1 >= 5 OR b = 's2'"),
+        ),
     ];
 
     for (pylon_sql, duck_sql) in &cases {
@@ -386,7 +409,7 @@ fn duckdb_oracle_agrees_on_same_parquet_directory() {
         assert!(out.status.success(), "{pylon_sql}: {}", stderr(&out));
         let (_, ours) = parse_table(&stdout(&out));
         let theirs = duckdb_rows(&duckdb, duck_sql);
-        assert_eq!(ours.len(), 10, "{pylon_sql}");
+        assert!(!ours.is_empty(), "{pylon_sql}: 应有结果行");
         assert_eq!(
             normalized_sorted(ours),
             normalized_sorted(theirs),
@@ -394,4 +417,145 @@ fn duckdb_oracle_agrees_on_same_parquet_directory() {
         );
     }
     eprintln!("DuckDB oracle: {} queries agreed", cases.len());
+}
+
+// ---- M1/T3：WHERE / 表达式投影 / --explain ----
+
+#[test]
+fn where_filters_rows_against_expected_fixture() {
+    let dir = fixture(SPEC);
+    let out = pylon(dir.path(), "SELECT a FROM t WHERE a > 4 LIMIT 10");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (_, rows) = parse_table(&stdout(&out));
+    let mut got: Vec<i64> = rows.iter().map(|r| r[0].parse().unwrap()).collect();
+    got.sort_unstable();
+    let want: Vec<i64> = expected_rows(SPEC)
+        .into_iter()
+        .filter(|r| r.a > 4)
+        .map(|r| r.a)
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn where_null_semantics_drop_null_comparisons() {
+    let dir = fixture(SPEC);
+    // b 每 7 行一个 NULL（g%7==6 → g=6）：IS NULL 命中 1 行，= 's3' 命中 1 行，
+    // NULL = 'x' 不命中任何行（三值逻辑）
+    let out = pylon(dir.path(), "SELECT a FROM t WHERE b IS NULL");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (_, rows) = parse_table(&stdout(&out));
+    assert_eq!(rows, vec![vec!["11"]]);
+
+    let out = pylon(dir.path(), "SELECT a FROM t WHERE b = 's3'");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (_, rows) = parse_table(&stdout(&out));
+    assert_eq!(rows, vec![vec!["2"]]);
+
+    let out = pylon(dir.path(), "SELECT a FROM t WHERE b = 'x' OR b IS NULL");
+    let (_, rows) = parse_table(&stdout(&out));
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn arithmetic_projection_computes_derived_column() {
+    let dir = fixture(SPEC);
+    let out = pylon(dir.path(), "SELECT a * 2 + 1 FROM t LIMIT 5");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (header, rows) = parse_table(&stdout(&out));
+    assert_eq!(header, ["a * 2 + 1"]);
+    // LIMIT 无 ORDER BY：返回哪些行不作保证（跨 split 并发），断言行数与值域
+    assert_eq!(rows.len(), 5);
+    let universe: std::collections::HashSet<i64> = (0..SPEC.total_rows())
+        .map(|g| fixture_row(g).a * 2 + 1)
+        .collect();
+    for r in &rows {
+        let v: i64 = r[0].parse().unwrap();
+        assert!(universe.contains(&v), "意外值 {v}：{rows:?}");
+    }
+}
+
+#[test]
+fn between_and_mixed_predicates_filter_correctly() {
+    let dir = fixture(SPEC);
+    let out = pylon(
+        dir.path(),
+        "SELECT a FROM t WHERE a BETWEEN 2 AND 8 AND b IS NOT NULL",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (_, rows) = parse_table(&stdout(&out));
+    let mut got: Vec<i64> = rows.iter().map(|r| r[0].parse().unwrap()).collect();
+    got.sort_unstable();
+    // a=3g-7 ∈ [2,8] → g ∈ [3,5]；g=6 的 NULL 行不在此区间
+    assert_eq!(got, vec![2, 5, 8]);
+}
+
+#[test]
+fn where_type_mismatch_is_a_positional_user_error() {
+    let dir = fixture(SPEC);
+    let out = pylon(dir.path(), "SELECT a FROM t WHERE a + b > 1");
+    assert_user_error(
+        &out,
+        &[
+            "error: cannot apply + to Int64 and Utf8",
+            "line 1, column 23",
+            "   | SELECT a FROM t WHERE a + b > 1\n   |                       ^^^^^",
+        ],
+    );
+}
+
+#[test]
+fn explain_prints_both_logical_levels_and_physical() {
+    let dir = fixture(SPEC);
+    let out = Command::new(env!("CARGO_BIN_EXE_pylon"))
+        .arg("--explain")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("SELECT a FROM t WHERE a > 1 + 2")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("logical (before):"), "{text}");
+    assert!(text.contains("1 + 2"), "{text}");
+    assert!(text.contains("logical (after):"), "{text}");
+    assert!(text.contains("a > 3"), "{text}");
+    assert!(text.contains("physical:"), "{text}");
+    assert!(text.contains("Filter (a > 3)"), "{text}");
+    assert!(text.contains("pushed=[a > 3]"), "{text}");
+}
+
+#[test]
+fn explain_of_aggregate_shows_logical_and_names_physical_gap() {
+    let dir = fixture(SPEC);
+    let out = Command::new(env!("CARGO_BIN_EXE_pylon"))
+        .arg("--explain")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("SELECT b, COUNT(*) FROM t WHERE a > 0 GROUP BY b")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Aggregate keys=[b] aggs=[count(*)]"),
+        "{text}"
+    );
+    assert!(text.contains("physical: not planned yet"), "{text}");
+
+    // 执行路径仍是带位置的用户错误
+    let out = pylon(dir.path(), "SELECT b, COUNT(*) FROM t GROUP BY b");
+    assert_user_error(&out, &["aggregate functions is not supported yet"]);
+}
+
+#[test]
+fn explain_syntax_error_is_positional() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pylon"))
+        .arg("--explain")
+        .arg("--data-dir")
+        .arg("/tmp")
+        .arg("SELECT FROM t")
+        .output()
+        .unwrap();
+    assert_user_error(&out, &["syntax error:", "line 1, column 8"]);
 }

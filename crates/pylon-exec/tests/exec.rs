@@ -214,7 +214,11 @@ fn operator_failure_is_reported() {
     let (_dir, format) = fixture();
     let mut pipeline = pipeline_for("SELECT a FROM t", &format);
     pipeline.ops = vec![Operator::Project {
-        columns: vec![42],
+        exprs: vec![pylon_expr::Expr::column(
+            42,
+            "nope",
+            arrow::datatypes::DataType::Int64,
+        )],
         schema: pipeline.output_schema.clone(),
     }];
     let err = PipelineDriver::default().run(&pipeline).unwrap_err();

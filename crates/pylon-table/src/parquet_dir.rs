@@ -12,7 +12,9 @@ use futures_util::future::BoxFuture;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
-use crate::{MorselStream, ScanPlan, ScanSplit, TableError, TableFormat, normalize_projection};
+use crate::{
+    MorselStream, ScanPlan, ScanPredicate, ScanSplit, TableError, TableFormat, normalize_projection,
+};
 
 #[derive(Debug, Clone)]
 pub struct ParquetDirFormat {
@@ -142,10 +144,18 @@ impl TableFormat for ParquetDirFormat {
         read_schema(&files[0])
     }
 
-    fn scan(&self, table: &str, projection: Option<&[usize]>) -> Result<ScanPlan, TableError> {
+    fn scan(
+        &self,
+        table: &str,
+        projection: Option<&[usize]>,
+        filters: &[ScanPredicate],
+    ) -> Result<ScanPlan, TableError> {
         let files = self.list_files(table)?;
         let schema = read_schema(&files[0])?;
         let columns = normalize_projection(table, projection, schema.fields().len())?;
+        // 谓词下推提示：M1/T3 先接收不使用；T5 的 Iceberg adapter（以及后续基于
+        // Parquet 统计信息的裁剪）在此消费 filters 少读文件/行组。
+        let _ = filters;
         Ok(ScanPlan {
             projection: columns.clone(),
             splits: files

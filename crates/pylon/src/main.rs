@@ -15,6 +15,10 @@ struct Cli {
     #[arg(long)]
     parse: bool,
 
+    /// 打印优化前后逻辑计划与物理计划，不执行
+    #[arg(long)]
+    explain: bool,
+
     /// 数据目录：表 t 解析为 <DIR>/t/*.parquet
     #[arg(long, env = "PYLON_DATA_DIR", default_value = ".", value_name = "DIR")]
     data_dir: PathBuf,
@@ -26,6 +30,30 @@ fn main() -> ExitCode {
         return match pylon_sql::parse(&cli.sql) {
             Ok(stmt) => {
                 println!("{}", pylon_sql::pretty::render(&stmt));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e.render(&cli.sql));
+                ExitCode::from(1)
+            }
+        };
+    }
+    if cli.explain {
+        let format = pylon_table::ParquetDirFormat::new(&cli.data_dir);
+        return match pylon_plan::plan_explain(&cli.sql, &format) {
+            Ok(e) => {
+                println!(
+                    "logical (before):\n{}",
+                    pylon_plan::render::logical(&e.logical_before)
+                );
+                println!(
+                    "logical (after):\n{}",
+                    pylon_plan::render::logical(&e.logical_after)
+                );
+                match &e.pipeline {
+                    Ok(p) => println!("physical:\n{}", pylon_plan::render::physical(p)),
+                    Err(err) => println!("physical: not planned yet — {err}"),
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
